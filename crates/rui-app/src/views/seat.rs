@@ -1,6 +1,28 @@
-//! Seat label shown in the top bar.
+//! Seat label and seat page.
 
+use crate::store::{self, Store};
+use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
 use rui_core::SeatInfo;
+
+/// Minimal seat page: just the seat description for now.
+pub struct SeatView {
+    store: Entity<Store>,
+}
+
+impl SeatView {
+    /// Build the seat view.
+    pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+        store::observe(&store, cx);
+        Self { store }
+    }
+}
+
+impl Render for SeatView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text = self.store.read(cx).seat.as_ref().map(seat_label).unwrap_or_default();
+        div().size_full().p(px(14.)).child(SharedString::from(text))
+    }
+}
 
 fn subscription_name(seat: &SeatInfo) -> String {
     match seat.subscription_type.as_deref() {

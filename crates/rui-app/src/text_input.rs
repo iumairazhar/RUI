@@ -7,8 +7,10 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
+    div, fill, point, prelude::*, px, relative, size,
 };
+
+use crate::theme::theme;
 
 actions!(
     text_input,
@@ -492,6 +494,7 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let th = theme(cx).clone();
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -499,7 +502,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0., 0., 1., 0.35))
+            (input.placeholder.clone(), th.muted)
         } else {
             (content, style.color)
         };
@@ -553,7 +556,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0x6aa9ff),
+                    th.accent_text,
                 )),
             )
         } else {
@@ -569,7 +572,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x6aa9ff55),
+                    th.accent_text.opacity(0.3),
                 )),
                 None,
             )
@@ -644,8 +647,8 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(rgb(0x2a2a33))
-            .text_color(rgb(0xffffff))
+            .bg(theme(cx).surface)
+            .text_color(theme(cx).fg)
             .line_height(px(20.))
             .text_size(px(14.))
             .rounded_md()

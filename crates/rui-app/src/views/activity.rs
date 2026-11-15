@@ -1,8 +1,8 @@
 //! Activity panel: a live feed of agent events.
 
-use super::column;
 use crate::store::{self, Store};
-use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px, rgb};
+use crate::theme::{Theme, theme};
+use gpui::{Context, Entity, Hsla, ScrollHandle, Window, div, prelude::*, px};
 use rui_core::Event;
 use serde_json::Value;
 
@@ -133,12 +133,12 @@ pub fn summarize(e: &Event) -> (String, bool) {
     }
 }
 
-fn agent_color(agent: &str) -> u32 {
+fn agent_color(agent: &str, th: &Theme) -> Hsla {
     match agent {
-        "rui" => 0x2bb5a8,
-        "lead" => 0x9b6bd4,
-        "builder" => 0x4d8ae6,
-        _ => 0x8b8b99,
+        "rui" => th.run.fg,
+        "lead" => th.think.fg,
+        "builder" => th.accent_text,
+        _ => th.muted,
     }
 }
 
@@ -146,30 +146,31 @@ fn clock(created_at: &str) -> String {
     created_at.get(11..19).unwrap_or("--:--:--").to_string()
 }
 
-fn row(e: &Event) -> impl IntoElement + use<> {
+fn row(e: &Event, th: &Theme) -> impl IntoElement + use<> {
     let (text, is_error) = summarize(e);
     let task = e.task_id.map(|t| format!("#{t}")).unwrap_or_else(|| "—".into());
-    let body = if is_error { 0xe06060 } else { 0xc8c8d4 };
+    let body = if is_error { th.block.fg } else { th.fg_2 };
     div()
         .flex()
         .gap_2()
         .text_size(px(12.))
         .font_family("Menlo")
-        .child(div().flex_none().text_color(rgb(0x6b6b78)).child(clock(&e.created_at)))
-        .child(div().flex_none().w(px(64.)).text_color(rgb(agent_color(&e.agent))).child(e.agent.clone()))
-        .child(div().flex_none().w(px(32.)).text_color(rgb(0x8b8b99)).child(task))
-        .child(div().flex_1().min_w_0().text_color(rgb(body)).child(text))
+        .child(div().flex_none().text_color(th.muted).child(clock(&e.created_at)))
+        .child(div().flex_none().w(px(64.)).text_color(agent_color(&e.agent, th)).child(e.agent.clone()))
+        .child(div().flex_none().w(px(32.)).text_color(th.muted).child(task))
+        .child(div().flex_1().min_w_0().text_color(body).child(text))
 }
 
 impl Render for ActivityView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
         let events = self.store.read(cx).events.clone();
         let newest = events.last().map(|e| e.id);
         if newest != self.last_id {
             self.last_id = newest;
             self.scroll.scroll_to_bottom();
         }
-        column("Activity").child(
+        div().flex().flex_col().size_full().p(px(14.)).gap_3().child(
             div()
                 .id("activity-scroll")
                 .flex_1()
@@ -179,7 +180,7 @@ impl Render for ActivityView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .children(events.iter().map(row)),
+                .children(events.iter().map(|e| row(e, &th))),
         )
     }
 }

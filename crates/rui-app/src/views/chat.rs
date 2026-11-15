@@ -1,9 +1,10 @@
 //! Chat column.
 
-use super::{button, column};
+use super::primary_button;
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
-use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px, rgb};
+use crate::theme::{Theme, theme};
+use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
 use rui_core::ChatRole;
 
 /// Chat messages plus an input box.
@@ -33,7 +34,7 @@ impl ChatView {
     }
 }
 
-fn bubble(role: ChatRole, text: &str) -> impl IntoElement {
+fn bubble(role: ChatRole, text: &str, th: &Theme) -> impl IntoElement {
     let user = role == ChatRole::User;
     let row = div().flex().w_full();
     let row = if user { row.justify_end() } else { row.justify_start() };
@@ -44,14 +45,15 @@ fn bubble(role: ChatRole, text: &str) -> impl IntoElement {
             .py(px(8.))
             .rounded_lg()
             .text_sm()
-            .bg(if user { rgb(0x3b6fd4) } else { rgb(0x2f2f3a) })
-            .text_color(rgb(0xffffff))
+            .bg(if user { th.accent_fill } else { th.surface })
+            .text_color(if user { th.on_accent } else { th.fg })
             .child(text.to_string()),
     )
 }
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme(cx).clone();
         let chat = self.store.read(cx).chat.clone();
         if chat.len() != self.last_len {
             self.last_len = chat.len();
@@ -66,9 +68,9 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .gap_2()
-            .children(chat.iter().map(|m| bubble(m.role, &m.content)));
-        let send = button("Send").on_click(cx.listener(|this, _, _, cx| this.send(cx)));
-        column("Chat").child(messages).child(
+            .children(chat.iter().map(|m| bubble(m.role, &m.content, &th)));
+        let send = primary_button("send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
+        div().flex().flex_col().size_full().p(px(14.)).gap_3().child(messages).child(
             div().flex().gap_2().items_center().child(div().flex_1().child(self.input.clone())).child(send),
         )
     }
