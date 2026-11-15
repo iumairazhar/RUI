@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, chat, db::Db, mcp, scheduler, state};
+use rui_daemon::{api, chat, db::Db, mcp, scheduler, seat, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,9 @@ async fn main() {
     }
     let cfg = scheduler::Config { port, tick, data_dir: state::data_dir() };
     let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
-    let app = api::router(api::ApiState { db: db.clone(), chat_tx }).merge(mcp::mcp_router(db.clone()));
+    let seat_cache = seat::SeatCache::default();
+    let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone() };
+    let app = api::router(state).merge(mcp::mcp_router(db.clone()));
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -34,6 +36,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    tokio::spawn(seat::refresh_loop(seat_cache));
     tokio::spawn(scheduler::run(db.clone(), cfg.clone()));
     tokio::spawn(chat::run(db, chat_rx, cfg));
     println!("rui-daemon listening on 127.0.0.1:{port}");

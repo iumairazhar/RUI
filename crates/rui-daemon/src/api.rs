@@ -8,7 +8,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use rui_core::{ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SourceKind, Task, TaskStatus};
+use crate::seat::SeatCache;
+use rui_core::{
+    ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SeatInfo, SourceKind, Task, TaskRun,
+    TaskStatus,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 pub struct ApiState {
     pub db: Arc<Db>,
     pub chat_tx: UnboundedSender<i64>,
+    pub seat: SeatCache,
 }
 
 /// Error that renders as `{ "error": msg }` with a status code.
@@ -61,6 +66,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/questions/{id}/answer", post(answer_question))
         .route("/chat", get(list_chat).post(post_chat))
         .route("/events", get(list_events))
+        .route("/seat", get(get_seat))
+        .route("/tasks/runs", get(list_task_runs))
         .with_state(state)
 }
 
@@ -104,13 +111,51 @@ async fn list_chat(
 struct EventsQuery {
     task_id: Option<i64>,
     limit: Option<i64>,
+    after_id: Option<i64>,
 }
 
 async fn list_events(
     State(s): State<ApiState>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Vec<Event>>> {
-    Ok(Json(s.db.list_events(q.task_id, q.limit.unwrap_or(200))?))
+    let limit = q.limit.unwrap_or(200);
+    let events = match q.after_id {
+        Some(after) => s.db.list_events_after(q.task_id, after, limit)?,
+        None => s.db.list_events(q.task_id, limit)?,
+    };
+    Ok(Json(events))
+}
+
+async fn get_seat(State(s): State<ApiState>) -> ApiResult<Json<SeatInfo>> {
+    let mut info = s.seat.read().await.clone();
+    info.last_model = s.db.latest_model()?;
+    Ok(Json(info))
+}
+
+fn seat_kind(payload: &serde_json::Value) -> &'static str {
+    match payload.get("apiKeySource").and_then(|v| v.as_str()) {
+        Some("none") => "subscription",
+        Some(_) => "api_key",
+        None => "unknown",
+    }
+}
+
+async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun>>> {
+    let runs = s
+        .db
+        .latest_init_per_task()?
+        .into_iter()
+        .filter_map(|e| {
+            Some(TaskRun {
+                task_id: e.task_id?,
+                agent: e.agent,
+                model: e.payload.get("model").and_then(|v| v.as_str()).map(String::from),
+                seat: seat_kind(&e.payload).into(),
+                at: e.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(runs))
 }
 
 #[derive(Deserialize)]
@@ -185,7 +230,7 @@ mod tests {
     fn setup() -> (Router, Arc<Db>, UnboundedReceiver<i64>) {
         let db = Arc::new(Db::open_test());
         let (chat_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (router(ApiState { db: db.clone(), chat_tx }), db, rx)
+        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default() }), db, rx)
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -220,6 +265,23 @@ mod tests {
             })
             .unwrap();
         (c.id, t.id)
+    }
+
+    fn seed_task_for(db: &Db, client_id: i64) -> i64 {
+        db.create_task(&NewTask {
+            client_id,
+            parent_id: None,
+            title: "t".into(),
+            body: String::new(),
+            status: TaskStatus::New,
+            done_command: None,
+            max_loops: 5,
+            role: Role::Lead,
+            source_kind: SourceKind::User,
+            source_ref: None,
+        })
+        .unwrap()
+        .id
     }
 
     #[tokio::test]
@@ -281,6 +343,55 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 2);
         let (_, v) = call(&app, "GET", &format!("/events?task_id={tid}&limit=5"), None).await;
         assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn seat_returns_cache_and_last_model() {
+        let (app, db, _rx) = setup();
+        let (_, v) = call(&app, "GET", "/seat", None).await;
+        assert!(v["last_model"].is_null());
+        db.add_event(None, "lead", "init", &json!({"model": "claude-old"})).unwrap();
+        db.add_event(None, "lead", "init", &json!({"session_id": "x"})).unwrap();
+        db.add_event(None, "lead", "init", &json!({"model": "claude-new"})).unwrap();
+        let (st, v) = call(&app, "GET", "/seat", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["last_model"].as_str(), Some("claude-new"));
+        assert_eq!(v["logged_in"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn task_runs_newest_init_per_task() {
+        let (app, db, _rx) = setup();
+        let (cid, t1) = seed_task(&db);
+        let t2 = seed_task_for(&db, cid);
+        let t3 = seed_task_for(&db, cid);
+        let _t4 = seed_task_for(&db, cid);
+        db.add_event(Some(t1), "lead", "init", &json!({"model": "old", "apiKeySource": "ANTHROPIC_API_KEY"})).unwrap();
+        db.add_event(Some(t1), "builder", "init", &json!({"model": "m1", "apiKeySource": "none"})).unwrap();
+        db.add_event(Some(t2), "lead", "init", &json!({"model": "m2", "apiKeySource": "env"})).unwrap();
+        db.add_event(Some(t3), "lead", "init", &json!({"session_id": "s"})).unwrap();
+        db.add_event(Some(t3), "lead", "assistant", &json!({})).unwrap();
+        let (st, v) = call(&app, "GET", "/tasks/runs", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let runs = v.as_array().unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0]["agent"].as_str(), runs[0]["model"].as_str()), (Some("builder"), Some("m1")));
+        assert_eq!(runs[0]["seat"].as_str(), Some("subscription"));
+        assert_eq!(runs[1]["seat"].as_str(), Some("api_key"));
+        assert_eq!(runs[2]["seat"].as_str(), Some("unknown"));
+        assert!(runs[2]["model"].is_null());
+    }
+
+    #[tokio::test]
+    async fn events_after_id_oldest_first_with_limit() {
+        let (app, db, _rx) = setup();
+        let ids: Vec<i64> = (0..5).map(|i| db.add_event(None, "rui", "k", &json!({"i": i})).unwrap()).collect();
+        let (_, v) = call(&app, "GET", &format!("/events?after_id={}", ids[1]), None).await;
+        let got: Vec<i64> = v.as_array().unwrap().iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        assert_eq!(got, ids[2..]);
+        let (_, v) = call(&app, "GET", &format!("/events?after_id={}&limit=2", ids[0]), None).await;
+        let got: Vec<i64> = v.as_array().unwrap().iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        assert_eq!(got, ids[1..3]);
     }
 
     #[tokio::test]

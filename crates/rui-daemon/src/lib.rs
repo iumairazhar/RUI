@@ -4,5 +4,6 @@ pub mod db;
 pub mod mcp;
 pub mod runner;
 pub mod scheduler;
+pub mod seat;
 pub mod state;
 pub mod worktree;

@@ -225,12 +225,10 @@ fn spawn_turn<F, Fut>(
 /// Turns a parsed line into an event kind and JSON payload.
 pub fn line_event(p: &ParsedLine) -> (&'static str, Value) {
     match p {
-        ParsedLine::Init { session_id } => ("init", json!({"session_id": session_id})),
+        ParsedLine::Init { raw, .. } => ("init", raw.clone()),
         ParsedLine::Assistant(v) => ("assistant", v.clone()),
         ParsedLine::ToolResult(v) => ("toolresult", v.clone()),
-        ParsedLine::Result { session_id, text, is_error } => {
-            ("result", json!({"session_id": session_id, "text": text, "is_error": is_error}))
-        }
+        ParsedLine::Result { raw, .. } => ("result", raw.clone()),
         ParsedLine::Other(v) => ("other", v.clone()),
     }
 }
@@ -402,6 +400,17 @@ async fn finish_builder(db: &Db, task: &Task, wt: &std::path::Path, done_command
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_line_event_keeps_raw_fields() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-x","apiKeySource":"none"}"#;
+        let p = crate::runner::parse_line(line).unwrap();
+        let (kind, payload) = line_event(&p);
+        assert_eq!(kind, "init");
+        assert_eq!(payload["model"], "claude-x");
+        assert_eq!(payload["apiKeySource"], "none");
+        assert_eq!(payload["session_id"], "s");
+    }
     use crate::db::NewTask;
     use rui_core::SourceKind;
 

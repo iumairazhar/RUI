@@ -382,6 +382,38 @@ impl Db {
         Ok(stmt.query_map(params![task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Events with id > `after_id`, oldest first, at most `limit`.
+    pub fn list_events_after(&self, task_id: Option<i64>, after_id: i64, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, agent, kind, payload, created_at FROM events \
+             WHERE id > ?1 AND (?2 IS NULL OR task_id = ?2) ORDER BY id LIMIT ?3",
+        )?;
+        Ok(stmt.query_map(params![after_id, task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The newest "init" event of each task, newest task id last.
+    pub fn latest_init_per_task(&self) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, agent, kind, payload, created_at FROM events \
+             WHERE id IN (SELECT MAX(id) FROM events WHERE kind = 'init' AND task_id IS NOT NULL GROUP BY task_id) \
+             ORDER BY task_id",
+        )?;
+        Ok(stmt.query_map([], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The model string of the newest "init" event that has one.
+    pub fn latest_model(&self) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(payload, '$.model') AS m FROM events \
+             WHERE kind = 'init' AND typeof(json_extract(payload, '$.model')) = 'text' \
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row([], |r| r.get(0)).ok())
+    }
+
     // ---- sessions ----
 
     /// Saved agent session id for a role and optional task.

@@ -31,10 +31,10 @@ pub struct RunOutcome {
 
 /// One parsed stream-json line.
 pub enum ParsedLine {
-    Init { session_id: String },
+    Init { session_id: String, raw: Value },
     Assistant(Value),
     ToolResult(Value),
-    Result { session_id: Option<String>, text: Option<String>, is_error: bool },
+    Result { session_id: Option<String>, text: Option<String>, is_error: bool, raw: Value },
     Other(Value),
 }
 
@@ -83,7 +83,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
     Some(match v.get("type").and_then(Value::as_str) {
         Some("system") if s("subtype").as_deref() == Some("init") => {
-            ParsedLine::Init { session_id: s("session_id").unwrap_or_default() }
+            ParsedLine::Init { session_id: s("session_id").unwrap_or_default(), raw: v }
         }
         Some("assistant") => ParsedLine::Assistant(v),
         Some("user") => ParsedLine::ToolResult(v),
@@ -91,6 +91,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
             session_id: s("session_id"),
             text: s("result"),
             is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            raw: v,
         },
         _ => ParsedLine::Other(v),
     })
@@ -156,8 +157,8 @@ async fn run_with_config(
 
 fn track(out: &mut RunOutcome, p: &ParsedLine) {
     match p {
-        ParsedLine::Init { session_id } => out.session_id = Some(session_id.clone()),
-        ParsedLine::Result { session_id, text, is_error } => {
+        ParsedLine::Init { session_id, .. } => out.session_id = Some(session_id.clone()),
+        ParsedLine::Result { session_id, text, is_error, .. } => {
             if session_id.is_some() {
                 out.session_id = session_id.clone();
             }
@@ -191,12 +192,12 @@ mod tests {
     #[test]
     fn parses_each_variant() {
         let init = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
-        assert!(matches!(parse_line(init), Some(ParsedLine::Init { session_id }) if session_id == "s1"));
+        assert!(matches!(parse_line(init), Some(ParsedLine::Init { session_id, .. }) if session_id == "s1"));
         assert!(matches!(parse_line(r#"{"type":"assistant"}"#), Some(ParsedLine::Assistant(_))));
         assert!(matches!(parse_line(r#"{"type":"user"}"#), Some(ParsedLine::ToolResult(_))));
         let res = r#"{"type":"result","session_id":"s2","result":"hi","is_error":true}"#;
         match parse_line(res) {
-            Some(ParsedLine::Result { session_id, text, is_error }) => {
+            Some(ParsedLine::Result { session_id, text, is_error, .. }) => {
                 assert_eq!(session_id.as_deref(), Some("s2"));
                 assert_eq!(text.as_deref(), Some("hi"));
                 assert!(is_error);
