@@ -228,6 +228,16 @@ pub mod logic {
         Ok(serde_json::to_value(task)?)
     }
 
+    /// Latest done-check result for a task, or null if it never ran.
+    fn last_check(db: &Db, task_id: i64) -> Value {
+        let events = db.list_events(Some(task_id), 1000).unwrap_or_default();
+        match events.iter().rev().find(|e| e.kind == "done_check") {
+            Some(e) => json!({"passed": e.payload["passed"], "output_tail": e.payload["output_tail"],
+                              "at": e.created_at}),
+            None => Value::Null,
+        }
+    }
+
     /// Summarises clients with their tasks, plus open questions.
     pub fn report_status(db: &Db, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
         let tasks = db.list_tasks()?;
@@ -241,7 +251,7 @@ pub mod logic {
                     .map(|t| {
                         json!({"id": t.id, "title": t.title, "status": t.status,
                                "parent_id": t.parent_id, "loops_used": t.loops_used,
-                               "max_loops": t.max_loops})
+                               "max_loops": t.max_loops, "last_check": last_check(db, t.id)})
                     })
                     .collect();
                 json!({"id": c.id, "name": c.name, "tasks": ts})
@@ -585,6 +595,14 @@ mod tests {
         assert_eq!(s["clients"][0]["name"], "Acme");
         assert_eq!(s["clients"][0]["tasks"][0]["status"], "waiting_answer");
         assert_eq!(s["open_questions"][0]["text"], "why?");
+        assert!(s["clients"][0]["tasks"][0]["last_check"].is_null());
+        let id = s["clients"][0]["tasks"][0]["id"].as_i64().unwrap();
+        db.add_event(Some(id), "scheduler", "done_check",
+            &json!({"passed": true, "output_tail": "test result: ok"})).unwrap();
+        let s = logic::report_status(&db, &ctx, NoArgs {}).unwrap();
+        let c = &s["clients"][0]["tasks"][0]["last_check"];
+        assert_eq!(c["passed"], true);
+        assert_eq!(c["output_tail"], "test result: ok");
     }
 
     #[test]
@@ -738,6 +756,7 @@ mod tests {
             ),
             system_prompt: "You are Rui.".into(),
             allowed_tools: vec!["mcp__rui__create_client".into()],
+            builtin_tools: None,
             permission_mode: None,
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
             mcp_headers: vec![],

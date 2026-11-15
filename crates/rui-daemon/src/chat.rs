@@ -35,6 +35,8 @@ async fn handle(db: &Db, cfg: &Config, id: i64) -> Result<()> {
         prompt: msg.content,
         system_prompt: RUI_PROMPT.into(),
         allowed_tools: RUI_TOOLS.split(',').map(String::from).collect(),
+        // Rui only delegates: no shell, file or web tools, just its MCP tools.
+        builtin_tools: Some(String::new()),
         permission_mode: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
         mcp_headers: vec![("X-Rui-Source-Ref".into(), format!("chat:{id}"))],

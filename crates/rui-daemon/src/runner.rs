@@ -15,6 +15,8 @@ pub struct AgentRun {
     pub prompt: String,
     pub system_prompt: String,
     pub allowed_tools: Vec<String>,
+    /// Built-in CLI tools the agent may see; `Some("")` hides them all.
+    pub builtin_tools: Option<String>,
     pub permission_mode: Option<String>,
     pub mcp_url: String,
     pub mcp_headers: Vec<(String, String)>,
@@ -65,6 +67,10 @@ pub fn build_args(run: &AgentRun, mcp_config_path: &Path) -> Vec<String> {
     if !run.allowed_tools.is_empty() {
         a.push("--allowedTools".into());
         a.push(run.allowed_tools.join(","));
+    }
+    if let Some(t) = &run.builtin_tools {
+        a.push("--tools".into());
+        a.push(t.clone());
     }
     if let Some(m) = &run.permission_mode {
         a.push("--permission-mode".into());
@@ -182,6 +188,7 @@ mod tests {
             prompt: "hello".into(),
             system_prompt: "sys".into(),
             allowed_tools: vec![],
+            builtin_tools: None,
             permission_mode: None,
             mcp_url: "http://127.0.0.1:1/none".into(),
             mcp_headers: vec![],
@@ -234,14 +241,17 @@ mod tests {
         assert!(!a.contains(&"--allowedTools".to_string()));
         assert!(!a.contains(&"--permission-mode".to_string()));
         assert!(!a.contains(&"--resume".to_string()));
+        assert!(!a.contains(&"--tools".to_string()));
         r.allowed_tools = vec!["Read".into(), "Bash".into()];
         r.permission_mode = Some("acceptEdits".into());
         r.resume = Some("abc".into());
+        r.builtin_tools = Some(String::new());
         let a = build_args(&r, Path::new("/x.json"));
         let pos = |k: &str| a.iter().position(|x| x == k).unwrap();
         assert_eq!(a[pos("--allowedTools") + 1], "Read,Bash");
         assert_eq!(a[pos("--permission-mode") + 1], "acceptEdits");
         assert_eq!(a[pos("--resume") + 1], "abc");
+        assert_eq!(a[pos("--tools") + 1], "");
     }
 
     #[test]
