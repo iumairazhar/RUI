@@ -2,7 +2,7 @@
 
 use super::{button, column};
 use crate::store::{self, Store};
-use crate::text_input::TextInput;
+use crate::text_input::{Submit, TextInput};
 use gpui::{Context, Entity, Window, div, prelude::*, px, rgb};
 use rui_core::Question;
 use std::collections::HashMap;
@@ -23,9 +23,13 @@ impl QuestionsView {
     fn sync_inputs(&mut self, questions: &[Question], cx: &mut Context<Self>) {
         self.inputs.retain(|id, _| questions.iter().any(|q| q.id == *id));
         for q in questions {
-            self.inputs
-                .entry(q.id)
-                .or_insert_with(|| cx.new(|cx| TextInput::new("Your answer...", cx)));
+            if self.inputs.contains_key(&q.id) {
+                continue;
+            }
+            let id = q.id;
+            let input = cx.new(|cx| TextInput::new("Your answer...", cx));
+            cx.subscribe(&input, move |this, _, _: &Submit, cx| this.answer(id, cx)).detach();
+            self.inputs.insert(id, input);
         }
     }
 

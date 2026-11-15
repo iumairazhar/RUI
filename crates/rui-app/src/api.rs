@@ -1,7 +1,7 @@
 //! Blocking HTTP client for the RUI daemon.
 
 use anyhow::Result;
-use rui_core::{ChatMessage, Client, Question, Task};
+use rui_core::{ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
 use std::time::Duration;
 
 /// Base URL of the daemon (`RUI_URL` or the default local address).
@@ -47,6 +47,25 @@ pub fn get_questions_open() -> Result<Vec<Question>> {
 /// Fetch the latest 200 chat messages.
 pub fn get_chat() -> Result<Vec<ChatMessage>> {
     Ok(serde_json::from_value(get("/chat?limit=200")?)?)
+}
+
+/// Fetch the signed-in seat info.
+pub fn get_seat() -> Result<SeatInfo> {
+    Ok(serde_json::from_value(get("/seat")?)?)
+}
+
+/// Fetch the latest run (model and seat) per task.
+pub fn get_task_runs() -> Result<Vec<TaskRun>> {
+    Ok(serde_json::from_value(get("/tasks/runs")?)?)
+}
+
+/// Fetch events oldest first: those after `after_id`, or the newest `limit` if `None`.
+pub fn get_events_after(after_id: Option<i64>, limit: usize) -> Result<Vec<Event>> {
+    let path = match after_id {
+        Some(id) => format!("/events?after_id={id}&limit={limit}"),
+        None => format!("/events?limit={limit}"),
+    };
+    Ok(serde_json::from_value(get(&path)?)?)
 }
 
 /// Post a user chat message.

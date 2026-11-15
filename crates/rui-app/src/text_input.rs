@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
     div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
@@ -26,12 +26,18 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Enter,
     ]
 );
+
+/// Emitted when the user presses Enter in a text input.
+pub struct Submit;
+
 
 /// Register the key bindings for all text inputs. Call once at startup.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("enter", Enter, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
         KeyBinding::new("left", Left, Some("TextInput")),
@@ -123,6 +129,10 @@ impl TextInput {
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.content.len(), cx);
+    }
+
+    fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Submit);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -607,6 +617,8 @@ impl Element for TextElement {
     }
 }
 
+impl EventEmitter<Submit> for TextInput {}
+
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -614,6 +626,7 @@ impl Render for TextInput {
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))

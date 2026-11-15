@@ -1,8 +1,10 @@
 //! UI columns.
 
+pub mod activity;
 pub mod board;
 pub mod chat;
 pub mod questions;
+pub mod seat;
 
 use gpui::{Div, div, prelude::*, px, rgb};
 

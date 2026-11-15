@@ -2,7 +2,7 @@
 
 use super::{button, column};
 use crate::store::{self, Store};
-use crate::text_input::TextInput;
+use crate::text_input::{Submit, TextInput};
 use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px, rgb};
 use rui_core::ChatRole;
 
@@ -19,6 +19,7 @@ impl ChatView {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Message Rui...", cx));
+        cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         Self { store, input, scroll: ScrollHandle::new(), last_len: 0 }
     }
 
