@@ -103,6 +103,29 @@ pub struct AgentSession {
     pub session_id: String,
 }
 
+/// Which account the agent CLI is signed in with, plus the last model used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeatInfo {
+    pub logged_in: bool,
+    pub auth_method: Option<String>,
+    pub email: Option<String>,
+    pub subscription_type: Option<String>,
+    pub org_name: Option<String>,
+    pub last_model: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The latest agent run for a task: which model and seat kind it used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub task_id: i64,
+    pub agent: String,
+    pub model: Option<String>,
+    /// "subscription", "api_key" or "unknown".
+    pub seat: String,
+    pub at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
