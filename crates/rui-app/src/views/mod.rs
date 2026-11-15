@@ -14,7 +14,6 @@ use gpui::{
 use rui_core::TaskStatus;
 
 /// Page header: small eyebrow line above a big title. Pass the eyebrow already uppercase.
-#[allow(dead_code)]
 pub fn page_head(eyebrow: &str, title: &str, cx: &App) -> Div {
     let th = theme(cx);
     let eyebrow = div()
@@ -48,13 +47,11 @@ pub fn tag(status: &Status, text: &str) -> Div {
 }
 
 /// Raised surface card.
-#[allow(dead_code)]
 pub fn card(cx: &App) -> Div {
     let th = theme(cx);
     div().bg(th.surface).rounded(px(9.)).py(px(9.)).px(px(10.)).shadow(th.card_shadow())
 }
 
-#[allow(dead_code)]
 fn abs_box(x: f32, y: f32, w: f32, h: f32, r: f32, s: f32, color: Hsla) -> Div {
     div()
         .absolute()
@@ -67,7 +64,6 @@ fn abs_box(x: f32, y: f32, w: f32, h: f32, r: f32, s: f32, color: Hsla) -> Div {
 }
 
 /// Little robot avatar drawn from divs, scaled from a 56 unit box.
-#[allow(dead_code)]
 pub fn avatar(color: Hsla, bulb: Hsla, size: Pixels, cx: &App) -> Div {
     let th = theme(cx);
     let s = f32::from(size) / 56.;
@@ -105,7 +101,6 @@ pub fn primary_button(id: impl Into<SharedString>, label: &str, cx: &App) -> Sta
 }
 
 /// Neutral small button.
-#[allow(dead_code)]
 pub fn chip(id: impl Into<SharedString>, label: &str, cx: &App) -> Stateful<Div> {
     let th = theme(cx);
     div()
@@ -137,7 +132,6 @@ pub fn task_status<'a>(t: &TaskStatus, th: &'a Theme) -> &'a Status {
 }
 
 /// Amber card holding a question, an answer input and its button.
-#[allow(dead_code)]
 pub fn question_card(text: &str, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
     let th = theme(cx);
     let head = div()

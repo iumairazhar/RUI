@@ -1,8 +1,9 @@
 //! Activity panel: a live feed of agent events.
 
 use crate::store::{self, Store};
-use crate::theme::{Theme, theme};
-use gpui::{Context, Entity, Hsla, ScrollHandle, Window, div, prelude::*, px};
+use super::{page_head, tag};
+use crate::theme::{Status, Theme, theme};
+use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
 use rui_core::Event;
 use serde_json::Value;
 
@@ -133,12 +134,12 @@ pub fn summarize(e: &Event) -> (String, bool) {
     }
 }
 
-fn agent_color(agent: &str, th: &Theme) -> Hsla {
+fn agent_status<'a>(agent: &str, th: &'a Theme) -> &'a Status {
     match agent {
-        "rui" => th.run.fg,
-        "lead" => th.think.fg,
-        "builder" => th.accent_text,
-        _ => th.muted,
+        "rui" => &th.think,
+        "lead" => &th.wait,
+        "builder" => &th.run,
+        _ => &th.done,
     }
 }
 
@@ -148,17 +149,36 @@ fn clock(created_at: &str) -> String {
 
 fn row(e: &Event, th: &Theme) -> impl IntoElement + use<> {
     let (text, is_error) = summarize(e);
-    let task = e.task_id.map(|t| format!("#{t}")).unwrap_or_else(|| "—".into());
-    let body = if is_error { th.block.fg } else { th.fg_2 };
+    let task = e.task_id.map(|t| format!("#{t}")).unwrap_or_default();
+    let body = if is_error { th.block.fg } else { th.fg };
     div()
+        .id(("event", e.id as usize))
         .flex()
-        .gap_2()
-        .text_size(px(12.))
-        .font_family("Menlo")
-        .child(div().flex_none().text_color(th.muted).child(clock(&e.created_at)))
-        .child(div().flex_none().w(px(64.)).text_color(agent_color(&e.agent, th)).child(e.agent.clone()))
-        .child(div().flex_none().w(px(32.)).text_color(th.muted).child(task))
-        .child(div().flex_1().min_w_0().text_color(body).child(text))
+        .items_start()
+        .gap(px(10.))
+        .py(px(6.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .hover(|s| s.bg(th.surface_2))
+        .child(
+            div()
+                .flex_none()
+                .font_family("Menlo")
+                .text_size(px(10.5))
+                .text_color(th.muted)
+                .child(clock(&e.created_at)),
+        )
+        .child(tag(agent_status(&e.agent, th), &e.agent))
+        .child(
+            div()
+                .flex_none()
+                .min_w(px(32.))
+                .font_family("Menlo")
+                .text_size(px(11.))
+                .text_color(th.muted)
+                .child(task),
+        )
+        .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(body).child(text))
 }
 
 impl Render for ActivityView {
@@ -170,18 +190,24 @@ impl Render for ActivityView {
             self.last_id = newest;
             self.scroll.scroll_to_bottom();
         }
-        div().flex().flex_col().size_full().p(px(14.)).gap_3().child(
-            div()
-                .id("activity-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll)
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(events.iter().map(|e| row(e, &th))),
-        )
+        let list = div()
+            .flex()
+            .flex_col()
+            .bg(th.surface)
+            .rounded(px(12.))
+            .shadow(th.card_shadow())
+            .p(px(8.))
+            .children(events.iter().map(|e| row(e, &th)));
+        let body = div()
+            .id("activity-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .mr(px(40.))
+            .mb(px(28.))
+            .child(list);
+        div().flex().flex_col().size_full().child(page_head("LIVE", "Threads", cx)).child(body)
     }
 }
 

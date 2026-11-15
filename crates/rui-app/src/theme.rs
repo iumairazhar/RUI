@@ -1,7 +1,6 @@
 //! Color tokens for the light and dark appearances.
 
 // Some tokens are consumed by views that are restyled later.
-#![allow(dead_code)]
 
 use gpui::{App, BoxShadow, Global, Hsla, WindowAppearance, point, px, rgb};
 

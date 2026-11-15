@@ -1,13 +1,15 @@
-//! Task board column.
+//! Work page: commitments laid out in lanes, left to right.
 
-use super::{task_status, tag};
+use super::{card, page_head};
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
-use gpui::{Context, Entity, Window, div, prelude::*, px};
+use gpui::{Context, Entity, FontWeight, Window, div, prelude::*, px};
 use rui_core::{Task, TaskRun, TaskStatus};
-use std::collections::HashMap;
 
-/// Tasks grouped by client, subtasks nested.
+/// Lane names, left to right.
+const LANES: [&str; 5] = ["Taken in", "Shaped", "Being built", "Your call", "Delivered"];
+
+/// Tasks grouped into lanes by status.
 pub struct BoardView {
     store: Entity<Store>,
 }
@@ -20,77 +22,184 @@ impl BoardView {
     }
 }
 
-fn pill(s: TaskStatus, th: &Theme) -> impl IntoElement {
-    tag(task_status(&s, th), s.as_str())
+/// Which lane a status belongs to.
+fn lane_of(s: TaskStatus) -> usize {
+    match s {
+        TaskStatus::New => 0,
+        TaskStatus::Clarifying | TaskStatus::Split => 1,
+        TaskStatus::Open | TaskStatus::InProgress => 2,
+        TaskStatus::WaitingAnswer | TaskStatus::Stuck => 3,
+        TaskStatus::Done => 4,
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 fn seat_text(run: &TaskRun) -> String {
     let seat = match run.seat.as_str() {
         "subscription" => "subscription",
-        "api_key" => "API key",
+        "api_key" => "api key",
         _ => "unknown",
     };
     format!("{} · {seat}", run.model.as_deref().unwrap_or("—"))
 }
 
-fn task_row(t: &Task, indent: bool, run: Option<&TaskRun>, th: &Theme) -> impl IntoElement {
-    let row = div().flex().flex_col().py(px(4.)).text_sm();
-    let row = if indent { row.pl(px(20.)) } else { row };
-    let note = run.map(|r| div().text_xs().text_color(th.muted).child(seat_text(r)));
-    row.child(task_main(t, th)).children(note)
+fn meta_text(t: &Task, client: &str) -> String {
+    let base = format!("{client} · {}", capitalize(t.role.as_str()));
+    match t.parent_id {
+        Some(p) => format!("{base} · #{p}"),
+        None => base,
+    }
 }
 
-fn task_main(t: &Task, th: &Theme) -> impl IntoElement {
+fn task_card(
+    t: &Task,
+    client: &str,
+    run: Option<&TaskRun>,
+    th: &Theme,
+    cx: &gpui::App,
+) -> impl IntoElement {
+    let meta = div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .mt(px(6.))
+        .text_size(px(10.5))
+        .text_color(th.muted)
+        .child(div().size(px(8.)).flex_none().rounded_full().bg(th.client_color(t.client_id)))
+        .child(meta_text(t, client));
+    let note = run.map(|r| div().text_size(px(10.5)).text_color(th.muted).child(seat_text(r)));
+    card(cx)
+        .id(("task-card", t.id as usize))
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(th.fg)
+                .line_height(px(16.2))
+                .child(t.title.clone()),
+        )
+        .child(meta)
+        .children(note)
+}
+
+fn lane_header(i: usize, count: usize, th: &Theme) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap_2()
-        .child(pill(t.status, th))
-        .child(div().flex_1().child(t.title.clone()))
+        .justify_between()
+        .px(px(12.))
+        .pt(px(12.))
+        .pb(px(8.))
         .child(
             div()
-                .text_xs()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(th.fg)
+                .child(LANES[i]),
+        )
+        .child(
+            div()
+                .font_family("Menlo")
+                .text_size(px(11.))
                 .text_color(th.muted)
-                .child(format!("{}/{}", t.loops_used, t.max_loops)),
+                .child(count.to_string()),
         )
 }
 
-fn client_block(
-    name: &str,
-    tasks: &[Task],
-    runs: &HashMap<i64, TaskRun>,
-    client_id: i64,
-    th: &Theme,
-) -> impl IntoElement {
-    let mine: Vec<&Task> = tasks.iter().filter(|t| t.client_id == client_id).collect();
-    let mut block = div().flex().flex_col().gap_1().child(
-        div().text_color(th.fg).pb(px(4.)).child(name.to_string()),
-    );
-    for top in mine.iter().filter(|t| t.parent_id.is_none()) {
-        block = block.child(task_row(top, false, runs.get(&top.id), th));
-        for sub in mine.iter().filter(|t| t.parent_id == Some(top.id)) {
-            block = block.child(task_row(sub, true, runs.get(&sub.id), th));
-        }
-    }
-    block
+fn lane(i: usize, cards: Vec<gpui::AnyElement>, th: &Theme) -> impl IntoElement {
+    let count = cards.len();
+    let body = div().id(("lane-body", i)).flex().flex_col().gap(px(6.)).px(px(8.)).pb(px(8.));
+    let body = if cards.is_empty() {
+        body.child(div().p(px(4.)).text_size(px(11.5)).text_color(th.muted).child("Empty"))
+    } else {
+        body.children(cards)
+    };
+    div()
+        .id(("lane", i))
+        .flex_1()
+        .min_w(px(168.))
+        .bg(th.well)
+        .rounded(px(12.))
+        .border_1()
+        .border_color(th.hairline)
+        .flex()
+        .flex_col()
+        .child(lane_header(i, count, th))
+        .child(body)
+}
+
+fn lead_line(open: usize, th: &Theme) -> impl IntoElement {
+    div()
+        .id("work-lead")
+        .pb(px(20.))
+        .text_size(px(15.))
+        .text_color(th.fg_2)
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(5.))
+                .child(
+                    div()
+                        .text_size(px(19.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(th.fg)
+                        .child(open.to_string()),
+                )
+                .child("open commitments. They only move left to right."),
+        )
 }
 
 impl Render for BoardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let s = self.store.read(cx);
-        let blocks: Vec<_> =
-            s.clients.iter().map(|c| client_block(&c.name, &s.tasks, &s.runs, c.id, &th)).collect();
-        div().flex().flex_col().size_full().p(px(14.)).gap_3().child(
-            div()
-                .id("board-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .children(blocks),
-        )
+        let open = s.tasks.iter().filter(|t| t.status != TaskStatus::Done).count();
+        let mut cards: Vec<Vec<gpui::AnyElement>> = (0..LANES.len()).map(|_| Vec::new()).collect();
+        for t in &s.tasks {
+            let name = s.clients.iter().find(|c| c.id == t.client_id).map_or("", |c| c.name.as_str());
+            cards[lane_of(t.status)]
+                .push(task_card(t, name, s.runs.get(&t.id), &th, cx).into_any_element());
+        }
+        let lanes: Vec<_> = cards.into_iter().enumerate().map(|(i, c)| lane(i, c, &th)).collect();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .pr(px(40.))
+            .child(page_head("COMMITMENTS", "Work", cx))
+            .child(lead_line(open, &th))
+            .child(
+                div()
+                    .id("work-lanes")
+                    .flex()
+                    .gap(px(8.))
+                    .pb(px(28.))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_x_scroll()
+                    .children(lanes),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_status_has_a_lane() {
+        for s in TaskStatus::ALL {
+            assert!(lane_of(*s) < LANES.len());
+        }
+        assert_eq!(lane_of(TaskStatus::Stuck), 3);
+        assert_eq!(lane_of(TaskStatus::Done), 4);
     }
 }
