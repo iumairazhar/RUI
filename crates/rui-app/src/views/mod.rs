@@ -1,10 +1,15 @@
 //! UI views and shared building blocks.
 
 pub mod activity;
+pub mod apps;
 pub mod board;
 pub mod chat;
+pub mod live;
+pub mod markdown;
 pub mod questions;
 pub mod seat;
+pub mod skills;
+pub mod trace;
 
 use crate::theme::{Status, Theme, theme};
 use gpui::{
@@ -26,7 +31,7 @@ pub fn page_head(eyebrow: &str, title: &str, cx: &App) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(th.fg)
         .child(title.to_string());
-    div().flex().flex_col().gap(px(7.)).pt(px(40.)).pb(px(20.)).child(eyebrow).child(title)
+    div().flex().flex_col().gap(px(7.)).pt(px(56.)).pb(px(20.)).child(eyebrow).child(title)
 }
 
 /// Small colored status tag.

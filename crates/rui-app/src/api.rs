@@ -1,7 +1,9 @@
 //! Blocking HTTP client for the RUI daemon.
 
 use anyhow::Result;
-use rui_core::{ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
+use serde::Deserialize;
+use rui_core::{Chat, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Base URL of the daemon (`RUI_URL` or the default local address).
@@ -44,9 +46,21 @@ pub fn get_questions_open() -> Result<Vec<Question>> {
     Ok(serde_json::from_value(get("/questions?status=open")?)?)
 }
 
-/// Fetch the latest 200 chat messages.
-pub fn get_chat() -> Result<Vec<ChatMessage>> {
-    Ok(serde_json::from_value(get("/chat?limit=200")?)?)
+/// Fetch all chats, newest updated first.
+pub fn get_chats() -> Result<Vec<Chat>> {
+    Ok(serde_json::from_value(get("/chats")?)?)
+}
+
+/// Create a chat; the daemon seeds it with Rui's first message.
+pub fn create_chat() -> Result<Chat> {
+    let url = format!("{}/chats", base_url());
+    let body = agent().post(&url).send_json(serde_json::json!({}))?.body_mut().read_json()?;
+    Ok(serde_json::from_value(body)?)
+}
+
+/// Fetch the latest 200 messages of one chat, oldest first.
+pub fn get_chat(chat_id: i64) -> Result<Vec<ChatMessage>> {
+    Ok(serde_json::from_value(get(&format!("/chat?chat_id={chat_id}&limit=200"))?)?)
 }
 
 /// Fetch the signed-in seat info.
@@ -68,9 +82,149 @@ pub fn get_events_after(after_id: Option<i64>, limit: usize) -> Result<Vec<Event
     Ok(serde_json::from_value(get(&path)?)?)
 }
 
-/// Post a user chat message.
-pub fn post_chat(content: &str) -> Result<()> {
-    post("/chat", serde_json::json!({ "content": content }))
+/// Fetch one task's newest events, oldest first.
+pub fn task_events(task_id: i64) -> Result<Vec<Event>> {
+    Ok(serde_json::from_value(get(&format!("/events?task_id={task_id}&limit=400"))?)?)
+}
+
+/// One file changed by a task.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Change {
+    pub file: String,
+    pub added: i64,
+    pub removed: i64,
+    /// Unified diff text; empty when the daemon does not send one.
+    #[serde(default)]
+    pub diff: String,
+}
+
+/// A file's content from a task's worktree.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TaskFile {
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// What one running agent turn is doing right now.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LiveState {
+    /// Streaming assistant text (tail-capped by the daemon).
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub thinking: bool,
+    /// Tool currently being called.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Partial JSON of the tool input; may be incomplete.
+    #[serde(default)]
+    pub tool_input: String,
+    #[serde(default)]
+    pub at: String,
+}
+
+/// Live state of every running task and chat turn, keyed by id.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct LiveSnapshot {
+    #[serde(default)]
+    pub tasks: HashMap<String, LiveState>,
+    #[serde(default)]
+    pub chats: HashMap<String, LiveState>,
+}
+
+impl LiveSnapshot {
+    /// Live state of a task, if its turn is running.
+    pub fn task(&self, id: i64) -> Option<&LiveState> {
+        self.tasks.get(&id.to_string())
+    }
+
+    /// Live state of a chat, if its turn is running.
+    pub fn chat(&self, id: i64) -> Option<&LiveState> {
+        self.chats.get(&id.to_string())
+    }
+}
+
+/// Fetch what running tasks and chats are doing right now.
+pub fn get_live() -> Result<LiveSnapshot> {
+    Ok(serde_json::from_value(get("/live")?)?)
+}
+
+/// Percent-encode everything except unreserved characters and '/'.
+fn encode_path(path: &str) -> String {
+    let keep = |b: u8| b.is_ascii_alphanumeric() || b"-._~/".contains(&b);
+    path.bytes().map(|b| if keep(b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Fetch one file of a task's worktree.
+pub fn task_file(id: i64, path: &str) -> Result<TaskFile> {
+    let url = format!("/tasks/{id}/file?path={}", encode_path(path));
+    Ok(serde_json::from_value(get(&url)?)?)
+}
+
+/// One app a team started for a project.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AppInfo {
+    pub project: String,
+    pub name: String,
+    pub port: u16,
+    pub url: String,
+    pub status: String,
+    #[serde(default)]
+    pub log: Vec<String>,
+}
+
+/// One skill (SKILL.md) from the daemon.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub bash: Vec<String>,
+    #[serde(default)]
+    pub run_hint: Option<String>,
+    pub body: String,
+}
+
+/// Fetch all apps, sorted by project then name.
+pub fn get_apps() -> Result<Vec<AppInfo>> {
+    Ok(serde_json::from_value(get("/apps")?)?)
+}
+
+/// Fetch all skills.
+pub fn get_skills() -> Result<Vec<SkillInfo>> {
+    Ok(serde_json::from_value(get("/skills")?)?)
+}
+
+/// Restart a project's apps.
+pub fn restart_apps(project: &str) -> Result<()> {
+    post(&format!("/apps/{}/restart", encode_path(project)), serde_json::json!({}))
+}
+
+/// Stop a project's apps.
+pub fn stop_apps(project: &str) -> Result<()> {
+    post(&format!("/apps/{}/stop", encode_path(project)), serde_json::json!({}))
+}
+
+/// Stop a running task.
+pub fn stop(id: i64) -> Result<()> {
+    post(&format!("/tasks/{id}/stop"), serde_json::json!({}))
+}
+
+/// Pass new instructions down to a task.
+pub fn instruct(id: i64, text: &str) -> Result<()> {
+    post(&format!("/tasks/{id}/instruct"), serde_json::json!({ "text": text }))
+}
+
+/// Fetch the files a task changed.
+pub fn changes(id: i64) -> Result<Vec<Change>> {
+    Ok(serde_json::from_value(get(&format!("/tasks/{id}/changes"))?)?)
+}
+
+/// Post a user message to a chat.
+pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
+    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))
 }
 
 /// Answer a question by id.
@@ -83,6 +237,20 @@ pub fn post_answer(question_id: i64, answer: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rui_core::{ChatRole, QuestionStatus, TaskStatus};
+
+    #[test]
+    fn parses_live() {
+        let j = r#"{"tasks":{"7":{"text":"hi","thinking":false,"tool":"Bash",
+            "tool_input":"{\"command\":\"ls","at":"2026-11-15T10:20:30Z"}},"chats":{"2":{}}}"#;
+        let v: LiveSnapshot = serde_json::from_str(j).unwrap();
+        let t = v.task(7).unwrap();
+        assert_eq!(t.tool.as_deref(), Some("Bash"));
+        assert_eq!(t.text, "hi");
+        assert_eq!(v.chat(2), Some(&LiveState::default()));
+        assert!(v.task(8).is_none() && v.chat(7).is_none());
+        let empty: LiveSnapshot = serde_json::from_str(r#"{"tasks":{},"chats":{}}"#).unwrap();
+        assert_eq!(empty, LiveSnapshot::default());
+    }
 
     #[test]
     fn parses_client() {
@@ -105,13 +273,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_changes() {
+        let j = r#"[{"file":"src/a.rs","added":3,"removed":1}]"#;
+        let v: Vec<Change> = serde_json::from_str(j).unwrap();
+        assert_eq!(v[0], Change { file: "src/a.rs".into(), added: 3, removed: 1, diff: String::new() });
+        let j = r#"[{"file":"a","added":0,"removed":0,"diff":"@@ -1 +1 @@"}]"#;
+        let v: Vec<Change> = serde_json::from_str(j).unwrap();
+        assert_eq!(v[0].diff, "@@ -1 +1 @@");
+    }
+
+    #[test]
+    fn parses_apps_and_skills() {
+        let a = r#"[{"project":"p","name":"api","port":8101,"url":"http://localhost:8101","status":"running","log":["hi"]}]"#;
+        let v: Vec<AppInfo> = serde_json::from_str(a).unwrap();
+        assert_eq!((v[0].port, v[0].log.len()), (8101, 1));
+        let s = r#"[{"name":"x","description":"d","bash":["a *"],"run_hint":null,"body":"b"}]"#;
+        let v: Vec<SkillInfo> = serde_json::from_str(s).unwrap();
+        assert_eq!((v[0].bash.len(), v[0].run_hint.clone()), (1, None));
+    }
+
+    #[test]
+    fn encodes_paths() {
+        assert_eq!(encode_path("src/a b&c.rs"), "src/a%20b%26c.rs");
+    }
+
+    #[test]
     fn parses_question_and_chat() {
         let q = r#"[{"id":3,"task_id":2,"asked_by":"lead","text":"why?","answer":null,
             "status":"open","created_at":"a"}]"#;
         let v: Vec<Question> = serde_json::from_str(q).unwrap();
         assert_eq!(v[0].status, QuestionStatus::Open);
-        let c = r#"[{"id":1,"role":"user","content":"hi","created_at":"a"}]"#;
+        let c = r#"[{"id":1,"chat_id":4,"role":"user","content":"hi","created_at":"a"}]"#;
         let v: Vec<ChatMessage> = serde_json::from_str(c).unwrap();
         assert_eq!(v[0].role, ChatRole::User);
+        assert_eq!(v[0].chat_id, 4);
+    }
+
+    #[test]
+    fn parses_chats() {
+        let j = r#"[{"id":2,"title":"New chat","created_at":"a","updated_at":"b","last":null}]"#;
+        let v: Vec<Chat> = serde_json::from_str(j).unwrap();
+        assert_eq!(v[0].last, None);
     }
 }

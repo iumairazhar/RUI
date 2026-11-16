@@ -90,6 +90,14 @@ impl TextInput {
         self.content.to_string()
     }
 
+    /// Replace the text, put the cursor at the end and notify.
+    pub fn set_content(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.reset();
+        self.content = text.to_string().into();
+        self.selected_range = text.len()..text.len();
+        cx.notify();
+    }
+
     /// Clear the text and notify.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.reset();

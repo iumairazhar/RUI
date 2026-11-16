@@ -119,8 +119,8 @@ pub fn seat_label(seat: &SeatInfo) -> String {
             None => "Not signed in".into(),
         };
     }
+    // The account email is private and never shown in the UI.
     let mut parts = vec![subscription_name(seat)];
-    parts.extend(seat.email.clone());
     parts.push(format!("Model: {}", seat.last_model.as_deref().unwrap_or("—")));
     parts.join(" · ")
 }
@@ -142,13 +142,14 @@ mod tests {
 
     #[test]
     fn full_label() {
-        assert_eq!(seat_label(&seat()), "Claude Max · me@example.com · Model: claude-opus-5-5");
+        assert_eq!(seat_label(&seat()), "Claude Max · Model: claude-opus-5-5");
+        assert!(!seat_label(&seat()).contains('@'), "email must never be shown");
     }
 
     #[test]
     fn pro_and_missing_model() {
         let s = SeatInfo { subscription_type: Some("pro".into()), last_model: None, ..seat() };
-        assert_eq!(seat_label(&s), "Claude Pro · me@example.com · Model: —");
+        assert_eq!(seat_label(&s), "Claude Pro · Model: —");
     }
 
     #[test]

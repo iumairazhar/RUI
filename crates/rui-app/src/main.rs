@@ -16,31 +16,38 @@ use rui_core::QuestionStatus;
 use store::Store;
 use theme::{Theme, theme};
 use views::{
-    activity::ActivityView,
+    activity::ThreadsView,
+    apps::AppsView,
     board::BoardView,
     chat::ChatView,
     questions::QuestionsView,
     seat::{SeatView, seat_label},
+    skills::SkillsView,
 };
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
     Rui,
     Threads,
+    Apps,
     Inbox,
     Work,
+    Skills,
     Seats,
 }
 
 impl Nav {
-    const ALL: [Nav; 5] = [Nav::Rui, Nav::Threads, Nav::Inbox, Nav::Work, Nav::Seats];
+    const ALL: [Nav; 7] =
+        [Nav::Rui, Nav::Threads, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
 
     fn label(self) -> &'static str {
         match self {
             Nav::Rui => "Rui",
             Nav::Threads => "Threads",
+            Nav::Apps => "Apps",
             Nav::Inbox => "Inbox",
             Nav::Work => "Work",
+            Nav::Skills => "Skills",
             Nav::Seats => "Seats",
         }
     }
@@ -49,8 +56,10 @@ impl Nav {
         match self {
             Nav::Rui => "icons/rui.svg",
             Nav::Threads => "icons/threads.svg",
+            Nav::Apps => "icons/apps.svg",
             Nav::Inbox => "icons/inbox.svg",
             Nav::Work => "icons/work.svg",
+            Nav::Skills => "icons/skills.svg",
             Nav::Seats => "icons/seats.svg",
         }
     }
@@ -78,7 +87,9 @@ struct Root {
     chat: Entity<ChatView>,
     board: Entity<BoardView>,
     questions: Entity<QuestionsView>,
-    activity: Entity<ActivityView>,
+    activity: Entity<ThreadsView>,
+    apps: Entity<AppsView>,
+    skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
 }
 
@@ -97,7 +108,9 @@ impl Root {
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
             board: cx.new(|cx| BoardView::new(store.clone(), cx)),
             questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
-            activity: cx.new(|cx| ActivityView::new(store.clone(), cx)),
+            activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
+            apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
+            skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
             store,
         }
@@ -107,8 +120,10 @@ impl Root {
         let page = match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
             Nav::Threads => self.activity.clone().into_any_element(),
+            Nav::Apps => self.apps.clone().into_any_element(),
             Nav::Inbox => self.questions.clone().into_any_element(),
             Nav::Work => self.board.clone().into_any_element(),
+            Nav::Skills => self.skills.clone().into_any_element(),
             Nav::Seats => self.seats.clone().into_any_element(),
         };
         div()
@@ -134,7 +149,8 @@ impl Root {
     }
 
     fn header(&self, th: &Theme, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let error = self.store.read(cx).error.clone();
+        let s = self.store.read(cx);
+        let error = s.error.clone().or_else(|| s.action_error.clone());
         let error = error.map(|e| div().id("header-error").text_color(th.block.fg).child(e));
         div()
             .id("header")
@@ -206,6 +222,9 @@ impl Root {
             .child(icon)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.nav = nav;
+                if nav == Nav::Skills {
+                    this.store.update(cx, |s, cx| s.refresh_skills(cx));
+                }
                 cx.notify();
             }))
             .tooltip(move |_, cx| cx.new(|_| Tooltip(label.into())).into());
