@@ -8,9 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use crate::apps::{self, AppInfo, Apps};
+use crate::live::{self, Live};
+use crate::scheduler::Runs;
 use crate::seat::SeatCache;
+use crate::worktree::{self, Change};
 use rui_core::{
-    ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SeatInfo, SourceKind, Task, TaskRun,
+    Chat, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SeatInfo, SourceKind, Task, TaskRun,
     TaskStatus,
 };
 use serde::Deserialize;
@@ -23,6 +27,10 @@ pub struct ApiState {
     pub db: Arc<Db>,
     pub chat_tx: UnboundedSender<i64>,
     pub seat: SeatCache,
+    pub runs: Runs,
+    pub live: Live,
+    pub data_dir: std::path::PathBuf,
+    pub apps: Apps,
 }
 
 /// Error that renders as `{ "error": msg }` with a status code.
@@ -64,11 +72,55 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
+        .route("/chats", get(list_chats).post(create_chat))
         .route("/chat", get(list_chat).post(post_chat))
         .route("/events", get(list_events))
         .route("/seat", get(get_seat))
+        .route("/live", get(get_live))
         .route("/tasks/runs", get(list_task_runs))
+        .route("/tasks/{id}/changes", get(task_changes))
+        .route("/tasks/{id}/file", get(task_file))
+        .route("/tasks/{id}/stop", post(stop_task))
+        .route("/tasks/{id}/instruct", post(instruct_task))
+        .route("/skills", get(list_skills))
+        .route("/apps", get(list_apps))
+        .route("/apps/{project}/restart", post(restart_apps))
+        .route("/apps/{project}/stop", post(stop_apps))
+        .route("/apps/{project}/{name}/stop", post(stop_app))
         .with_state(state)
+}
+
+async fn list_skills(State(s): State<ApiState>) -> Json<Vec<crate::skills::Skill>> {
+    Json(crate::skills::load_all(&s.data_dir))
+}
+
+async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
+    Json(apps::list(&s.apps))
+}
+
+/// Re-reads the project's apps.json and starts them in the background.
+async fn restart_apps(State(s): State<ApiState>, Path(project): Path<String>) -> ApiResult<StatusCode> {
+    let client = s.db.get_client_by_name(&project)?.ok_or_else(|| not_found("project not found"))?;
+    let repo = crate::scheduler::expand_home(&client.repo_path);
+    let apps = s.apps.clone();
+    tokio::spawn(async move {
+        apps::start_project(&apps, &client.name, &repo).await;
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn stop_apps(State(s): State<ApiState>, Path(project): Path<String>) -> Json<Vec<AppInfo>> {
+    apps::stop_project(&s.apps, &project);
+    Json(apps::list(&s.apps))
+}
+
+async fn stop_app(State(s): State<ApiState>, Path((project, name)): Path<(String, String)>) -> Json<Vec<AppInfo>> {
+    apps::stop_one(&s.apps, &project, &name);
+    Json(apps::list(&s.apps))
+}
+
+async fn get_live(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    Json(live::snapshot(&s.live))
 }
 
 async fn list_clients(State(s): State<ApiState>) -> ApiResult<Json<Vec<Client>>> {
@@ -95,8 +147,23 @@ async fn list_questions(
     Ok(Json(s.db.list_questions(status)?))
 }
 
+const CHAT_GREETING: &str = "What do you want set up?";
+
+async fn list_chats(State(s): State<ApiState>) -> ApiResult<Json<Vec<Chat>>> {
+    Ok(Json(s.db.list_chats()?))
+}
+
+/// Creates a chat that opens with a Rui greeting.
+async fn create_chat(State(s): State<ApiState>) -> ApiResult<(StatusCode, Json<Chat>)> {
+    let chat = s.db.create_chat()?;
+    s.db.add_chat_message(chat.id, ChatRole::Rui, CHAT_GREETING)?;
+    let chat = s.db.get_chat(chat.id)?.ok_or_else(|| not_found("chat not found"))?;
+    Ok((StatusCode::CREATED, Json(chat)))
+}
+
 #[derive(Deserialize)]
 struct ChatQuery {
+    chat_id: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -104,7 +171,11 @@ async fn list_chat(
     State(s): State<ApiState>,
     Query(q): Query<ChatQuery>,
 ) -> ApiResult<Json<Vec<ChatMessage>>> {
-    Ok(Json(s.db.list_chat(q.limit.unwrap_or(100))?))
+    let chat_id = q.chat_id.ok_or_else(|| bad_request("chat_id is required"))?;
+    if s.db.get_chat(chat_id)?.is_none() {
+        return Err(not_found("chat not found"));
+    }
+    Ok(Json(s.db.list_chat(chat_id, q.limit.unwrap_or(100))?))
 }
 
 #[derive(Deserialize)]
@@ -160,6 +231,7 @@ async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun
 
 #[derive(Deserialize)]
 struct ChatBody {
+    chat_id: i64,
     content: String,
 }
 
@@ -168,7 +240,10 @@ async fn post_chat(
     Json(b): Json<ChatBody>,
 ) -> ApiResult<(StatusCode, Json<ChatMessage>)> {
     require_text(&b.content, "content")?;
-    let msg = s.db.add_chat_message(ChatRole::User, &b.content)?;
+    if s.db.get_chat(b.chat_id)?.is_none() {
+        return Err(not_found("chat not found"));
+    }
+    let msg = s.db.add_chat_message(b.chat_id, ChatRole::User, &b.content)?;
     let _ = s.chat_tx.send(msg.id);
     Ok((StatusCode::CREATED, Json(msg)))
 }
@@ -214,8 +289,138 @@ async fn create_task(
         role: Role::Lead,
         source_kind: SourceKind::User,
         source_ref: None,
+        skill: None,
     })?;
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+fn conflict(msg: &str) -> ApiError {
+    ApiError(StatusCode::CONFLICT, msg.into())
+}
+
+/// Removes and aborts the running turn of a task, if there is one.
+fn abort_run(runs: &Runs, id: i64) {
+    let handle = runs.lock().ok().and_then(|mut m| m.remove(&id));
+    if let Some(h) = handle {
+        h.abort();
+    }
+}
+
+#[derive(Deserialize)]
+struct InstructBody {
+    text: String,
+}
+
+/// Saves an owner instruction, aborts any run and puts the task back in the queue.
+async fn instruct_task(
+    State(s): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(b): Json<InstructBody>,
+) -> ApiResult<Json<Task>> {
+    require_text(&b.text, "text")?;
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Split | TaskStatus::WaitingAnswer) {
+        return Err(conflict("task cannot take instructions in its current status"));
+    }
+    abort_run(&s.runs, id);
+    s.db.add_event(Some(id), "owner", "instruction", &serde_json::json!({"text": b.text}))?;
+    let next = if task.role == Role::Lead { TaskStatus::New } else { TaskStatus::Open };
+    s.db.set_task_status(id, next)?;
+    reopen_stuck_parent(&s.db, &task)?;
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    Ok(Json(task))
+}
+
+/// A stuck parent goes back to split so its other subtasks can run again.
+fn reopen_stuck_parent(db: &Db, task: &Task) -> ApiResult<()> {
+    let Some(pid) = task.parent_id else { return Ok(()) };
+    let parent = db.get_task(pid)?;
+    if parent.is_some_and(|p| p.status == TaskStatus::Stuck) {
+        db.set_task_status(pid, TaskStatus::Split)?;
+    }
+    Ok(())
+}
+
+/// Aborts the running turn (if any) and marks the task stuck.
+async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Task>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Split) {
+        return Err(conflict("task is already done or split"));
+    }
+    abort_run(&s.runs, id);
+    s.db.set_task_status(id, TaskStatus::Stuck)?;
+    s.db.add_event(Some(id), "owner", "stopped", &serde_json::json!({"by": "owner"}))?;
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    Ok(Json(task))
+}
+
+/// Files changed by a task: committed diff when done, else the live worktree diff.
+async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Change>>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let dir = s.data_dir.join("worktrees").join(id.to_string());
+    if !dir.exists() {
+        return Ok(Json(vec![]));
+    }
+    let done = task.status == TaskStatus::Done;
+    let list = tokio::task::spawn_blocking(move || worktree::changes(&dir, done))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(list))
+}
+
+const MAX_FILE_BYTES: u64 = 256 * 1024;
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+#[derive(serde::Serialize)]
+struct FileView {
+    path: String,
+    content: String,
+    truncated: bool,
+}
+
+fn forbidden(msg: &str) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, msg.into())
+}
+
+/// Reads up to 256 KB of a file inside the worktree; 403 when the path escapes it.
+fn read_worktree_file(dir: &std::path::Path, rel: &str) -> ApiResult<FileView> {
+    use std::io::Read;
+    if std::path::Path::new(rel).is_absolute() {
+        return Err(forbidden("path must be relative"));
+    }
+    let root = dir.canonicalize().map_err(|_| not_found("worktree not found"))?;
+    let full = root.join(rel).canonicalize().map_err(|_| not_found("file not found"))?;
+    if !full.starts_with(&root) {
+        return Err(forbidden("path is outside the worktree"));
+    }
+    if !full.is_file() {
+        return Err(not_found("file not found"));
+    }
+    let file = std::fs::File::open(&full).map_err(|_| not_found("file not found"))?;
+    let mut buf = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf).map_err(anyhow::Error::from)?;
+    let truncated = buf.len() as u64 > MAX_FILE_BYTES;
+    buf.truncate(MAX_FILE_BYTES as usize);
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    Ok(FileView { path: rel.to_string(), content, truncated })
+}
+
+/// Contents of one file in a task's worktree (read-only, capped at 256 KB).
+async fn task_file(
+    State(s): State<ApiState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FileQuery>,
+) -> ApiResult<Json<FileView>> {
+    s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let dir = s.data_dir.join("worktrees").join(id.to_string());
+    let view = tokio::task::spawn_blocking(move || read_worktree_file(&dir, &q.path))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(view))
 }
 
 #[cfg(test)]
@@ -230,7 +435,7 @@ mod tests {
     fn setup() -> (Router, Arc<Db>, UnboundedReceiver<i64>) {
         let db = Arc::new(Db::open_test());
         let (chat_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default() }), db, rx)
+        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() }), db, rx)
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -262,6 +467,7 @@ mod tests {
                 role: Role::Lead,
                 source_kind: SourceKind::User,
                 source_ref: None,
+                skill: None,
             })
             .unwrap();
         (c.id, t.id)
@@ -279,9 +485,34 @@ mod tests {
             role: Role::Lead,
             source_kind: SourceKind::User,
             source_ref: None,
+            skill: None,
         })
         .unwrap()
         .id
+    }
+
+    #[tokio::test]
+    async fn apps_list_empty_and_restart_unknown_404() {
+        let (app, _db, _rx) = setup();
+        let (code, v) = call(&app, "GET", "/apps", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v, serde_json::json!([]));
+        let (code, _) = call(&app, "POST", "/apps/nope/restart", None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn skills_lists_data_dir_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: demo\ndescription: d\nbash: [\"a *\"]\n---\nBody\n").unwrap();
+        let (app, _tid) = setup_with_dir(dir.path());
+        let (code, v) = call(&app, "GET", "/skills", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v[0]["name"], "demo");
+        assert_eq!(v[0]["bash"], json!(["a *"]));
+        assert_eq!(v[0]["body"], "Body");
     }
 
     #[tokio::test]
@@ -322,15 +553,45 @@ mod tests {
 
     #[tokio::test]
     async fn chat_post_notifies_and_lists() {
-        let (app, _db, mut rx) = setup();
-        let (st, v) = call(&app, "POST", "/chat", Some(json!({"content": "hi"}))).await;
+        let (app, db, mut rx) = setup();
+        let cid = db.create_chat().unwrap().id;
+        let (st, v) = call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": "hi"}))).await;
         assert_eq!((st, v["role"].as_str()), (StatusCode::CREATED, Some("user")));
         assert_eq!(rx.try_recv().unwrap(), v["id"].as_i64().unwrap());
-        let (_, v) = call(&app, "GET", "/chat?limit=10", None).await;
+        let (_, v) = call(&app, "GET", &format!("/chat?chat_id={cid}&limit=10"), None).await;
         assert_eq!(v[0]["content"].as_str(), Some("hi"));
-        let (st, _) = call(&app, "POST", "/chat", Some(json!({"content": ""}))).await;
+        assert_eq!(v[0]["chat_id"].as_i64(), Some(cid));
+        let (st, _) = call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": ""}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_errors_for_missing_or_unknown_chat() {
+        let (app, _db, mut rx) = setup();
+        assert_eq!(call(&app, "GET", "/chat", None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "GET", "/chat?chat_id=99", None).await.0, StatusCode::NOT_FOUND);
+        let body = json!({"chat_id": 99, "content": "hi"});
+        assert_eq!(call(&app, "POST", "/chat", Some(body)).await.0, StatusCode::NOT_FOUND);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chats_create_list_and_title_from_first_message() {
+        let (app, _db, _rx) = setup();
+        let (st, c) = call(&app, "POST", "/chats", None).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(c["title"].as_str(), Some("New chat"));
+        assert_eq!(c["last"].as_str(), Some("What do you want set up?"));
+        let cid = c["id"].as_i64().unwrap();
+        let long = "x".repeat(60);
+        call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": long}))).await;
+        let (_, list) = call(&app, "GET", "/chats", None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["title"].as_str(), Some(format!("{}…", "x".repeat(44)).as_str()));
+        let (_, msgs) = call(&app, "GET", &format!("/chat?chat_id={cid}"), None).await;
+        assert_eq!(msgs.as_array().unwrap().len(), 2);
+        assert_eq!(msgs[0]["role"].as_str(), Some("rui"));
     }
 
     #[tokio::test]
@@ -407,5 +668,152 @@ mod tests {
         assert_eq!(call(&app, "POST", "/tasks", Some(missing)).await.0, StatusCode::NOT_FOUND);
         let empty = json!({"client_id": cid, "title": "", "body": ""});
         assert_eq!(call(&app, "POST", "/tasks", Some(empty)).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stop_open_task_marks_stuck_and_logs() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.set_task_status(tid, TaskStatus::InProgress).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{tid}/stop"), None).await;
+        assert_eq!((st, v["status"].as_str()), (StatusCode::OK, Some("stuck")));
+        let events = db.list_events(Some(tid), 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "stopped" && e.agent == "owner"));
+    }
+
+    #[tokio::test]
+    async fn stop_done_is_conflict_and_unknown_is_not_found() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.set_task_status(tid, TaskStatus::Done).unwrap();
+        assert_eq!(call(&app, "POST", &format!("/tasks/{tid}/stop"), None).await.0, StatusCode::CONFLICT);
+        assert_eq!(call(&app, "POST", "/tasks/999/stop", None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn instruct_stuck_builder_reopens_it_and_parent() {
+        let (app, db, _rx) = setup();
+        let (cid, parent) = seed_task(&db);
+        db.set_task_status(parent, TaskStatus::Stuck).unwrap();
+        let sub = db
+            .create_task(&NewTask {
+                client_id: cid,
+                parent_id: Some(parent),
+                title: "s".into(),
+                body: String::new(),
+                status: TaskStatus::Stuck,
+                done_command: Some("true".into()),
+                max_loops: 5,
+                role: Role::Builder,
+                source_kind: SourceKind::User,
+                source_ref: None,
+                skill: None,
+            })
+            .unwrap();
+        let uri = format!("/tasks/{}/instruct", sub.id);
+        let (st, v) = call(&app, "POST", &uri, Some(json!({"text": "try x"}))).await;
+        assert_eq!((st, v["status"].as_str()), (StatusCode::OK, Some("open")));
+        assert_eq!(db.get_task(parent).unwrap().unwrap().status, TaskStatus::Split);
+        let events = db.list_events(Some(sub.id), 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "instruction" && e.agent == "owner"));
+    }
+
+    #[tokio::test]
+    async fn instruct_lead_goes_to_new() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.set_task_status(tid, TaskStatus::Stuck).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{tid}/instruct"), Some(json!({"text": "go"}))).await;
+        assert_eq!((st, v["status"].as_str()), (StatusCode::OK, Some("new")));
+    }
+
+    #[tokio::test]
+    async fn instruct_errors() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        let uri = format!("/tasks/{tid}/instruct");
+        db.set_task_status(tid, TaskStatus::WaitingAnswer).unwrap();
+        assert_eq!(call(&app, "POST", &uri, Some(json!({"text": "x"}))).await.0, StatusCode::CONFLICT);
+        assert_eq!(call(&app, "POST", &uri, Some(json!({"text": "  "}))).await.0, StatusCode::BAD_REQUEST);
+        let missing = call(&app, "POST", "/tasks/999/instruct", Some(json!({"text": "x"}))).await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_registered_handle() {
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let runs = Runs::default();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: runs.clone(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() };
+        let app = router(state);
+        let (_, tid) = seed_task(&db);
+        let join = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(3600)));
+        runs.lock().unwrap().insert(tid, join.abort_handle());
+        let (st, _) = call(&app, "POST", &format!("/tasks/{tid}/stop"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(join.await.unwrap_err().is_cancelled());
+        assert!(!runs.lock().unwrap().contains_key(&tid));
+    }
+
+    #[tokio::test]
+    async fn changes_unknown_404_and_no_worktree_empty() {
+        let (app, db, _rx) = setup();
+        let missing = call(&app, "GET", "/tasks/999/changes", None).await;
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        let (_, tid) = seed_task(&db);
+        let (st, body) = call(&app, "GET", &format!("/tasks/{tid}/changes"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, json!([]));
+    }
+
+    fn setup_with_dir(dir: &std::path::Path) -> (Router, i64) {
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, tid) = seed_task(&db);
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default() };
+        (router(state), tid)
+    }
+
+    #[tokio::test]
+    async fn live_returns_task_and_chat_state() {
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let live = Live::default();
+        let st = crate::live::LiveState { text: "hi".into(), tool: Some("Bash".into()), ..Default::default() };
+        live.lock().unwrap().insert(crate::live::LiveKey::Task(5), st);
+        live.lock().unwrap().insert(crate::live::LiveKey::Chat(2), Default::default());
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let (code, v) = call(&router(state), "GET", "/live", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["tasks"]["5"]["text"], "hi");
+        assert_eq!(v["tasks"]["5"]["tool"], "Bash");
+        assert_eq!(v["chats"]["2"], json!({"text":"","thinking":false,"tool":null,"tool_input":"","at":""}));
+    }
+
+    #[tokio::test]
+    async fn file_reads_guards_and_truncates() {
+        let data = tempfile::tempdir().unwrap();
+        let (app, tid) = setup_with_dir(data.path());
+        let wt = data.path().join("worktrees").join(tid.to_string());
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/a.txt"), "hello").unwrap();
+        std::fs::write(data.path().join("secret.txt"), "nope").unwrap();
+        std::fs::write(wt.join("big.txt"), "z".repeat(300 * 1024)).unwrap();
+        let get = |p: String| {
+            let (app, uri) = (app.clone(), format!("/tasks/{tid}/file?path={p}"));
+            async move { call(&app, "GET", &uri, None).await }
+        };
+        let (st, v) = get("src/a.txt".into()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v, json!({"path": "src/a.txt", "content": "hello", "truncated": false}));
+        assert_eq!(get("../../secret.txt".into()).await.0, StatusCode::FORBIDDEN);
+        let abs = data.path().join("secret.txt").to_string_lossy().into_owned();
+        assert_eq!(get(abs).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(get("missing.txt".into()).await.0, StatusCode::NOT_FOUND);
+        let (_, big) = get("big.txt".into()).await;
+        assert_eq!(big["truncated"], json!(true));
+        assert_eq!(big["content"].as_str().unwrap().len(), 256 * 1024);
+        let missing_task = call(&app, "GET", "/tasks/999/file?path=a", None).await;
+        assert_eq!(missing_task.0, StatusCode::NOT_FOUND);
     }
 }

@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use rui_core::{
-    ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SCHEMA_VERSION,
+    Chat, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SCHEMA_VERSION,
     SourceKind, Task, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
@@ -11,8 +11,10 @@ use std::sync::{Mutex, MutexGuard};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const TASK_COLS: &str = "id, client_id, parent_id, title, body, status, done_command, max_loops, \
-     loops_used, role, branch, source_kind, source_ref, created_at, updated_at";
+     loops_used, role, branch, source_kind, source_ref, created_at, updated_at, skill";
 const CLIENT_COLS: &str = "id, name, repo_path, test_command, allowed_commands, created_at";
+const EVENT_COLS: &str = "id, task_id, chat_id, agent, kind, payload, created_at";
+const CHAT_COLS: &str = "id, chat_id, role, content, created_at";
 const QUESTION_COLS: &str = "id, task_id, asked_by, text, answer, status, created_at";
 
 /// Handle to the SQLite database, safe to share across threads.
@@ -32,6 +34,7 @@ pub struct NewTask {
     pub role: Role,
     pub source_kind: SourceKind,
     pub source_ref: Option<String>,
+    pub skill: Option<String>,
 }
 
 fn bad(idx: usize, msg: String) -> rusqlite::Error {
@@ -72,6 +75,7 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         depends_on: Vec::new(),
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
+        skill: r.get(15)?,
     })
 }
 
@@ -90,21 +94,46 @@ fn question_from_row(r: &Row) -> rusqlite::Result<Question> {
 fn chat_from_row(r: &Row) -> rusqlite::Result<ChatMessage> {
     Ok(ChatMessage {
         id: r.get(0)?,
-        role: parse_enum(1, r.get(1)?, ChatRole::parse)?,
-        content: r.get(2)?,
-        created_at: r.get(3)?,
+        chat_id: r.get(1)?,
+        role: parse_enum(2, r.get(2)?, ChatRole::parse)?,
+        content: r.get(3)?,
+        created_at: r.get(4)?,
     })
 }
 
+fn chat_row(r: &Row) -> rusqlite::Result<Chat> {
+    Ok(Chat {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        created_at: r.get(2)?,
+        updated_at: r.get(3)?,
+        last: r.get(4)?,
+    })
+}
+
+const DEFAULT_CHAT_TITLE: &str = "New chat";
+const TITLE_MAX_CHARS: usize = 44;
+
+/// Chat title taken from the first user message: trimmed, cut at 44 chars.
+pub fn chat_title(content: &str) -> String {
+    let text = content.trim();
+    if text.chars().count() <= TITLE_MAX_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(TITLE_MAX_CHARS).collect();
+    format!("{}…", head.trim_end())
+}
+
 fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
-    let payload: String = r.get(4)?;
+    let payload: String = r.get(5)?;
     Ok(Event {
         id: r.get(0)?,
         task_id: r.get(1)?,
-        agent: r.get(2)?,
-        kind: r.get(3)?,
-        payload: serde_json::from_str(&payload).map_err(|e| bad(4, e.to_string()))?,
-        created_at: r.get(5)?,
+        chat_id: r.get(2)?,
+        agent: r.get(3)?,
+        kind: r.get(4)?,
+        payload: serde_json::from_str(&payload).map_err(|e| bad(5, e.to_string()))?,
+        created_at: r.get(6)?,
     })
 }
 
@@ -134,6 +163,19 @@ fn fetch_task(conn: &Connection, id: i64) -> Result<Option<Task>> {
 fn fetch_question(conn: &Connection, id: i64) -> Result<Option<Question>> {
     let sql = format!("SELECT {QUESTION_COLS} FROM questions WHERE id = ?1");
     Ok(conn.query_row(&sql, [id], question_from_row).optional()?)
+}
+
+const CHAT_SELECT: &str = "SELECT c.id, c.title, c.created_at, c.updated_at, \
+     (SELECT m.content FROM chat_messages m WHERE m.chat_id = c.id ORDER BY m.id DESC LIMIT 1) FROM chats c";
+
+fn fetch_chat(conn: &Connection, id: i64) -> Result<Option<Chat>> {
+    let sql = format!("{CHAT_SELECT} WHERE c.id = ?1");
+    Ok(conn.query_row(&sql, [id], chat_row).optional()?)
+}
+
+fn fetch_chat_message(conn: &Connection, id: i64) -> Result<Option<ChatMessage>> {
+    let sql = format!("SELECT {CHAT_COLS} FROM chat_messages WHERE id = ?1");
+    Ok(conn.query_row(&sql, [id], chat_from_row).optional()?)
 }
 
 fn fetch_client(conn: &Connection, id: i64) -> Result<Option<Client>> {
@@ -211,8 +253,8 @@ impl Db {
     pub fn create_task(&self, t: &NewTask) -> Result<Task> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO tasks (client_id, parent_id, title, body, status, done_command, max_loops, role, source_kind, source_ref) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tasks (client_id, parent_id, title, body, status, done_command, max_loops, role, source_kind, source_ref, skill) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 t.client_id,
                 t.parent_id,
@@ -223,7 +265,8 @@ impl Db {
                 t.max_loops,
                 t.role.as_str(),
                 t.source_kind.as_str(),
-                t.source_ref
+                t.source_ref,
+                t.skill
             ],
         )?;
         fetch_task(&conn, conn.last_insert_rowid())?.ok_or_else(|| anyhow!("task vanished"))
@@ -327,28 +370,56 @@ impl Db {
 
     // ---- chat ----
 
-    /// Append a chat message and return it.
-    pub fn add_chat_message(&self, role: ChatRole, content: &str) -> Result<ChatMessage> {
+    /// Create an empty chat with the default title.
+    pub fn create_chat(&self) -> Result<Chat> {
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO chat_messages (role, content) VALUES (?1, ?2)",
-            params![role.as_str(), content],
-        )?;
-        let id = conn.last_insert_rowid();
-        Ok(conn.query_row(
-            "SELECT id, role, content, created_at FROM chat_messages WHERE id = ?1",
-            [id],
-            chat_from_row,
-        )?)
+        conn.execute("INSERT INTO chats (title) VALUES (?1)", [DEFAULT_CHAT_TITLE])?;
+        fetch_chat(&conn, conn.last_insert_rowid())?.ok_or_else(|| anyhow!("chat vanished"))
     }
 
-    /// The last `limit` chat messages, oldest first.
-    pub fn list_chat(&self, limit: i64) -> Result<Vec<ChatMessage>> {
+    /// Chat by id, if it exists.
+    pub fn get_chat(&self, id: i64) -> Result<Option<Chat>> {
+        fetch_chat(&*self.conn()?, id)
+    }
+
+    /// All chats, most recently active first.
+    pub fn list_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, role, content, created_at FROM chat_messages ORDER BY id DESC LIMIT ?1",
+        let sql = format!("{CHAT_SELECT} ORDER BY c.updated_at DESC, c.id DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map([], chat_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Append a message to a chat, bump the chat, and title it from the first user message.
+    pub fn add_chat_message(&self, chat_id: i64, role: ChatRole, content: &str) -> Result<ChatMessage> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO chat_messages (chat_id, role, content) VALUES (?1, ?2, ?3)",
+            params![chat_id, role.as_str(), content],
         )?;
-        let mut msgs = stmt.query_map([limit], chat_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let id = conn.last_insert_rowid();
+        let sql = format!("UPDATE chats SET updated_at = {NOW} WHERE id = ?1");
+        conn.execute(&sql, [chat_id])?;
+        if role == ChatRole::User {
+            conn.execute(
+                "UPDATE chats SET title = ?1 WHERE id = ?2 AND title = ?3",
+                params![chat_title(content), chat_id, DEFAULT_CHAT_TITLE],
+            )?;
+        }
+        Ok(fetch_chat_message(&conn, id)?.ok_or_else(|| anyhow!("message vanished"))?)
+    }
+
+    /// One chat message by id.
+    pub fn get_chat_message(&self, id: i64) -> Result<Option<ChatMessage>> {
+        fetch_chat_message(&*self.conn()?, id)
+    }
+
+    /// The last `limit` messages of a chat, oldest first.
+    pub fn list_chat(&self, chat_id: i64, limit: i64) -> Result<Vec<ChatMessage>> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {CHAT_COLS} FROM chat_messages WHERE chat_id = ?1 ORDER BY id DESC LIMIT ?2");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut msgs = stmt.query_map(params![chat_id, limit], chat_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         msgs.reverse();
         Ok(msgs)
     }
@@ -363,10 +434,32 @@ impl Db {
         kind: &str,
         payload: &serde_json::Value,
     ) -> Result<i64> {
+        self.insert_event(task_id, None, agent, kind, payload)
+    }
+
+    /// Record an event that belongs to a chat and return its id.
+    pub fn add_event_in_chat(
+        &self,
+        chat_id: i64,
+        agent: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64> {
+        self.insert_event(None, Some(chat_id), agent, kind, payload)
+    }
+
+    fn insert_event(
+        &self,
+        task_id: Option<i64>,
+        chat_id: Option<i64>,
+        agent: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO events (task_id, agent, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![task_id, agent, kind, payload.to_string()],
+            "INSERT INTO events (task_id, chat_id, agent, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![task_id, chat_id, agent, kind, payload.to_string()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -374,32 +467,50 @@ impl Db {
     /// The last `limit` events (optionally for one task), oldest first.
     pub fn list_events(&self, task_id: Option<i64>, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, agent, kind, payload, created_at FROM ( \
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM ( \
                SELECT * FROM events WHERE (?1 IS NULL OR task_id = ?1) ORDER BY id DESC LIMIT ?2 \
-             ) ORDER BY id",
-        )?;
+             ) ORDER BY id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map(params![task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Events with id > `after_id`, oldest first, at most `limit`.
     pub fn list_events_after(&self, task_id: Option<i64>, after_id: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, agent, kind, payload, created_at FROM events \
-             WHERE id > ?1 AND (?2 IS NULL OR task_id = ?2) ORDER BY id LIMIT ?3",
-        )?;
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events \
+             WHERE id > ?1 AND (?2 IS NULL OR task_id = ?2) ORDER BY id LIMIT ?3"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map(params![after_id, task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Owner instructions (id, text) not yet delivered, oldest first.
+    pub fn pending_instructions(&self, task_id: i64) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, json_extract(payload, '$.text') FROM events \
+             WHERE task_id = ?1 AND kind = 'instruction' AND id > ( \
+               SELECT COALESCE(MAX(json_extract(payload, '$.upto')), 0) FROM events \
+               WHERE task_id = ?1 AND kind = 'instruction_delivered') \
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?)))?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(|(id, t)| (id, t.unwrap_or_default())).collect())
     }
 
     /// The newest "init" event of each task, newest task id last.
     pub fn latest_init_per_task(&self) -> Result<Vec<Event>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, agent, kind, payload, created_at FROM events \
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events \
              WHERE id IN (SELECT MAX(id) FROM events WHERE kind = 'init' AND task_id IS NOT NULL GROUP BY task_id) \
-             ORDER BY task_id",
-        )?;
+             ORDER BY task_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map([], event_from_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -435,6 +546,23 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Saved Rui session id for one chat.
+    pub fn get_rui_session(&self, chat_id: i64) -> Result<Option<String>> {
+        let sql = "SELECT session_id FROM agent_sessions WHERE role = 'rui' AND chat_id = ?1";
+        Ok(self.conn()?.query_row(sql, [chat_id], |r| r.get(0)).optional()?)
+    }
+
+    /// Upsert the Rui session id for one chat.
+    pub fn set_rui_session(&self, chat_id: i64, session_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM agent_sessions WHERE role = 'rui' AND chat_id = ?1", [chat_id])?;
+        conn.execute(
+            "INSERT INTO agent_sessions (role, chat_id, session_id) VALUES ('rui', ?1, ?2)",
+            params![chat_id, session_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +581,7 @@ mod tests {
             role: Role::Lead,
             source_kind: SourceKind::User,
             source_ref: None,
+            skill: None,
         }
     }
 
@@ -522,12 +651,83 @@ mod tests {
     #[test]
     fn chat_order_and_limit() {
         let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
         for i in 0..5 {
-            db.add_chat_message(ChatRole::User, &format!("m{i}")).unwrap();
+            db.add_chat_message(chat.id, ChatRole::User, &format!("m{i}")).unwrap();
         }
-        let last = db.list_chat(3).unwrap();
+        let last = db.list_chat(chat.id, 3).unwrap();
         let texts: Vec<_> = last.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(texts, vec!["m2", "m3", "m4"]);
+    }
+
+    #[test]
+    fn chat_title_rule() {
+        assert_eq!(chat_title("  hello  "), "hello");
+        let long = "é".repeat(50);
+        assert_eq!(chat_title(&long), format!("{}…", "é".repeat(44)));
+        let exact = "a".repeat(44);
+        assert_eq!(chat_title(&exact), exact);
+        let spaced = format!("{} tail words", "a".repeat(43));
+        assert_eq!(chat_title(&spaced), format!("{}…", "a".repeat(43)));
+    }
+
+    #[test]
+    fn chats_list_title_last_and_isolation() {
+        let db = Db::open_test();
+        let a = db.create_chat().unwrap();
+        let b = db.create_chat().unwrap();
+        assert_eq!((a.title.as_str(), a.last.clone()), ("New chat", None));
+        db.add_chat_message(a.id, ChatRole::Rui, "welcome").unwrap();
+        assert_eq!(db.get_chat(a.id).unwrap().unwrap().title, "New chat");
+        db.add_chat_message(a.id, ChatRole::User, "set up acme").unwrap();
+        db.add_chat_message(a.id, ChatRole::User, "second").unwrap();
+        let m = db.add_chat_message(b.id, ChatRole::User, "other").unwrap();
+        assert_eq!(db.get_chat_message(m.id).unwrap().unwrap().chat_id, b.id);
+        assert_eq!(db.get_chat_message(999).unwrap(), None);
+        let chats = db.list_chats().unwrap();
+        assert_eq!(chats.len(), 2);
+        let a = chats.iter().find(|c| c.id == a.id).unwrap();
+        assert_eq!((a.title.as_str(), a.last.as_deref()), ("set up acme", Some("second")));
+        assert_eq!(db.list_chat(a.id, 10).unwrap().len(), 3);
+        assert_eq!(db.list_chat(b.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rui_sessions_are_per_chat_and_events_carry_chat() {
+        let db = Db::open_test();
+        let (a, b) = (db.create_chat().unwrap(), db.create_chat().unwrap());
+        db.set_rui_session(a.id, "s1").unwrap();
+        db.set_rui_session(a.id, "s2").unwrap();
+        assert_eq!(db.get_rui_session(a.id).unwrap().as_deref(), Some("s2"));
+        assert_eq!(db.get_rui_session(b.id).unwrap(), None);
+        db.add_event_in_chat(a.id, "rui", "k", &serde_json::json!({})).unwrap();
+        assert_eq!(db.list_events(None, 10).unwrap()[0].chat_id, Some(a.id));
+    }
+
+    const V1_SCHEMA: &str = "\
+        CREATE TABLE chat_messages (id INTEGER PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL, \
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+        CREATE TABLE events (id INTEGER PRIMARY KEY, task_id INTEGER, agent TEXT NOT NULL, kind TEXT NOT NULL, \
+          payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+        CREATE TABLE agent_sessions (role TEXT NOT NULL, task_id INTEGER, session_id TEXT NOT NULL, \
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE (role, task_id)); \
+        INSERT INTO chat_messages (role, content) VALUES ('user', 'hi'); \
+        INSERT INTO events (agent, kind) VALUES ('rui', 'x'), ('lead', 'y'); \
+        INSERT INTO agent_sessions (role, session_id) VALUES ('rui', 's'); \
+        PRAGMA user_version = 1;";
+
+    #[test]
+    fn migration_002_upgrades_v1_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute_batch(include_str!("../../../db/migrations/002_chats.sql")).unwrap();
+        let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(one("PRAGMA user_version"), 2);
+        assert_eq!(one("SELECT chat_id FROM chat_messages"), 1);
+        assert_eq!(one("SELECT chat_id FROM agent_sessions WHERE role = 'rui'"), 1);
+        assert_eq!(one("SELECT chat_id FROM events WHERE agent = 'rui'"), 1);
+        assert_eq!(one("SELECT COUNT(*) FROM events WHERE chat_id IS NULL"), 1);
+        assert_eq!(one("SELECT COUNT(*) FROM chats WHERE id = 1 AND title = 'Rui'"), 1);
     }
 
     #[test]
@@ -542,6 +742,19 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].payload, p);
         assert_eq!(db.list_events(None, 1).unwrap()[0].kind, "boot");
+    }
+
+    #[test]
+    fn pending_instructions_respect_delivered_marker() {
+        let (db, c) = db_with_client();
+        let t = db.create_task(&new_task(c.id, "t")).unwrap();
+        assert!(db.pending_instructions(t.id).unwrap().is_empty());
+        let a = db.add_event(Some(t.id), "owner", "instruction", &serde_json::json!({"text": "a"})).unwrap();
+        let b = db.add_event(Some(t.id), "owner", "instruction", &serde_json::json!({"text": "b"})).unwrap();
+        let both = vec![(a, "a".to_string()), (b, "b".to_string())];
+        assert_eq!(db.pending_instructions(t.id).unwrap(), both);
+        db.add_event(Some(t.id), "owner", "instruction_delivered", &serde_json::json!({"upto": a})).unwrap();
+        assert_eq!(db.pending_instructions(t.id).unwrap(), vec![(b, "b".to_string())]);
     }
 
     #[test]

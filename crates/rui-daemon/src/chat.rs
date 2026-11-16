@@ -1,56 +1,81 @@
 //! Handles chat messages from the owner by running one Rui turn each.
 
 use crate::db::Db;
+use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, run_agent};
 use crate::scheduler::{Config, line_event};
+use crate::skills;
 use anyhow::{Context, Result};
 use rui_core::{ChatMessage, ChatRole, Role};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__create_client,mcp__rui__create_task,mcp__rui__report_status";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__start_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps";
 
 /// Processes chat message ids one at a time, forever.
-pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config) {
+pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
     while let Some(id) = rx.recv().await {
-        if let Err(e) = handle(&db, &cfg, id).await {
+        let msg = match load_message(&db, id) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("chat error: {e:#}");
+                continue;
+            }
+        };
+        if let Err(e) = handle(&db, &cfg, &live, msg.clone()).await {
             eprintln!("chat error: {e:#}");
-            let _ = db.add_chat_message(ChatRole::Rui, &format!("Sorry, that failed: {e:#}"));
+            let _ = db.add_chat_message(msg.chat_id, ChatRole::Rui, &format!("Sorry, that failed: {e:#}"));
         }
     }
 }
 
 fn load_message(db: &Db, id: i64) -> Result<ChatMessage> {
-    let recent = db.list_chat(500)?;
-    recent.into_iter().find(|m| m.id == id).context("chat message not found")
+    db.get_chat_message(id)?.context("chat message not found")
 }
 
-async fn handle(db: &Db, cfg: &Config, id: i64) -> Result<()> {
-    let msg = load_message(db, id)?;
+/// Rui's prompt plus the catalog of skills it can hire.
+fn system_prompt(data_dir: &Path) -> String {
+    let lines: Vec<String> = skills::load_all(data_dir)
+        .iter()
+        .map(|s| match &s.run_hint {
+            Some(r) => format!("- {}: {} (run: {r})", s.name, s.description),
+            None => format!("- {}: {}", s.name, s.description),
+        })
+        .collect();
+    format!("{RUI_PROMPT}\n\n# Skills you can hire\n{}", lines.join("\n"))
+}
+
+async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<()> {
+    let (id, chat_id) = (msg.id, msg.chat_id);
     let run = AgentRun {
         role: Role::Rui,
         task_id: None,
         cwd: cfg.data_dir.clone(),
         prompt: msg.content,
-        system_prompt: RUI_PROMPT.into(),
+        system_prompt: system_prompt(&cfg.data_dir),
         allowed_tools: RUI_TOOLS.split(',').map(String::from).collect(),
         // Rui only delegates: no shell, file or web tools, just its MCP tools.
         builtin_tools: Some(String::new()),
         permission_mode: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
         mcp_headers: vec![("X-Rui-Source-Ref".into(), format!("chat:{id}"))],
-        resume: db.get_session(Role::Rui, None)?,
+        resume: db.get_rui_session(chat_id)?,
+        partial: true,
     };
+    let key = LiveKey::Chat(chat_id);
+    let _guard = LiveGuard(live.clone(), key);
     let out = run_agent(&run, |p| {
-        let (kind, payload) = line_event(p);
-        let _ = db.add_event(None, "rui", kind, &payload);
+        on_line(live, key, p);
+        let Some((kind, payload)) = line_event(p) else { return };
+        let _ = db.add_event_in_chat(chat_id, "rui", kind, &payload);
     })
     .await?;
     if let Some(sid) = &out.session_id {
-        db.set_session(Role::Rui, None, sid)?;
+        db.set_rui_session(chat_id, sid)?;
     }
     let reply = out.result_text.unwrap_or_default();
-    db.add_chat_message(ChatRole::Rui, &reply)?;
+    db.add_chat_message(chat_id, ChatRole::Rui, &reply)?;
     Ok(())
 }

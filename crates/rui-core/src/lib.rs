@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
@@ -63,6 +63,8 @@ pub struct Task {
     pub source_kind: SourceKind,
     pub source_ref: Option<String>,
     pub depends_on: Vec<i64>,
+    #[serde(default)]
+    pub skill: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -79,8 +81,21 @@ pub struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Chat {
+    pub id: i64,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Content of the newest message, if any.
+    #[serde(default)]
+    pub last: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
+    #[serde(default)]
+    pub chat_id: i64,
     pub role: ChatRole,
     pub content: String,
     pub created_at: String,
@@ -90,6 +105,8 @@ pub struct ChatMessage {
 pub struct Event {
     pub id: i64,
     pub task_id: Option<i64>,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
     pub agent: String,
     pub kind: String,
     pub payload: serde_json::Value,

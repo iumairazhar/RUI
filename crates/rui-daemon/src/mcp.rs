@@ -5,6 +5,7 @@
 //! Agent identity comes from HTTP headers (`X-Rui-Task-Id`, `X-Rui-Source-Ref`)
 //! read from the request parts rmcp injects into the tool call.
 
+use crate::apps::{self, AppSpec, Apps};
 use crate::db::{Db, NewTask};
 use axum::http::request::Parts;
 use rmcp::{
@@ -20,7 +21,7 @@ use rmcp::{
 use rui_core::{Role, SourceKind, Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -32,9 +33,9 @@ pub struct Ctx {
 }
 
 /// Builds the router with `/mcp/rui`, `/mcp/lead` and `/mcp/builder`.
-pub fn mcp_router(db: Arc<Db>) -> axum::Router {
+pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps) -> axum::Router {
     axum::Router::new()
-        .nest_service("/mcp/rui", service(RuiServer::new(db.clone())))
+        .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir, apps)))
         .nest_service("/mcp/lead", service(LeadServer::new(db.clone())))
         .nest_service("/mcp/builder", service(BuilderServer::new(db)))
 }
@@ -73,11 +74,11 @@ fn info() -> ServerConfig {
 
 // ---- argument types ----
 
-/// Arguments for `create_client`.
+/// Arguments for `use_repo`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateClientArgs {
-    /// Unique client name.
+    /// Unique project name.
     pub name: String,
     /// Absolute path (or ~/...) of an existing git repository.
     pub repo_path: String,
@@ -97,6 +98,44 @@ pub struct CreateTaskArgs {
     pub title: String,
     /// Full task description.
     pub body: String,
+}
+
+/// One team member to hire for a task.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct Member {
+    /// Skill name from the skills catalog, e.g. "fastapi", "react-vite" or "tester".
+    pub skill: String,
+    /// Concrete job for this member: endpoints, fields, files, behaviour.
+    pub job: String,
+    /// Command that proves the job is done, e.g. "uv run pytest -q" or "npm run build". Must not be empty.
+    pub done_command: String,
+    /// Indexes into `team` (0-based) of members that must finish first. Each index must be lower than this member's own index.
+    pub depends_on: Option<Vec<usize>>,
+}
+
+/// Arguments for `start_task`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct StartTaskArgs {
+    /// Project name. An existing project is reused; an unknown name creates a new project from scratch.
+    pub project: String,
+    /// Short task title.
+    pub title: String,
+    /// What the owner wants, in full. Every member sees it.
+    pub brief: String,
+    /// The team to hire. Members run one after another; use depends_on to set the order.
+    pub team: Vec<Member>,
+    /// Apps to run for this project. Always pass these for anything runnable.
+    pub apps: Option<Vec<AppSpec>>,
+}
+
+/// Arguments for `run_apps` and `stop_apps`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ProjectArgs {
+    /// Project name.
+    pub project: String,
 }
 
 /// Empty arguments.
@@ -200,8 +239,100 @@ pub mod logic {
         let cmds = a.allowed_commands.clone().unwrap_or_default();
         let repo = path.to_string_lossy().into_owned();
         let client = db.create_client(name, &repo, a.test_command.as_deref(), &cmds)?;
-        record(db, ctx, Role::Rui, "create_client", &a)?;
+        record(db, ctx, Role::Rui, "use_repo", &a)?;
         Ok(serde_json::to_value(client)?)
+    }
+
+    fn validate_team(data_dir: &Path, team: &[Member]) -> anyhow::Result<()> {
+        if team.is_empty() {
+            anyhow::bail!("team must not be empty");
+        }
+        for (i, m) in team.iter().enumerate() {
+            if crate::skills::load(data_dir, &m.skill).is_none() {
+                anyhow::bail!("unknown skill '{}' (member {i})", m.skill);
+            }
+            if m.done_command.trim().is_empty() {
+                anyhow::bail!("member {i} ({}) has an empty done_command", m.skill);
+            }
+            if let Some(d) = m.depends_on.iter().flatten().find(|d| **d >= i) {
+                anyhow::bail!("member {i} depends_on {d}, which must be lower than {i}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Existing client by name (or by the slug of the name), else a fresh git project.
+    fn project_client(db: &Db, data_dir: &Path, name: &str) -> anyhow::Result<rui_core::Client> {
+        let slug = crate::projects::slug(name);
+        for n in [name, slug.as_str()] {
+            if let Some(c) = db.get_client_by_name(n)? {
+                return Ok(c);
+            }
+        }
+        let path = crate::projects::new_project(data_dir, name)?;
+        db.create_client(&slug, &path.to_string_lossy(), None, &[])
+    }
+
+    fn write_apps(repo: &Path, apps: &[AppSpec]) -> anyhow::Result<()> {
+        let dir = repo.join(".rui");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("apps.json"), serde_json::to_string_pretty(apps)?)?;
+        Ok(())
+    }
+
+    fn new_member_task(parent: &Task, ctx: &Ctx, m: &Member) -> NewTask {
+        let head: String = m.job.chars().take(60).collect();
+        NewTask {
+            client_id: parent.client_id,
+            parent_id: Some(parent.id),
+            title: format!("{}: {head}", m.skill),
+            body: m.job.clone(),
+            status: TaskStatus::Open,
+            done_command: Some(m.done_command.clone()),
+            max_loops: 5,
+            role: Role::Builder,
+            source_kind: SourceKind::Chat,
+            source_ref: ctx.source_ref.clone(),
+            skill: Some(m.skill.clone()),
+        }
+    }
+
+    /// Hires a team: creates the project if needed, a parent task and one child per member.
+    pub fn start_task(db: &Db, data_dir: &Path, ctx: &Ctx, a: StartTaskArgs) -> anyhow::Result<Value> {
+        if a.title.trim().is_empty() || a.project.trim().is_empty() {
+            anyhow::bail!("project and title must not be empty");
+        }
+        validate_team(data_dir, &a.team)?;
+        let client = project_client(db, data_dir, a.project.trim())?;
+        let parent = db.create_task(&NewTask {
+            client_id: client.id,
+            parent_id: None,
+            title: a.title.clone(),
+            body: a.brief.clone(),
+            status: TaskStatus::Split,
+            done_command: None,
+            max_loops: 5,
+            role: Role::Rui,
+            source_kind: SourceKind::Chat,
+            source_ref: ctx.source_ref.clone(),
+            skill: None,
+        })?;
+        let mut ids: Vec<i64> = Vec::new();
+        for m in &a.team {
+            let child = db.create_task(&new_member_task(&parent, ctx, m))?;
+            for d in m.depends_on.iter().flatten() {
+                db.add_task_dep(child.id, ids[*d])?;
+            }
+            ids.push(child.id);
+        }
+        let repo = expand_home(&client.repo_path);
+        if let Some(apps) = a.apps.as_ref().filter(|x| !x.is_empty()) {
+            write_apps(&repo, apps)?;
+        }
+        record(db, ctx, Role::Rui, "start_task", &a)?;
+        let members: Vec<Value> =
+            a.team.iter().zip(&ids).map(|(m, id)| json!({"task_id": id, "skill": m.skill})).collect();
+        Ok(json!({"project": client.name, "repo_path": client.repo_path, "task_id": parent.id, "members": members}))
     }
 
     /// Creates a top-level lead task for an existing client.
@@ -223,6 +354,7 @@ pub mod logic {
             role: Role::Lead,
             source_kind: SourceKind::Chat,
             source_ref: ctx.source_ref.clone(),
+            skill: None,
         })?;
         record(db, ctx, Role::Rui, "create_task", &a)?;
         Ok(serde_json::to_value(task)?)
@@ -239,7 +371,7 @@ pub mod logic {
     }
 
     /// Summarises clients with their tasks, plus open questions.
-    pub fn report_status(db: &Db, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
+    pub fn report_status(db: &Db, apps: &Apps, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
         let tasks = db.list_tasks()?;
         let clients: Vec<Value> = db
             .list_clients()?
@@ -251,10 +383,15 @@ pub mod logic {
                     .map(|t| {
                         json!({"id": t.id, "title": t.title, "status": t.status,
                                "parent_id": t.parent_id, "loops_used": t.loops_used,
-                               "max_loops": t.max_loops, "last_check": last_check(db, t.id)})
+                               "max_loops": t.max_loops, "skill": t.skill, "last_check": last_check(db, t.id)})
                     })
                     .collect();
-                json!({"id": c.id, "name": c.name, "tasks": ts})
+                let running: Vec<Value> = apps::list(apps)
+                    .iter()
+                    .filter(|x| x.project == c.name)
+                    .map(|x| json!({"name": x.name, "url": x.url, "status": x.status}))
+                    .collect();
+                json!({"id": c.id, "name": c.name, "tasks": ts, "apps": running})
             })
             .collect();
         let open: Vec<Value> = db
@@ -310,6 +447,7 @@ pub mod logic {
             role: Role::Builder,
             source_kind: parent.source_kind,
             source_ref: Some(format!("task:{}", parent.id)),
+            skill: None,
         })?;
         for d in &deps {
             db.add_task_dep(task.id, *d)?;
@@ -355,21 +493,23 @@ pub mod logic {
 #[derive(Clone)]
 pub struct RuiServer {
     db: Arc<Db>,
+    data_dir: PathBuf,
+    apps: Apps,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
 
 impl RuiServer {
-    /// Creates the server over a shared database.
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db, tool_router: Self::tool_router() }
+    /// Creates the server over a shared database, the data dir (projects, skills) and the running apps.
+    pub fn new(db: Arc<Db>, data_dir: PathBuf, apps: Apps) -> Self {
+        Self { db, data_dir, apps, tool_router: Self::tool_router() }
     }
 }
 
 #[tool_router]
 impl RuiServer {
-    #[tool(description = "Register a new client from an existing git repo on disk (repo_path must be a git repository).")]
-    async fn create_client(
+    #[tool(description = "Register an existing git repo on disk as a project.")]
+    async fn use_repo(
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<CreateClientArgs>,
@@ -377,13 +517,13 @@ impl RuiServer {
         finish(logic::create_client(&self.db, &ctx_from(&parts), a))
     }
 
-    #[tool(description = "Create a new top-level task for an existing client; a lead agent will pick it up.")]
-    async fn create_task(
+    #[tool(description = "Start a task by hiring a team of skilled members. Creates the project if the name is new. Members run in order; later ones see earlier work.")]
+    async fn start_task(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(a): Parameters<CreateTaskArgs>,
+        Parameters(a): Parameters<StartTaskArgs>,
     ) -> CallToolResult {
-        finish(logic::create_task(&self.db, &ctx_from(&parts), a))
+        finish(logic::start_task(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Get all clients with their tasks and statuses, plus open questions.")]
@@ -392,7 +532,36 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<NoArgs>,
     ) -> CallToolResult {
-        finish(logic::report_status(&self.db, &ctx_from(&parts), a))
+        finish(logic::report_status(&self.db, &self.apps, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Start (or restart) a project's apps and wait until they answer. Returns each app's url and status.")]
+    async fn run_apps(
+        &self,
+        Parameters(a): Parameters<ProjectArgs>,
+    ) -> CallToolResult {
+        finish(self.run_project(&a.project).await)
+    }
+
+    #[tool(description = "Stop all running apps of a project.")]
+    async fn stop_apps(
+        &self,
+        Parameters(a): Parameters<ProjectArgs>,
+    ) -> CallToolResult {
+        apps::stop_project(&self.apps, &a.project);
+        finish(Ok(json!({"ok": true})))
+    }
+}
+
+impl RuiServer {
+    async fn run_project(&self, project: &str) -> anyhow::Result<Value> {
+        let client = self
+            .db
+            .get_client_by_name(project)?
+            .ok_or_else(|| anyhow::anyhow!("project '{project}' not found"))?;
+        let repo = crate::scheduler::expand_home(&client.repo_path);
+        let infos = apps::start_project(&self.apps, &client.name, &repo).await;
+        Ok(serde_json::to_value(infos)?)
     }
 }
 
@@ -587,11 +756,76 @@ mod tests {
         assert!(logic::create_task(&db, &ctx, a).is_err());
     }
 
+    fn team(skills: &[&str]) -> Vec<Member> {
+        skills
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Member {
+                skill: (*s).into(),
+                job: format!("job {i}"),
+                done_command: "true".into(),
+                depends_on: (i > 0).then(|| vec![i - 1]),
+            })
+            .collect()
+    }
+
+    fn start_args(project: &str, skills: &[&str]) -> StartTaskArgs {
+        let app = AppSpec { name: "api".into(), dir: ".".into(), command: "run $PORT".into() };
+        StartTaskArgs {
+            project: project.into(),
+            title: "T".into(),
+            brief: "B".into(),
+            team: team(skills),
+            apps: Some(vec![app]),
+        }
+    }
+
+    #[test]
+    fn start_task_creates_project_team_and_apps() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        crate::skills::seed(data.path());
+        let ctx = Ctx { task_id: None, source_ref: Some("chat:3".into()) };
+        let r = logic::start_task(&db, data.path(), &ctx, start_args("Todo App", &["fastapi", "tester"])).unwrap();
+        let repo = data.path().join("projects/todo-app");
+        assert!(repo.join(".git").exists());
+        assert_eq!(r["project"], "todo-app");
+        let apps = std::fs::read_to_string(repo.join(".rui/apps.json")).unwrap();
+        assert!(apps.contains("run $PORT"));
+        assert!(db.get_client_by_name("todo-app").unwrap().is_some());
+        let parent = db.get_task(r["task_id"].as_i64().unwrap()).unwrap().unwrap();
+        assert_eq!((parent.role, parent.status), (Role::Rui, TaskStatus::Split));
+        assert_eq!(parent.source_ref.as_deref(), Some("chat:3"));
+        let kids = db.subtasks(parent.id).unwrap();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.iter().all(|k| k.status == TaskStatus::Open && k.role == Role::Builder));
+        assert_eq!(kids[0].skill.as_deref(), Some("fastapi"));
+        assert_eq!(kids[1].depends_on, vec![kids[0].id]);
+        assert_eq!(r["members"][1]["skill"], "tester");
+    }
+
+    #[test]
+    fn start_task_rejects_bad_teams() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        crate::skills::seed(data.path());
+        let ctx = Ctx::default();
+        let err = logic::start_task(&db, data.path(), &ctx, start_args("p", &["nope"])).unwrap_err();
+        assert!(err.to_string().contains("unknown skill"));
+        assert!(logic::start_task(&db, data.path(), &ctx, start_args("p", &[])).is_err());
+        let mut a = start_args("p", &["fastapi", "tester"]);
+        a.team[1].depends_on = Some(vec![1]);
+        assert!(logic::start_task(&db, data.path(), &ctx, a).is_err());
+        let mut a = start_args("p", &["fastapi"]);
+        a.team[0].done_command = " ".into();
+        assert!(logic::start_task(&db, data.path(), &ctx, a).is_err());
+        assert!(db.list_clients().unwrap().is_empty());
+        assert!(!data.path().join("projects").exists());
+    }
+
     #[test]
     fn report_status_lists_tasks_and_questions() {
         let (db, ctx, _d) = setup(None);
         logic::ask_question(&db, &ctx, AskQuestionArgs { text: "why?".into() }).unwrap();
-        let s = logic::report_status(&db, &ctx, NoArgs {}).unwrap();
+        let s = logic::report_status(&db, &Apps::default(), &ctx, NoArgs {}).unwrap();
         assert_eq!(s["clients"][0]["name"], "Acme");
         assert_eq!(s["clients"][0]["tasks"][0]["status"], "waiting_answer");
         assert_eq!(s["open_questions"][0]["text"], "why?");
@@ -599,7 +833,7 @@ mod tests {
         let id = s["clients"][0]["tasks"][0]["id"].as_i64().unwrap();
         db.add_event(Some(id), "scheduler", "done_check",
             &json!({"passed": true, "output_tail": "test result: ok"})).unwrap();
-        let s = logic::report_status(&db, &ctx, NoArgs {}).unwrap();
+        let s = logic::report_status(&db, &Apps::default(), &ctx, NoArgs {}).unwrap();
         let c = &s["clients"][0]["tasks"][0]["last_check"];
         assert_eq!(c["passed"], true);
         assert_eq!(c["output_tail"], "test result: ok");
@@ -719,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn lead_endpoint_lists_three_tools() {
-        let app = mcp_router(Arc::new(Db::open_test()));
+        let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default());
         let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-03-26","capabilities":{},
             "clientInfo":{"name":"t","version":"1"}}});
@@ -744,23 +978,24 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(axum::serve(listener, mcp_router(db.clone())).into_future());
+        tokio::spawn(axum::serve(listener, mcp_router(db.clone(), std::env::temp_dir(), Apps::default())).into_future());
         let dir = git_dir();
         let run = AgentRun {
             role: Role::Rui,
             task_id: None,
             cwd: dir.path().to_path_buf(),
             prompt: format!(
-                "Use the create_client tool to create a client named Demo with repo_path {}. Then reply done.",
+                "Use the use_repo tool to create a client named Demo with repo_path {}. Then reply done.",
                 dir.path().display()
             ),
             system_prompt: "You are Rui.".into(),
-            allowed_tools: vec!["mcp__rui__create_client".into()],
+            allowed_tools: vec!["mcp__rui__use_repo".into()],
             builtin_tools: None,
             permission_mode: None,
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
             mcp_headers: vec![],
             resume: None,
+            partial: false,
         };
         let out = run_agent(&run, |l| {
             if let crate::runner::ParsedLine::Other(v) | crate::runner::ParsedLine::Assistant(v) = l {

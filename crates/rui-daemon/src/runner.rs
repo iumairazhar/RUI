@@ -21,6 +21,8 @@ pub struct AgentRun {
     pub mcp_url: String,
     pub mcp_headers: Vec<(String, String)>,
     pub resume: Option<String>,
+    /// Ask the CLI for partial message events (live typing).
+    pub partial: bool,
 }
 
 /// Final result of a turn.
@@ -36,6 +38,8 @@ pub enum ParsedLine {
     Init { session_id: String, raw: Value },
     Assistant(Value),
     ToolResult(Value),
+    /// Inner `event` of a `stream_event` line; live only, never stored.
+    Stream(Value),
     Result { session_id: Option<String>, text: Option<String>, is_error: bool, raw: Value },
     Other(Value),
 }
@@ -80,6 +84,9 @@ pub fn build_args(run: &AgentRun, mcp_config_path: &Path) -> Vec<String> {
         a.push("--resume".into());
         a.push(id.clone());
     }
+    if run.partial {
+        a.push("--include-partial-messages".into());
+    }
     a
 }
 
@@ -93,6 +100,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         }
         Some("assistant") => ParsedLine::Assistant(v),
         Some("user") => ParsedLine::ToolResult(v),
+        Some("stream_event") => ParsedLine::Stream(v.get("event").cloned().unwrap_or(Value::Null)),
         Some("result") => ParsedLine::Result {
             session_id: s("session_id"),
             text: s("result"),
@@ -193,6 +201,7 @@ mod tests {
             mcp_url: "http://127.0.0.1:1/none".into(),
             mcp_headers: vec![],
             resume: None,
+            partial: false,
         }
     }
 
@@ -212,6 +221,8 @@ mod tests {
             _ => panic!("expected result"),
         }
         assert!(matches!(parse_line(r#"{"type":"system","subtype":"x"}"#), Some(ParsedLine::Other(_))));
+        let se = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
+        assert!(matches!(parse_line(se), Some(ParsedLine::Stream(e)) if e["type"] == "message_start"));
         assert!(parse_line("").is_none());
         assert!(parse_line("   ").is_none());
         assert!(parse_line("not json").is_none());
@@ -252,6 +263,16 @@ mod tests {
         assert_eq!(a[pos("--permission-mode") + 1], "acceptEdits");
         assert_eq!(a[pos("--resume") + 1], "abc");
         assert_eq!(a[pos("--tools") + 1], "");
+    }
+
+    #[test]
+    fn partial_flag_only_when_set() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = run(d.path());
+        let flag = "--include-partial-messages".to_string();
+        assert!(!build_args(&r, Path::new("/x.json")).contains(&flag));
+        r.partial = true;
+        assert!(build_args(&r, Path::new("/x.json")).contains(&flag));
     }
 
     #[test]

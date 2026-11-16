@@ -1,10 +1,13 @@
 //! The scheduler: plain rules that decide what runs next, plus the code that runs it.
 
+use crate::apps::{self, AppInfo, Apps};
 use crate::db::Db;
+use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
-use crate::worktree::{DoneCheck, commit_all, create_worktree, run_done_command};
+use crate::skills::{self, Skill};
+use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, land, run_done_command};
 use anyhow::{Context, Result};
-use rui_core::{Client, QuestionStatus, Role, Task, TaskStatus};
+use rui_core::{ChatRole, Client, QuestionStatus, Role, Task, TaskStatus};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -136,16 +139,19 @@ pub fn last_done_output(db: &Db, task_id: i64) -> Result<Option<String>> {
 
 // ---- effect layer ----
 
+/// Abort handles of the turns currently running, keyed by task id.
+pub type Runs = Arc<Mutex<HashMap<i64, tokio::task::AbortHandle>>>;
+
 /// Runs forever: every tick, plan and execute. Never exits on error.
-pub async fn run(db: Arc<Db>, cfg: Config) {
-    let running = Arc::new(Mutex::new(HashSet::new()));
+pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, live: Live, apps: Apps) {
     loop {
         tokio::time::sleep(cfg.tick).await;
-        let snapshot = running.lock().map(|r| r.clone()).unwrap_or_default();
+        let snapshot: HashSet<i64> =
+            running.lock().map(|r| r.keys().copied().collect()).unwrap_or_default();
         match plan_tick(&db, &snapshot) {
             Ok(actions) => {
                 for a in actions {
-                    execute(&db, &cfg, &running, a);
+                    execute(&db, &cfg, &running, &live, &apps, a);
                 }
             }
             Err(e) => report_error(&db, None, &e),
@@ -158,7 +164,7 @@ fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
     let _ = db.add_event(task_id, "scheduler", "scheduler_error", &json!({"error": format!("{e:#}")}));
 }
 
-fn execute(db: &Arc<Db>, cfg: &Config, running: &Arc<Mutex<HashSet<i64>>>, action: Action) {
+fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps, action: Action) {
     match action {
         Action::Rollup { task_id, status } => {
             let res = db
@@ -166,28 +172,70 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Arc<Mutex<HashSet<i64>>>, actio
                 .and_then(|_| db.add_event(Some(task_id), "scheduler", "rollup", &json!({"status": status})));
             if let Err(e) = res {
                 report_error(db, Some(task_id), &e);
+            } else if status == TaskStatus::Done {
+                launch_apps(db, apps, task_id);
             }
         }
         Action::StartLead { task_id, answers } => {
-            spawn_turn(db, cfg, running, task_id, TaskStatus::Clarifying, move |db, cfg| async move {
-                lead_turn(&db, &cfg, task_id, answers).await
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, move |db, cfg, live| async move {
+                lead_turn(&db, &cfg, &live, task_id, answers).await
             });
         }
         Action::StartBuilder { task_id } => {
-            spawn_turn(db, cfg, running, task_id, TaskStatus::InProgress, move |db, cfg| async move {
-                builder_turn(&db, &cfg, task_id).await
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, move |db, cfg, live| async move {
+                builder_turn(&db, &cfg, &live, task_id).await
             });
         }
     }
 }
 
+/// After a top-level Rui task is done, starts its project's apps and tells the chat.
+fn launch_apps(db: &Arc<Db>, apps: &Apps, task_id: i64) {
+    let Ok(Some(task)) = db.get_task(task_id) else { return };
+    if task.role != Role::Rui || task.parent_id.is_some() {
+        return;
+    }
+    let (db, apps) = (db.clone(), apps.clone());
+    tokio::spawn(async move {
+        if let Err(e) = launch_and_report(&db, &apps, &task).await {
+            report_error(&db, Some(task.id), &e);
+        }
+    });
+}
+
+async fn launch_and_report(db: &Db, apps: &Apps, task: &Task) -> Result<()> {
+    let client = client_for(db, task)?;
+    let repo = expand_home(&client.repo_path);
+    let infos = apps::start_project(apps, &client.name, &repo).await;
+    db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
+    let chat_id = task.source_ref.as_deref().and_then(|r| r.strip_prefix("chat:")).and_then(|id| id.parse::<i64>().ok());
+    let Some(chat_id) = chat_id else { return Ok(()) };
+    let text = done_message(&task.title, &client.repo_path, &infos);
+    db.add_chat_message(chat_id, ChatRole::Rui, &text)?;
+    Ok(())
+}
+
+/// The chat message announcing a finished task and its apps.
+fn done_message(title: &str, repo: &str, infos: &[AppInfo]) -> String {
+    if infos.is_empty() {
+        return format!("✅ **{title}** is done.\n\nProject folder: {repo}");
+    }
+    if let Some(f) = infos.iter().find(|a| a.status != "running") {
+        let skip = f.log.len().saturating_sub(5);
+        let tail = f.log[skip..].join("\n");
+        return format!("⚠️ **{title}** is done but {} failed to start:\n\n```\n{tail}\n```", f.name);
+    }
+    let lines: Vec<String> = infos.iter().map(|a| format!("- {}: {}", a.name, a.url)).collect();
+    format!("✅ **{title}** is done and running:\n\n{}", lines.join("\n"))
+}
+
 /// Removes the task from the running set when dropped, even on panic.
-struct RunGuard(Arc<Mutex<HashSet<i64>>>, i64);
+struct RunGuard(Runs, i64);
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.0.lock() {
-            set.remove(&self.1);
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(&self.1);
         }
     }
 }
@@ -195,42 +243,48 @@ impl Drop for RunGuard {
 fn spawn_turn<F, Fut>(
     db: &Arc<Db>,
     cfg: &Config,
-    running: &Arc<Mutex<HashSet<i64>>>,
+    running: &Runs,
+    live: &Live,
     task_id: i64,
     start_status: TaskStatus,
     turn: F,
 ) where
-    F: FnOnce(Arc<Db>, Config) -> Fut + Send + 'static,
+    F: FnOnce(Arc<Db>, Config, Live) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
-    let inserted = running.lock().map(|mut set| set.insert(task_id)).unwrap_or(false);
-    if !inserted {
+    let Ok(mut map) = running.lock() else { return };
+    if map.contains_key(&task_id) {
         return;
     }
-    let guard = RunGuard(running.clone(), task_id);
     if let Err(e) = db.set_task_status(task_id, start_status) {
         report_error(db, Some(task_id), &e);
         return;
     }
     let (db, cfg) = (db.clone(), cfg.clone());
-    tokio::spawn(async move {
-        let _guard = guard;
-        if let Err(e) = turn(db.clone(), cfg).await {
+    let guard = RunGuard(running.clone(), task_id);
+    let live_guard = LiveGuard(live.clone(), LiveKey::Task(task_id));
+    let live = live.clone();
+    let handle = tokio::spawn(async move {
+        let _guard = (guard, live_guard);
+        if let Err(e) = turn(db.clone(), cfg, live).await {
             report_error(&db, Some(task_id), &e);
             let _ = db.set_task_status(task_id, TaskStatus::Stuck);
         }
     });
+    // Inserted while the lock is held, so the guard cannot remove it first.
+    map.insert(task_id, handle.abort_handle());
 }
 
-/// Turns a parsed line into an event kind and JSON payload.
-pub fn line_event(p: &ParsedLine) -> (&'static str, Value) {
-    match p {
+/// Turns a parsed line into an event kind and JSON payload; None for live-only lines.
+pub fn line_event(p: &ParsedLine) -> Option<(&'static str, Value)> {
+    Some(match p {
+        ParsedLine::Stream(_) => return None,
         ParsedLine::Init { raw, .. } => ("init", raw.clone()),
         ParsedLine::Assistant(v) => ("assistant", v.clone()),
         ParsedLine::ToolResult(v) => ("toolresult", v.clone()),
         ParsedLine::Result { raw, .. } => ("result", raw.clone()),
         ParsedLine::Other(v) => ("other", v.clone()),
-    }
+    })
 }
 
 /// Expands a leading `~/` to the home directory.
@@ -246,10 +300,11 @@ fn client_for(db: &Db, task: &Task) -> Result<Client> {
 }
 
 /// Runs the agent, logging every line as an event for `agent`.
-async fn run_logged(db: &Db, agent: &str, task_id: Option<i64>, run: &AgentRun) -> Result<RunOutcome> {
+async fn run_logged(db: &Db, live: &Live, agent: &str, task_id: i64, run: &AgentRun) -> Result<RunOutcome> {
     run_agent(run, |p| {
-        let (kind, payload) = line_event(p);
-        let _ = db.add_event(task_id, agent, kind, &payload);
+        on_line(live, LiveKey::Task(task_id), p);
+        let Some((kind, payload)) = line_event(p) else { return };
+        let _ = db.add_event(Some(task_id), agent, kind, &payload);
     })
     .await
 }
@@ -269,14 +324,32 @@ fn lead_prompt(task: &Task, client: &Client, answers: &[(String, String)]) -> St
     format!("The owner answered:\n\n{}\n\nContinue: split or ask more.", pairs.join("\n\n"))
 }
 
-async fn lead_turn(db: &Db, cfg: &Config, task_id: i64, answers: Vec<(String, String)>) -> Result<()> {
+/// Text block listing owner instructions, or an empty string when there are none.
+fn instructions_block(items: &[(i64, String)]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = items.iter().map(|(_, t)| format!("- {t}")).collect();
+    format!("The owner sent new instructions:\n{}\n\n", lines.join("\n"))
+}
+
+/// Takes the pending instructions and marks them delivered before the agent runs.
+fn take_instructions(db: &Db, task_id: i64) -> Result<String> {
+    let pending = db.pending_instructions(task_id)?;
+    let Some((last_id, _)) = pending.last() else { return Ok(String::new()) };
+    db.add_event(Some(task_id), "owner", "instruction_delivered", &json!({"upto": last_id}))?;
+    Ok(instructions_block(&pending))
+}
+
+async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Vec<(String, String)>) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = client_for(db, &task)?;
+    let block = take_instructions(db, task_id)?;
     let run = AgentRun {
         role: Role::Lead,
         task_id: Some(task_id),
         cwd: expand_home(&client.repo_path),
-        prompt: lead_prompt(&task, &client, &answers),
+        prompt: format!("{block}{}", lead_prompt(&task, &client, &answers)),
         system_prompt: LEAD_PROMPT.into(),
         allowed_tools: LEAD_TOOLS.split(',').map(String::from).collect(),
         builtin_tools: None,
@@ -284,8 +357,9 @@ async fn lead_turn(db: &Db, cfg: &Config, task_id: i64, answers: Vec<(String, St
         mcp_url: format!("http://127.0.0.1:{}/mcp/lead", cfg.port),
         mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string())],
         resume: db.get_session(Role::Lead, Some(task_id))?,
+        partial: true,
     };
-    match run_logged(db, "lead", Some(task_id), &run).await {
+    match run_logged(db, live, "lead", task_id, &run).await {
         Ok(out) => {
             if let Some(id) = out.session_id {
                 db.set_session(Role::Lead, Some(task_id), &id)?;
@@ -310,6 +384,23 @@ fn builder_tools(client: &Client, done_command: &str) -> Vec<String> {
     tools
 }
 
+/// Extra Bash permissions a skill grants.
+fn skill_tools(skill: &Skill) -> Vec<String> {
+    skill.bash.iter().map(|p| format!("Bash({p})")).collect()
+}
+
+/// System prompt and allowed tools for a builder, including its skill if it has one.
+fn builder_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str) -> Result<(String, Vec<String>)> {
+    let mut tools = builder_tools(client, done);
+    let Some(name) = &task.skill else { return Ok((BUILDER_PROMPT.into(), tools)) };
+    let Some(skill) = skills::load(&cfg.data_dir, name) else {
+        db.add_event(Some(task.id), "scheduler", "skill_missing", &json!({"skill": name}))?;
+        return Ok((BUILDER_PROMPT.into(), tools));
+    };
+    tools.extend(skill_tools(&skill));
+    Ok((format!("{BUILDER_PROMPT}\n\n# Skill: {name}\n{}", skill.body), tools))
+}
+
 fn builder_prompt(task: &Task, done_command: &str, last_output: Option<&str>) -> String {
     let mut p = format!(
         "Subtask: {}\n\n{}\n\nDone command: {}\nThis is loop {} of {}.",
@@ -323,19 +414,6 @@ fn builder_prompt(task: &Task, done_command: &str, last_output: Option<&str>) ->
         p.push_str(&format!("\n\nOutput of the last done check:\n{out}"));
     }
     p
-}
-
-/// Branch of the dependency with the highest id that has one.
-/// With several independent deps only one base is used; merging comes with internal PRs later.
-fn dependency_base(db: &Db, task: &Task) -> Result<Option<String>> {
-    let mut deps = task.depends_on.clone();
-    deps.sort_unstable_by(|a, b| b.cmp(a));
-    for id in deps {
-        if let Some(branch) = db.get_task(id)?.and_then(|d| d.branch) {
-            return Ok(Some(branch));
-        }
-    }
-    Ok(None)
 }
 
 /// On daemon start: orphaned in_progress tasks go back to open, clarifying ones to new.
@@ -356,31 +434,40 @@ pub fn recover_on_start(db: &Db) -> Result<usize> {
     Ok(count)
 }
 
-async fn builder_turn(db: &Db, cfg: &Config, task_id: i64) -> Result<()> {
+async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let done_command = task.done_command.clone().context("subtask has no done_command")?;
     let client = client_for(db, &task)?;
     let repo = expand_home(&client.repo_path);
-    let base = dependency_base(db, &task)?;
-    let (wt, branch) =
-        create_worktree(&repo, &cfg.data_dir.join("worktrees"), task_id, base.as_deref())?;
+    let (wt, branch) = create_worktree(&repo, &cfg.data_dir.join("worktrees"), task_id, None)?;
     db.set_task_branch(task_id, &branch)?;
     let last = last_done_output(db, task_id)?;
+    let block = take_instructions(db, task_id)?;
+    let (system_prompt, allowed_tools) = builder_setup(db, cfg, &task, &client, &done_command)?;
+    let resume = if block.is_empty() { None } else { db.get_session(Role::Builder, Some(task_id))? };
     let run = AgentRun {
         role: Role::Builder,
         task_id: Some(task_id),
         cwd: wt.clone(),
-        prompt: builder_prompt(&task, &done_command, last.as_deref()),
-        system_prompt: BUILDER_PROMPT.into(),
-        allowed_tools: builder_tools(&client, &done_command),
+        prompt: format!("{block}{}", builder_prompt(&task, &done_command, last.as_deref())),
+        system_prompt,
+        allowed_tools,
         builtin_tools: None,
         permission_mode: Some("acceptEdits".into()),
         mcp_url: format!("http://127.0.0.1:{}/mcp/builder", cfg.port),
         mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string())],
-        resume: None,
+        resume,
+        partial: true,
     };
-    if let Err(e) = run_logged(db, "builder", Some(task_id), &run).await {
-        db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
+    match run_logged(db, live, "builder", task_id, &run).await {
+        Ok(out) => {
+            if let Some(id) = out.session_id {
+                db.set_session(Role::Builder, Some(task_id), &id)?;
+            }
+        }
+        Err(e) => {
+            db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
+        }
     }
     finish_builder(db, &task, &wt, &done_command).await
 }
@@ -396,6 +483,26 @@ async fn finish_builder(db: &Db, task: &Task, wt: &std::path::Path, done_command
     }
     let committed = commit_all(wt, &format!("rui: task {}: {}", task.id, task.title))?;
     db.add_event(Some(task.id), "scheduler", "commit", &json!({"committed": committed}))?;
+    if !committed {
+        return Ok(());
+    }
+    land_branch(db, task)
+}
+
+/// Merges the task branch into main; a conflict turns the finished task Stuck.
+fn land_branch(db: &Db, task: &Task) -> Result<()> {
+    let client = client_for(db, task)?;
+    let branch = crate::worktree::branch_name(task.id);
+    let message = format!("rui: task {}: {}", task.id, task.title);
+    match land(&expand_home(&client.repo_path), &branch, &message)? {
+        LandResult::Merged => {
+            db.add_event(Some(task.id), "scheduler", "landed", &json!({"branch": branch}))?;
+        }
+        LandResult::Conflict(files) => {
+            db.add_event(Some(task.id), "scheduler", "land_failed", &json!({"files": files}))?;
+            db.set_task_status(task.id, TaskStatus::Stuck)?;
+        }
+    }
     Ok(())
 }
 
@@ -407,14 +514,27 @@ mod tests {
     fn init_line_event_keeps_raw_fields() {
         let line = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-x","apiKeySource":"none"}"#;
         let p = crate::runner::parse_line(line).unwrap();
-        let (kind, payload) = line_event(&p);
+        let (kind, payload) = line_event(&p).unwrap();
         assert_eq!(kind, "init");
         assert_eq!(payload["model"], "claude-x");
         assert_eq!(payload["apiKeySource"], "none");
         assert_eq!(payload["session_id"], "s");
     }
+    #[test]
+    fn stream_lines_are_not_stored() {
+        let line = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
+        let p = crate::runner::parse_line(line).unwrap();
+        assert!(line_event(&p).is_none());
+    }
     use crate::db::NewTask;
     use rui_core::SourceKind;
+
+    #[test]
+    fn instructions_block_formats_items() {
+        assert_eq!(instructions_block(&[]), "");
+        let items = vec![(1, "a".to_string()), (2, "b".to_string())];
+        assert_eq!(instructions_block(&items), "The owner sent new instructions:\n- a\n- b\n\n");
+    }
 
     fn mk(db: &Db, client: i64, parent: Option<i64>, status: TaskStatus) -> Task {
         db.create_task(&NewTask {
@@ -428,6 +548,7 @@ mod tests {
             role: Role::Lead,
             source_kind: SourceKind::User,
             source_ref: None,
+            skill: None,
         })
         .unwrap()
     }
@@ -554,5 +675,35 @@ mod tests {
             db.set_task_status(t.id, TaskStatus::InProgress).unwrap();
         }
         assert_eq!(last_done_output(&db, t.id).unwrap().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn rui_parent_in_split_behaves_like_lead_parent() {
+        let (db, c) = setup();
+        let parent = db
+            .create_task(&NewTask {
+                client_id: c,
+                parent_id: None,
+                title: "p".into(),
+                body: String::new(),
+                status: TaskStatus::Split,
+                done_command: None,
+                max_loops: 5,
+                role: Role::Rui,
+                source_kind: SourceKind::Chat,
+                source_ref: None,
+                skill: None,
+            })
+            .unwrap();
+        let sub = mk(&db, c, Some(parent.id), TaskStatus::Open);
+        assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: sub.id }]);
+        db.set_task_status(sub.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Rollup { task_id: parent.id, status: TaskStatus::Done }]);
+    }
+
+    #[test]
+    fn skill_tools_wrap_patterns() {
+        let s = skills::parse("---\nname: x\ndescription: d\nbash: [\"uv *\", \"curl *\"]\n---\nb\n").unwrap();
+        assert_eq!(skill_tools(&s), ["Bash(uv *)", "Bash(curl *)"]);
     }
 }

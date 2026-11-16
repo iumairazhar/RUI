@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   branch TEXT,
   source_kind TEXT NOT NULL CHECK (source_kind IN ('chat','user')),
   source_ref TEXT,
+  skill TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -46,8 +47,16 @@ CREATE TABLE IF NOT EXISTS questions (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS chats (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT 'New chat',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE TABLE IF NOT EXISTS chat_messages (
   id INTEGER PRIMARY KEY,
+  chat_id INTEGER NOT NULL DEFAULT 1 REFERENCES chats(id),
   role TEXT NOT NULL CHECK (role IN ('user','rui')),
   content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -56,6 +65,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY,
   task_id INTEGER REFERENCES tasks(id),
+  chat_id INTEGER REFERENCES chats(id),
   agent TEXT NOT NULL,
   kind TEXT NOT NULL,
   payload TEXT NOT NULL DEFAULT '{}',
@@ -65,6 +75,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS agent_sessions (
   role TEXT NOT NULL CHECK (role IN ('rui','lead','builder')),
   task_id INTEGER REFERENCES tasks(id),
+  chat_id INTEGER REFERENCES chats(id),
   session_id TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE (role, task_id)
@@ -75,5 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_questions_task_id ON questions(task_id);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
+CREATE INDEX IF NOT EXISTS idx_events_chat_id ON events(chat_id);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;

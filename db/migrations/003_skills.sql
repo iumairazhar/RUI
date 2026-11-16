@@ -1,0 +1,4 @@
+BEGIN;
+ALTER TABLE tasks ADD COLUMN skill TEXT;
+PRAGMA user_version = 3;
+COMMIT;

@@ -1,9 +1,13 @@
 pub mod api;
+pub mod apps;
 pub mod chat;
 pub mod db;
+pub mod live;
 pub mod mcp;
+pub mod projects;
 pub mod runner;
 pub mod scheduler;
 pub mod seat;
+pub mod skills;
 pub mod state;
 pub mod worktree;

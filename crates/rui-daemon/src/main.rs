@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, chat, db::Db, mcp, scheduler, seat, state};
+use rui_daemon::{api, apps, chat, db::Db, live, mcp, scheduler, seat, skills, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,11 +24,16 @@ async fn main() {
         Ok(_) => {}
         Err(e) => eprintln!("recovery failed: {e:#}"),
     }
-    let cfg = scheduler::Config { port, tick, data_dir: state::data_dir() };
+    let data_dir = state::data_dir();
+    let cfg = scheduler::Config { port, tick, data_dir: data_dir.clone() };
     let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
     let seat_cache = seat::SeatCache::default();
-    let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone() };
-    let app = api::router(state).merge(mcp::mcp_router(db.clone()));
+    let runs = scheduler::Runs::default();
+    let live = live::Live::default();
+    let apps = apps::Apps::default();
+    skills::seed(&data_dir);
+    let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone(), runs: runs.clone(), live: live.clone(), data_dir: data_dir.clone(), apps: apps.clone() };
+    let app = api::router(state).merge(mcp::mcp_router(db.clone(), data_dir, apps.clone()));
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -37,11 +42,27 @@ async fn main() {
         }
     };
     tokio::spawn(seat::refresh_loop(seat_cache));
-    tokio::spawn(scheduler::run(db.clone(), cfg.clone()));
-    tokio::spawn(chat::run(db, chat_rx, cfg));
+    tokio::spawn(scheduler::run(db.clone(), cfg.clone(), runs, live.clone(), apps.clone()));
+    tokio::spawn(chat::run(db, chat_rx, cfg, live));
     println!("rui-daemon listening on 127.0.0.1:{port}");
-    if let Err(e) = axum::serve(listener, app).await {
+    let served = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
+    apps::stop_all(&apps);
+    if let Err(e) = served {
         eprintln!("server error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Resolves on Ctrl-C or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
+        return ctrl_c.await;
+    };
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term.recv() => {}
     }
 }
