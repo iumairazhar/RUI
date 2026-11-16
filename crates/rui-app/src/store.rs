@@ -379,10 +379,29 @@ impl Store {
         }
     }
 
-    /// Stop a task, then refresh.
+    /// Stop a task and its unfinished subtasks, toast how many stopped, then refresh.
     pub fn stop_task(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.show_toast("Stopped", vec![format!("Thread {id}")], cx);
-        self.act(move || api::stop(id), cx);
+        self.stop_call(move || api::stop(id), cx);
+    }
+
+    /// Stop every running team, toast how many stopped, then refresh.
+    pub fn stop_all(&mut self, cx: &mut Context<Self>) {
+        self.stop_call(api::stop_all, cx);
+    }
+
+    fn stop_call(&mut self, call: impl FnOnce() -> anyhow::Result<Vec<i64>> + Send + 'static, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { call() }).await;
+            this.update(cx, |s, cx| {
+                match res {
+                    Ok(ids) => s.show_toast(&stopped_text(ids.len()), vec![], cx),
+                    Err(e) => s.action_error = Some(format!("Request failed: {e}")),
+                }
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Send new instructions to a task, then refresh.
@@ -511,6 +530,12 @@ fn file_text(res: anyhow::Result<api::TaskFile>) -> Result<String, String> {
     Ok(if f.truncated { format!("{}\n(truncated)", f.content) } else { f.content })
 }
 
+/// Toast text after a stop: "Stopped · 3 agents stopped".
+pub fn stopped_text(n: usize) -> String {
+    let noun = if n == 1 { "agent" } else { "agents" };
+    format!("Stopped \u{b7} {n} {noun} stopped")
+}
+
 /// Re-render `view` whenever the store changes.
 pub fn observe<V: 'static>(store: &Entity<Store>, cx: &mut Context<V>) {
     cx.observe(store, |_, _, cx| cx.notify()).detach();
@@ -538,6 +563,12 @@ mod tests {
         let asks = vec![ask(1, "open"), ask(2, "answered"), ask(3, "open")];
         assert_eq!(inbox_count(&questions, &asks), 3);
         assert_eq!(inbox_count(&[], &[]), 0);
+    }
+
+    #[test]
+    fn stopped_toast_text() {
+        assert_eq!(stopped_text(3), "Stopped \u{b7} 3 agents stopped");
+        assert_eq!(stopped_text(1), "Stopped \u{b7} 1 agent stopped");
     }
 
     #[test]

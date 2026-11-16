@@ -31,6 +31,11 @@ fn post(path: &str, body: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn post_value(path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    let url = format!("{}{}", base_url(), path);
+    Ok(agent().post(&url).send_json(body)?.body_mut().read_json()?)
+}
+
 /// Fetch all clients.
 pub fn get_clients() -> Result<Vec<Client>> {
     Ok(serde_json::from_value(get("/clients")?)?)
@@ -356,9 +361,19 @@ pub fn stop_apps(project: &str) -> Result<()> {
     post(&format!("/apps/{}/stop", encode_path(project)), serde_json::json!({}))
 }
 
-/// Stop a running task.
-pub fn stop(id: i64) -> Result<()> {
-    post(&format!("/tasks/{id}/stop"), serde_json::json!({}))
+/// Ids in a `{stopped: [ids]}` reply.
+fn stopped_ids(v: &serde_json::Value) -> Vec<i64> {
+    v["stopped"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default()
+}
+
+/// Stop a task and its unfinished subtasks; returns every id stopped.
+pub fn stop(id: i64) -> Result<Vec<i64>> {
+    Ok(stopped_ids(&post_value(&format!("/tasks/{id}/stop"), serde_json::json!({}))?))
+}
+
+/// Stop every running team; returns every id stopped.
+pub fn stop_all() -> Result<Vec<i64>> {
+    Ok(stopped_ids(&post_value("/stop-all", serde_json::json!({}))?))
 }
 
 /// Pass new instructions down to a task.

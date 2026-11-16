@@ -306,6 +306,9 @@ pub mod logic {
         Ok(serde_json::to_value(client)?)
     }
 
+    /// Most specialists a pod may have, not counting the Lead.
+    const MAX_SPECIALISTS: usize = 3;
+
     /// Checks the pod and returns it without duplicates.
     fn validate_pod(data_dir: &Path, pod: &[String]) -> anyhow::Result<Vec<String>> {
         if pod.is_empty() {
@@ -325,6 +328,9 @@ pub mod logic {
             if !clean.iter().any(|c| c == name) {
                 clean.push(name.to_string());
             }
+        }
+        if clean.len() > MAX_SPECIALISTS {
+            anyhow::bail!("Pods are capped at 3 specialists plus the Lead. Pick the smallest team; the owner can ask for more.");
         }
         Ok(clean)
     }
@@ -1058,6 +1064,16 @@ mod tests {
         let (db, ctx, _d) = setup(None);
         let a = CreateTaskArgs { client_name: "Acme".into(), title: " ".into(), body: "".into() };
         assert!(logic::create_task(&db, &ctx, a).is_err());
+    }
+
+    #[test]
+    fn staff_task_rejects_pods_over_three_specialists() {
+        let names = ["a", "b", "c", "d"];
+        let (db, data) = (Db::open_test(), data_with_roles(&names));
+        let ctx = Ctx::default();
+        assert!(logic::staff_task(&db, data.path(), &ctx, staff_args(None, &names[..3])).is_ok());
+        let err = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &names)).unwrap_err();
+        assert!(err.to_string().contains("capped at 3 specialists"));
     }
 
     #[test]

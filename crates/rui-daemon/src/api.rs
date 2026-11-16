@@ -86,6 +86,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/results", get(task_results))
         .route("/tasks/{id}/result-file", get(result_file))
         .route("/tasks/{id}/stop", post(stop_task))
+        .route("/stop-all", post(stop_all))
         .route("/tasks/{id}/instruct", post(instruct_task))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
@@ -366,9 +367,23 @@ async fn instruct_task(
     Ok(Json(crate::control::instruct(&s.db, &s.runs, id, &b.text, "owner")?))
 }
 
-/// Aborts the running turn (if any) and marks the task stuck.
-async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Task>> {
-    Ok(Json(crate::control::stop_one(&s.db, &s.runs, id, "owner", None)?))
+/// Stops a task and its unfinished subtasks, aborting their runs.
+async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let ids = crate::control::stop_tree(&s.db, &s.runs, id, "owner", None)?;
+    Ok(Json(serde_json::json!({ "stopped": ids })))
+}
+
+/// Stops every top-level task that is not done or stuck, with its subtasks.
+async fn stop_all(State(s): State<ApiState>) -> ApiResult<Json<serde_json::Value>> {
+    let open: Vec<i64> = (s.db.list_tasks()?.iter())
+        .filter(|t| t.parent_id.is_none() && !matches!(t.status, TaskStatus::Done | TaskStatus::Stuck))
+        .map(|t| t.id)
+        .collect();
+    let mut stopped = Vec::new();
+    for id in open {
+        stopped.extend(crate::control::stop_tree(&s.db, &s.runs, id, "owner", None)?);
+    }
+    Ok(Json(serde_json::json!({ "stopped": stopped })))
 }
 
 /// Files changed by a task: committed diff when done, else the live worktree diff.
@@ -517,9 +532,13 @@ mod tests {
     }
 
     fn seed_task_for(db: &Db, client_id: i64) -> i64 {
+        seed_child(db, client_id, None)
+    }
+
+    fn seed_child(db: &Db, client_id: i64, parent_id: Option<i64>) -> i64 {
         db.create_task(&NewTask {
             client_id,
-            parent_id: None,
+            parent_id,
             title: "t".into(),
             body: String::new(),
             status: TaskStatus::New,
@@ -772,9 +791,36 @@ mod tests {
         let (_, tid) = seed_task(&db);
         db.set_task_status(tid, TaskStatus::InProgress).unwrap();
         let (st, v) = call(&app, "POST", &format!("/tasks/{tid}/stop"), None).await;
-        assert_eq!((st, v["status"].as_str()), (StatusCode::OK, Some("stuck")));
+        assert_eq!((st, v["stopped"].clone()), (StatusCode::OK, json!([tid])));
+        assert_eq!(db.get_task(tid).unwrap().unwrap().status, TaskStatus::Stuck);
         let events = db.list_events(Some(tid), 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "stopped" && e.agent == "owner"));
+    }
+
+    #[tokio::test]
+    async fn stop_parent_stops_running_children() {
+        let (app, db, _rx) = setup();
+        let (cid, parent) = seed_task(&db);
+        let kid = seed_child(&db, cid, Some(parent));
+        db.set_task_status(kid, TaskStatus::InProgress).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{parent}/stop"), None).await;
+        assert_eq!((st, v["stopped"].clone()), (StatusCode::OK, json!([parent, kid])));
+        assert_eq!(db.get_task(kid).unwrap().unwrap().status, TaskStatus::Stuck);
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_every_open_team() {
+        let (app, db, _rx) = setup();
+        let (cid, a) = seed_task(&db);
+        let ka = seed_child(&db, cid, Some(a));
+        let b = seed_task_for(&db, cid);
+        let done = seed_task_for(&db, cid);
+        db.set_task_status(done, TaskStatus::Done).unwrap();
+        let (st, v) = call(&app, "POST", "/stop-all", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["stopped"], json!([a, ka, b]));
+        assert_eq!(db.get_task(done).unwrap().unwrap().status, TaskStatus::Done);
+        assert_eq!(db.get_task(b).unwrap().unwrap().status, TaskStatus::Stuck);
     }
 
     #[tokio::test]
