@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use rui_core::{
-    Chat, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, Rung, SCHEMA_VERSION,
+    Chat, ChatAsk, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, Rung, SCHEMA_VERSION,
     SourceKind, Task, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
@@ -133,6 +133,28 @@ pub fn chat_title(content: &str) -> String {
     }
     let head: String = text.chars().take(TITLE_MAX_CHARS).collect();
     format!("{}…", head.trim_end())
+}
+
+fn fetch_asks(conn: &Connection, cond: &str, args: impl rusqlite::Params) -> Result<Vec<ChatAsk>> {
+    let sql = format!(
+        "SELECT a.id, a.chat_id, c.title, a.text, a.options, a.answer, a.status, a.created_at \
+         FROM chat_asks a JOIN chats c ON c.id = a.chat_id WHERE {cond} ORDER BY a.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(args, |r| {
+        let options: String = r.get(4)?;
+        Ok(ChatAsk {
+            id: r.get(0)?,
+            chat_id: r.get(1)?,
+            chat_title: r.get(2)?,
+            text: r.get(3)?,
+            options: serde_json::from_str(&options).unwrap_or_default(),
+            answer: r.get(5)?,
+            status: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
@@ -437,6 +459,62 @@ impl Db {
         fetch_chat(&*self.conn()?, id)
     }
 
+    // ---- chat asks ----
+
+    /// The chat a source ref like `chat:<message id>` points at (the id is a chat MESSAGE id).
+    pub fn chat_id_for_source_ref(&self, source_ref: &str) -> Result<Option<i64>> {
+        let Some(id) = source_ref.strip_prefix("chat:").and_then(|i| i.parse::<i64>().ok()) else { return Ok(None) };
+        Ok(self.get_chat_message(id)?.map(|m| m.chat_id))
+    }
+
+    /// Stores a new open ask of the turn that answered `message_id`.
+    pub fn create_chat_ask(&self, chat_id: i64, message_id: Option<i64>, text: &str, options: &[String]) -> Result<ChatAsk> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO chat_asks (chat_id, message_id, text, options) VALUES (?1, ?2, ?3, ?4)",
+            params![chat_id, message_id, text, serde_json::to_string(options)?],
+        )?;
+        let id = conn.last_insert_rowid();
+        fetch_asks(&conn, "a.id = ?1", params![id])?.pop().ok_or_else(|| anyhow!("ask vanished"))
+    }
+
+    pub fn get_chat_ask(&self, id: i64) -> Result<Option<ChatAsk>> {
+        Ok(fetch_asks(&*self.conn()?, "a.id = ?1", params![id])?.pop())
+    }
+
+    /// Asks, oldest first, optionally only those with `status`.
+    pub fn list_chat_asks(&self, status: Option<&str>) -> Result<Vec<ChatAsk>> {
+        fetch_asks(&*self.conn()?, "(?1 IS NULL OR a.status = ?1)", params![status])
+    }
+
+    /// How many asks this turn (the owner message `message_id`) already made.
+    pub fn count_asks_of_message(&self, message_id: i64) -> Result<i64> {
+        let sql = "SELECT COUNT(*) FROM chat_asks WHERE message_id = ?1";
+        Ok(self.conn()?.query_row(sql, [message_id], |r| r.get(0))?)
+    }
+
+    /// Records the answer to an open ask. None if it is missing or already answered.
+    pub fn answer_chat_ask(&self, id: i64, answer: &str) -> Result<Option<ChatAsk>> {
+        let conn = self.conn()?;
+        let n = conn.execute("UPDATE chat_asks SET answer = ?1, status = 'answered' WHERE id = ?2 AND status = 'open'", params![answer, id])?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(fetch_asks(&conn, "a.id = ?1", params![id])?.pop())
+    }
+
+    /// The asks made in the same turn as ask `id` (just itself when it has no turn).
+    pub fn asks_of_same_turn(&self, id: i64) -> Result<Vec<ChatAsk>> {
+        let cond = "a.id = ?1 OR (a.message_id IS NOT NULL AND a.message_id = (SELECT message_id FROM chat_asks WHERE id = ?1))";
+        fetch_asks(&*self.conn()?, cond, params![id])
+    }
+
+    /// The owner replied in the chat itself: its open asks count as answered there.
+    pub fn close_chat_asks(&self, chat_id: i64) -> Result<usize> {
+        let sql = "UPDATE chat_asks SET status = 'answered', answer = '(answered in chat)' WHERE chat_id = ?1 AND status = 'open'";
+        Ok(self.conn()?.execute(sql, [chat_id])?)
+    }
+
     /// All chats, most recently active first.
     pub fn list_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn()?;
@@ -540,6 +618,18 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map(params![after_id, task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How often each skill was installed in the last `days` days, from `skill_used` events.
+    pub fn skill_use_counts(&self, days: i64) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(payload, '$.skill'), COUNT(*) FROM events \
+             WHERE kind = 'skill_used' AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1) GROUP BY 1",
+        )?;
+        let rows = stmt.query_map(params![format!("-{days} days")], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter_map(|(k, n)| Some((k?, n))).collect())
     }
 
     /// Owner instructions (id, text) not yet delivered, oldest first.
@@ -772,6 +862,18 @@ mod tests {
         INSERT INTO events (agent, kind) VALUES ('rui', 'x'), ('lead', 'y'); \
         INSERT INTO agent_sessions (role, session_id) VALUES ('rui', 's'); \
         PRAGMA user_version = 1;";
+
+    #[test]
+    fn migration_005_adds_chat_asks_to_a_v4_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE chats (id INTEGER PRIMARY KEY, title TEXT); PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(include_str!("../../../db/migrations/005_chat_asks.sql")).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        conn.execute("INSERT INTO chats (id, title) VALUES (1, 't')", []).unwrap();
+        conn.execute("INSERT INTO chat_asks (chat_id, text) VALUES (1, 'q')", []).unwrap();
+        assert!(conn.execute("INSERT INTO chat_asks (chat_id, text, status) VALUES (1, 'q', 'bogus')", []).is_err());
+    }
 
     #[test]
     fn migration_002_upgrades_v1_db() {

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_MAX_LOOPS: i64 = 5;
 
+/// Tool group names a role may be given.
+pub const ROLE_TOOLS: [&str; 6] = ["Read", "Search", "Edit", "Shell", "Run tests", "Fetch URL"];
+
 /// One parsed role.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Role {
@@ -23,6 +26,7 @@ pub struct Role {
     /// Skill folder names installed for this role.
     pub skills: Vec<String>,
     pub max_loops: i64,
+    #[serde(skip_serializing)]
     pub body: String,
 }
 
@@ -108,10 +112,11 @@ pub fn cli_tools(role: &Role) -> Vec<String> {
     out.into_iter().map(String::from).collect()
 }
 
-/// One catalog line per role, for Rui's prompt.
+/// One catalog line per role that is switched on, for Rui's prompt.
 pub fn catalog(data_dir: &Path) -> String {
     let lines: Vec<String> = load_all(data_dir)
         .iter()
+        .filter(|r| crate::library::is_on(data_dir, crate::library::Kind::Role, &r.name))
         .map(|r| format!("- {} {}: {} (skills: {})", r.code, r.name, r.description, r.skills.join(", ")))
         .collect();
     lines.join("\n")

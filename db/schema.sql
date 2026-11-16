@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   UNIQUE (role, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS chat_asks (
+  id INTEGER PRIMARY KEY,
+  chat_id INTEGER NOT NULL REFERENCES chats(id),
+  message_id INTEGER, -- the owner message of the turn that asked; groups one turn's asks
+  text TEXT NOT NULL,
+  options TEXT NOT NULL DEFAULT '[]', -- JSON array of strings
+  answer TEXT,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_asks_chat_id ON chat_asks(chat_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_client_id ON tasks(client_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -94,4 +106,4 @@ CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
 CREATE INDEX IF NOT EXISTS idx_events_chat_id ON events(chat_id);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

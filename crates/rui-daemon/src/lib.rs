@@ -1,7 +1,13 @@
 pub mod api;
 pub mod apps;
+pub mod asks;
 pub mod chat;
+pub mod control;
 pub mod db;
+pub mod library;
+pub mod library_api;
+pub mod library_roles;
+pub mod library_skills;
 pub mod live;
 pub mod mcp;
 pub mod projects;

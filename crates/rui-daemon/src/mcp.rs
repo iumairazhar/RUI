@@ -8,7 +8,7 @@
 use crate::apps::{self, AppSpec, Apps};
 use crate::db::{Db, NewTask};
 use crate::roster;
-use crate::scheduler;
+use crate::scheduler::{self, Runs};
 use axum::http::request::Parts;
 use rmcp::{
     ServerHandler,
@@ -35,9 +35,9 @@ pub struct Ctx {
 }
 
 /// Builds the router with `/mcp/rui`, `/mcp/lead` and `/mcp/builder`.
-pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps) -> axum::Router {
+pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axum::Router {
     axum::Router::new()
-        .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir.clone(), apps)))
+        .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs)))
         .nest_service("/mcp/lead", service(LeadServer::new(db.clone(), data_dir.clone())))
         .nest_service("/mcp/builder", service(BuilderServer::new(db, data_dir)))
 }
@@ -130,6 +130,37 @@ pub struct ProjectArgs {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoArgs {}
+
+/// Arguments for `ask_owner`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AskOwnerArgs {
+    /// One short question for the owner.
+    pub question: String,
+    /// Optional quick answers the owner can pick from.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+}
+
+/// Arguments for `stop_task`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct StopTaskArgs {
+    /// Id of the task to stop (from report_status).
+    pub task_id: i64,
+    /// Why it is being stopped.
+    pub reason: String,
+}
+
+/// Arguments for `instruct_task`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct InstructTaskArgs {
+    /// Id of the task to redirect (from report_status).
+    pub task_id: i64,
+    /// What the owner now wants.
+    pub text: String,
+}
 
 /// Arguments for the Lead's `create_subtask`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -288,6 +319,9 @@ pub mod logic {
             if roster::load(data_dir, name).is_none() {
                 anyhow::bail!("unknown role '{name}'");
             }
+            if !crate::library::is_on(data_dir, crate::library::Kind::Role, name) {
+                anyhow::bail!("role '{name}' is turned off");
+            }
             if !clean.iter().any(|c| c == name) {
                 clean.push(name.to_string());
             }
@@ -343,6 +377,41 @@ pub mod logic {
         }
         record(db, ctx, Role::Rui, "staff_task", &a)?;
         Ok(json!({"project": client.name, "repo_path": client.repo_path, "task_id": parent.id, "pod": full_pod}))
+    }
+
+    /// Stores a question for the owner; it shows in the Inbox. Rui must end its turn afterwards.
+    pub fn ask_owner(db: &Db, ctx: &Ctx, a: AskOwnerArgs) -> anyhow::Result<Value> {
+        let question = a.question.trim();
+        if question.is_empty() {
+            anyhow::bail!("question must not be empty");
+        }
+        let source = ctx.source_ref.as_deref().ok_or_else(|| anyhow::anyhow!("ask_owner works only in a chat"))?;
+        let chat_id = db.chat_id_for_source_ref(source)?.ok_or_else(|| anyhow::anyhow!("chat not found"))?;
+        let msg_id = source.strip_prefix("chat:").and_then(|i| i.parse::<i64>().ok());
+        if let Some(m) = msg_id.filter(|m| db.count_asks_of_message(*m).unwrap_or(0) >= crate::asks::MAX_ASKS_PER_TURN) {
+            anyhow::bail!("at most {} asks per turn (message {m}); end your turn", crate::asks::MAX_ASKS_PER_TURN);
+        }
+        let options: Vec<String> = a.options.iter().flatten().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+        let ask = db.create_chat_ask(chat_id, msg_id, question, &options)?;
+        record(db, ctx, Role::Rui, "ask_owner", &a)?;
+        Ok(json!({"ask_id": ask.id, "next": "Asked. The owner will answer in the Inbox or chat. End your turn now."}))
+    }
+
+    /// Stops a task and its unfinished subtasks.
+    pub fn stop_task(db: &Db, runs: &Runs, ctx: &Ctx, a: StopTaskArgs) -> anyhow::Result<Value> {
+        let ids = crate::control::stop_tree(db, runs, a.task_id, "rui", Some(a.reason.trim())).map_err(|e| anyhow::anyhow!("{e}"))?;
+        record(db, ctx, Role::Rui, "stop_task", &a)?;
+        Ok(json!({"stopped": ids}))
+    }
+
+    /// Sends an instruction to a task; a parent's Lead gets a new turn.
+    pub fn instruct_task(db: &Db, runs: &Runs, ctx: &Ctx, a: InstructTaskArgs) -> anyhow::Result<Value> {
+        if a.text.trim().is_empty() {
+            anyhow::bail!("text must not be empty");
+        }
+        let t = crate::control::instruct(db, runs, a.task_id, a.text.trim(), "rui").map_err(|e| anyhow::anyhow!("{e}"))?;
+        record(db, ctx, Role::Rui, "instruct_task", &a)?;
+        Ok(json!({"task_id": t.id, "status": t.status}))
     }
 
     /// Creates a top-level lead task for an existing client.
@@ -603,14 +672,15 @@ pub struct RuiServer {
     db: Arc<Db>,
     data_dir: PathBuf,
     apps: Apps,
+    runs: Runs,
     #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
 
 impl RuiServer {
-    /// Creates the server over a shared database, the data dir (projects, roles) and the running apps.
-    pub fn new(db: Arc<Db>, data_dir: PathBuf, apps: Apps) -> Self {
-        Self { db, data_dir, apps, tool_router: Self::tool_router() }
+    /// Creates the server over a shared database, the data dir (projects, roles), the running apps and the run handles.
+    pub fn new(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> Self {
+        Self { db, data_dir, apps, runs, tool_router: Self::tool_router() }
     }
 }
 
@@ -658,6 +728,33 @@ impl RuiServer {
     ) -> CallToolResult {
         apps::stop_project(&self.apps, &a.project);
         finish(Ok(json!({"ok": true})))
+    }
+
+    #[tool(description = "Ask the owner a question that shows in their Inbox, with optional quick-answer options. Use it instead of asking in plain text, at most 3 per turn, then end your turn.")]
+    async fn ask_owner(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AskOwnerArgs>,
+    ) -> CallToolResult {
+        finish(logic::ask_owner(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Stop a task and all its unfinished subtasks, for example when the owner cancels or changes course. Give the reason. Returns the stopped task ids.")]
+    async fn stop_task(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<StopTaskArgs>,
+    ) -> CallToolResult {
+        finish(logic::stop_task(&self.db, &self.runs, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Send the owner's new or changed instructions to a running task. For a task (parent) its Lead re-plans and adjusts subtasks; for a subtask the member gets it.")]
+    async fn instruct_task(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<InstructTaskArgs>,
+    ) -> CallToolResult {
+        finish(logic::instruct_task(&self.db, &self.runs, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Answer an escalated team question yourself. Give the decision and the reason.")]
@@ -992,6 +1089,48 @@ mod tests {
     }
 
     #[test]
+    fn ask_owner_stores_an_ask_in_the_messages_chat() {
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, rui_core::ChatRole::User, "hi").unwrap();
+        let ctx = Ctx { task_id: None, source_ref: Some(format!("chat:{}", msg.id)) };
+        let ask = |q: &str| logic::ask_owner(&db, &ctx, AskOwnerArgs { question: q.into(), options: Some(vec![" A ".into(), "".into()]) });
+        for q in ["one", "two", "three"] {
+            ask(q).unwrap();
+        }
+        assert!(ask("four").unwrap_err().to_string().contains("at most 3"));
+        let asks = db.list_chat_asks(Some("open")).unwrap();
+        assert_eq!((asks.len(), asks[0].chat_id, asks[0].options.clone()), (3, chat.id, vec!["A".to_string()]));
+        assert!(ask(" ").is_err());
+        let no_chat = Ctx { task_id: None, source_ref: None };
+        assert!(logic::ask_owner(&db, &no_chat, AskOwnerArgs { question: "q".into(), options: None }).is_err());
+    }
+
+    #[test]
+    fn rui_stop_and_instruct_tools() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
+        let (ctx, runs) = (Ctx::default(), Runs::default());
+        let r = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend"])).unwrap();
+        let id = r["task_id"].as_i64().unwrap();
+        db.set_task_status(id, TaskStatus::Split).unwrap();
+        let out = logic::instruct_task(&db, &runs, &ctx, InstructTaskArgs { task_id: id, text: "  shorter ".into() }).unwrap();
+        assert_eq!(out["status"], "new");
+        assert!(logic::instruct_task(&db, &runs, &ctx, InstructTaskArgs { task_id: id, text: " ".into() }).is_err());
+        let out = logic::stop_task(&db, &runs, &ctx, StopTaskArgs { task_id: id, reason: "cancel".into() }).unwrap();
+        assert_eq!(out["stopped"], json!([id]));
+        assert_eq!(db.get_task(id).unwrap().unwrap().status, TaskStatus::Stuck);
+    }
+
+    #[test]
+    fn staff_task_rejects_an_off_role() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
+        crate::library::set_status(data.path(), crate::library::Kind::Role, "tester", "off").unwrap();
+        let err = logic::staff_task(&db, data.path(), &Ctx::default(), staff_args(None, &["backend", "tester"])).unwrap_err();
+        assert!(err.to_string().contains("turned off"), "{err}");
+        assert!(db.list_tasks().unwrap().is_empty());
+    }
+
+    #[test]
     fn staff_task_rejects_bad_pods() {
         let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
         let ctx = Ctx::default();
@@ -1222,12 +1361,12 @@ mod tests {
 
     #[tokio::test]
     async fn endpoints_list_their_tools() {
-        let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default());
+        let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
         let lead = ["create_subtask", "escalate", "mark_split", "rule", "set_done_command", "set_limit"];
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
-        let rui = ["escalate_to_owner", "report_status", "rule", "run_apps", "staff_task", "stop_apps", "use_repo"];
+        let rui = ["ask_owner", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "staff_task", "stop_apps", "stop_task", "use_repo"];
         assert_eq!(tool_names(&app, "/mcp/rui").await, rui);
     }
 
@@ -1238,7 +1377,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(axum::serve(listener, mcp_router(db.clone(), std::env::temp_dir(), Apps::default())).into_future());
+        tokio::spawn(axum::serve(listener, mcp_router(db.clone(), std::env::temp_dir(), Apps::default(), Runs::default())).into_future());
         let dir = git_dir();
         let run = AgentRun {
             role: Role::Rui,

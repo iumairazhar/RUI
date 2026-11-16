@@ -74,6 +74,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/questions/{id}/answer", post(answer_question))
         .route("/chats", get(list_chats).post(create_chat))
         .route("/chat", get(list_chat).post(post_chat))
+        .route("/asks", get(list_asks))
+        .route("/asks/{id}/answer", post(answer_ask))
         .route("/events", get(list_events))
         .route("/seat", get(get_seat))
         .route("/live", get(get_live))
@@ -82,16 +84,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/file", get(task_file))
         .route("/tasks/{id}/stop", post(stop_task))
         .route("/tasks/{id}/instruct", post(instruct_task))
-        .route("/skills", get(list_skills))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
         .route("/apps/{project}/{name}/stop", post(stop_app))
+        .merge(crate::library_api::routes())
         .with_state(state)
-}
-
-async fn list_skills(State(s): State<ApiState>) -> Json<Vec<crate::skills::Skill>> {
-    Json(crate::skills::load_all(&s.data_dir))
 }
 
 async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
@@ -244,9 +242,41 @@ async fn post_chat(
     if s.db.get_chat(b.chat_id)?.is_none() {
         return Err(not_found("chat not found"));
     }
+    s.db.close_chat_asks(b.chat_id)?;
     let msg = s.db.add_chat_message(b.chat_id, ChatRole::User, &b.content)?;
     let _ = s.chat_tx.send(msg.id);
     Ok((StatusCode::CREATED, Json(msg)))
+}
+
+#[derive(Deserialize)]
+struct AsksQuery {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Rui's questions to the owner, optionally only `?status=open` or `answered`.
+async fn list_asks(State(s): State<ApiState>, Query(q): Query<AsksQuery>) -> ApiResult<Json<Vec<rui_core::ChatAsk>>> {
+    if q.status.as_deref().is_some_and(|st| st != "open" && st != "answered") {
+        return Err(bad_request("status must be open or answered"));
+    }
+    Ok(Json(s.db.list_chat_asks(q.status.as_deref())?))
+}
+
+#[derive(Deserialize)]
+struct AskAnswer {
+    answer: String,
+}
+
+/// Answers an ask; once its whole turn is answered Rui gets one combined message in the chat.
+async fn answer_ask(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<AskAnswer>) -> ApiResult<Json<rui_core::ChatAsk>> {
+    use crate::asks::AskError;
+    require_text(&b.answer, "answer")?;
+    match crate::asks::answer(&s.db, &s.chat_tx, id, b.answer.trim()) {
+        Ok(a) => Ok(Json(a)),
+        Err(AskError::NotFound) => Err(not_found("ask not found")),
+        Err(AskError::Answered) => Err(conflict("ask is already answered")),
+        Err(AskError::Other(e)) => Err(e.into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -307,16 +337,20 @@ fn conflict(msg: &str) -> ApiError {
 }
 
 /// Removes and aborts the running turn of a task, if there is one.
-fn abort_run(runs: &Runs, id: i64) {
-    let handle = runs.lock().ok().and_then(|mut m| m.remove(&id));
-    if let Some(h) = handle {
-        h.abort();
-    }
-}
-
 #[derive(Deserialize)]
 struct InstructBody {
     text: String,
+}
+
+impl From<crate::control::ControlError> for ApiError {
+    fn from(e: crate::control::ControlError) -> Self {
+        use crate::control::ControlError as C;
+        match e {
+            C::NotFound(m) => not_found(&m),
+            C::Conflict(m) => conflict(&m),
+            C::Other(e) => e.into(),
+        }
+    }
 }
 
 /// Saves an owner instruction, aborts any run and puts the task back in the queue.
@@ -326,40 +360,12 @@ async fn instruct_task(
     Json(b): Json<InstructBody>,
 ) -> ApiResult<Json<Task>> {
     require_text(&b.text, "text")?;
-    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    if matches!(task.status, TaskStatus::Done | TaskStatus::Split | TaskStatus::WaitingAnswer) {
-        return Err(conflict("task cannot take instructions in its current status"));
-    }
-    abort_run(&s.runs, id);
-    s.db.add_event(Some(id), "owner", "instruction", &serde_json::json!({"text": b.text}))?;
-    let next = if task.role == Role::Lead { TaskStatus::New } else { TaskStatus::Open };
-    s.db.set_task_status(id, next)?;
-    reopen_stuck_parent(&s.db, &task)?;
-    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    Ok(Json(task))
-}
-
-/// A stuck parent goes back to split so its other subtasks can run again.
-fn reopen_stuck_parent(db: &Db, task: &Task) -> ApiResult<()> {
-    let Some(pid) = task.parent_id else { return Ok(()) };
-    let parent = db.get_task(pid)?;
-    if parent.is_some_and(|p| p.status == TaskStatus::Stuck) {
-        db.set_task_status(pid, TaskStatus::Split)?;
-    }
-    Ok(())
+    Ok(Json(crate::control::instruct(&s.db, &s.runs, id, &b.text, "owner")?))
 }
 
 /// Aborts the running turn (if any) and marks the task stuck.
 async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Task>> {
-    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    if matches!(task.status, TaskStatus::Done | TaskStatus::Split) {
-        return Err(conflict("task is already done or split"));
-    }
-    abort_run(&s.runs, id);
-    s.db.set_task_status(id, TaskStatus::Stuck)?;
-    s.db.add_event(Some(id), "owner", "stopped", &serde_json::json!({"by": "owner"}))?;
-    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    Ok(Json(task))
+    Ok(Json(crate::control::stop_one(&s.db, &s.runs, id, "owner", None)?))
 }
 
 /// Files changed by a task: committed diff when done, else the live worktree diff.
@@ -523,6 +529,21 @@ mod tests {
         assert_eq!(v[0]["name"], "demo");
         assert_eq!(v[0]["bash"], json!(["a *"]));
         assert_eq!(v[0]["body"], "Body");
+    }
+
+    #[tokio::test]
+    async fn roles_lists_data_dir_roles_without_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let role_dir = dir.path().join("roles/backend");
+        std::fs::create_dir_all(&role_dir).unwrap();
+        let text = "---\nname: backend\ncode: BE\ntitle: Backend Engineer\ndescription: Builds APIs\ntools: [\"Read\"]\nskills: [\"fastapi\"]\nmax_loops: 6\n---\nYou build APIs.\n";
+        std::fs::write(role_dir.join("AGENT.md"), text).unwrap();
+        let (app, _tid) = setup_with_dir(dir.path());
+        let (code, v) = call(&app, "GET", "/roles", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((v[0]["code"].as_str(), v[0]["title"].as_str()), (Some("BE"), Some("Backend Engineer")));
+        assert_eq!((v[0]["skills"].clone(), v[0]["max_loops"].as_i64()), (json!(["fastapi"]), Some(6)));
+        assert!(v[0].get("body").is_none());
     }
 
     #[tokio::test]
@@ -785,6 +806,30 @@ mod tests {
         assert_eq!(call(&app, "POST", &uri, Some(json!({"text": "  "}))).await.0, StatusCode::BAD_REQUEST);
         let missing = call(&app, "POST", "/tasks/999/instruct", Some(json!({"text": "x"}))).await;
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn asks_list_answer_and_chat_reply() {
+        let (app, db, mut rx) = setup();
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, ChatRole::User, "plan my exam").unwrap();
+        let a = db.create_chat_ask(chat.id, Some(msg.id), "When is it?", &["Thursday".into()]).unwrap();
+        let (st, v) = call(&app, "GET", "/asks?status=open", None).await;
+        assert_eq!((st, v[0]["text"].as_str(), v[0]["options"][0].as_str(), v[0]["chat_title"].as_str()), (StatusCode::OK, Some("When is it?"), Some("Thursday"), Some("plan my exam")));
+        assert_eq!(call(&app, "GET", "/asks?status=weird", None).await.0, StatusCode::BAD_REQUEST);
+        let uri = format!("/asks/{}/answer", a.id);
+        assert_eq!(call(&app, "POST", &uri, Some(json!({"answer": " "}))).await.0, StatusCode::BAD_REQUEST);
+        let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "Thursday"}))).await;
+        assert_eq!((st, v["status"].as_str()), (StatusCode::OK, Some("answered")));
+        let last = db.list_chat(chat.id, 5).unwrap().pop().unwrap();
+        assert_eq!((last.role, last.content.as_str()), (ChatRole::User, "Re: When is it? — Thursday"));
+        assert_eq!(rx.try_recv().unwrap(), last.id);
+        assert_eq!(call(&app, "POST", &uri, Some(json!({"answer": "x"}))).await.0, StatusCode::CONFLICT);
+        assert_eq!(call(&app, "POST", "/asks/999/answer", Some(json!({"answer": "x"}))).await.0, StatusCode::NOT_FOUND);
+        let b = db.create_chat_ask(chat.id, None, "More?", &[]).unwrap();
+        call(&app, "POST", "/chat", Some(json!({"chat_id": chat.id, "content": "just do it"}))).await;
+        assert_eq!(db.get_chat_ask(b.id).unwrap().unwrap().status, "answered");
+        assert!(call(&app, "GET", "/asks?status=open", None).await.1.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

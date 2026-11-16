@@ -202,7 +202,7 @@ pub fn answer_question(db: &Db, id: i64, answer: &str, why: Option<&str>, by: &s
 fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     let Some(task) = db.get_task(q.task_id)? else { return Ok(()) };
     if task.parent_id.is_none() {
-        return Ok(());
+        return answer_stuck_question(db, &task, q, by);
     }
     let answer = q.answer.as_deref().unwrap_or_default();
     let mut text = format!("Answer to your question \"{}\": {answer}", q.text);
@@ -214,6 +214,29 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
         db.set_task_status(task.id, TaskStatus::Open)?;
     }
     Ok(())
+}
+
+/// The owner's reply to a "stopped" question on a top-level task: cancel leaves it stuck,
+/// retry reopens the stuck subtasks, anything else goes to the Lead as an instruction.
+fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result<()> {
+    if task.status != TaskStatus::Stuck || !q.text.contains(STOPPED_MARK) {
+        return Ok(());
+    }
+    let answer = q.answer.as_deref().unwrap_or_default().trim();
+    let word = answer.to_lowercase();
+    if word.starts_with("cancel") {
+        db.add_event(Some(task.id), by, "cancelled", &json!({"question_id": q.id}))?;
+        return Ok(());
+    }
+    if word.starts_with("retry") {
+        for sub in db.subtasks(task.id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
+            db.set_task_status(sub.id, TaskStatus::Open)?;
+        }
+        let has_subs = !db.subtasks(task.id)?.is_empty();
+        return db.set_task_status(task.id, if has_subs { TaskStatus::Split } else { TaskStatus::New });
+    }
+    db.add_event(Some(task.id), by, "instruction", &json!({"text": answer}))?;
+    db.set_task_status(task.id, TaskStatus::New)
 }
 
 /// Passes an open question up one level: lead to rui, rui to owner.
@@ -283,6 +306,11 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps,
                 report_error(db, Some(task_id), &e);
             } else if status == TaskStatus::Done {
                 launch_apps(db, apps, task_id);
+            } else if status == TaskStatus::Stuck {
+                let reason = stuck_reason(db, task_id).ok().flatten();
+                if let Some(r) = reason {
+                    let _ = raise_stuck_question(db, task_id, &r);
+                }
             }
         }
         Action::StartLead { task_id, answers } => {
@@ -339,11 +367,51 @@ async fn launch_and_report(db: &Db, apps: &Apps, task: &Task) -> Result<()> {
     let repo = expand_home(&client.repo_path);
     let infos = apps::start_project(apps, &client.name, &repo).await;
     db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
-    let chat_id = task.source_ref.as_deref().and_then(|r| r.strip_prefix("chat:")).and_then(|id| id.parse::<i64>().ok());
-    let Some(chat_id) = chat_id else { return Ok(()) };
-    let text = done_message(&task.title, &client.repo_path, &infos);
-    db.add_chat_message(chat_id, ChatRole::Rui, &text)?;
+    post_done_notice(db, task, &client.repo_path, &infos)
+}
+
+/// Posts the done message into the chat of the message the task came from (`chat:<message id>`).
+fn post_done_notice(db: &Db, task: &Task, repo: &str, infos: &[AppInfo]) -> Result<()> {
+    let Some(source) = task.source_ref.as_deref() else { return Ok(()) };
+    let Some(chat_id) = db.chat_id_for_source_ref(source)? else { return Ok(()) };
+    db.add_chat_message(chat_id, ChatRole::Rui, &done_message(&task.title, repo, infos))?;
     Ok(())
+}
+
+const STOPPED_MARK: &str = " stopped: ";
+
+/// For a top-level task that got stuck by an error, asks the owner (shows in the Inbox) what to do.
+/// Does nothing for subtasks, owner stops, or when such a question is already open.
+fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
+    let Some(task) = db.get_task(task_id)? else { return Ok(()) };
+    if task.parent_id.is_some() {
+        return Ok(());
+    }
+    let open = db.questions_for_task(task_id)?;
+    if open.iter().any(|q| q.status == QuestionStatus::Open && q.text.contains(STOPPED_MARK)) {
+        return Ok(());
+    }
+    let reason: String = reason.lines().next().unwrap_or_default().chars().take(200).collect();
+    let text = format!("{}{STOPPED_MARK}{reason}. Retry, give instructions, or cancel?", task.title);
+    let ladder = [Rung { who: "Scheduler".into(), why: reason }];
+    let q = db.create_ladder_question(task_id, Role::Lead, "owner", &ladder, &text)?;
+    db.add_event(Some(task_id), "scheduler", "question_raised", &json!({"question_id": q.id, "level": "owner"}))?;
+    Ok(())
+}
+
+/// Why a stuck parent's subtasks stopped, when it was an error or a land conflict (not a stop or loop limit).
+fn stuck_reason(db: &Db, parent_id: i64) -> Result<Option<String>> {
+    for sub in db.subtasks(parent_id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
+        let events = db.list_events(Some(sub.id), 30)?;
+        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped"].contains(&e.kind.as_str()));
+        let Some(e) = last else { continue };
+        match e.kind.as_str() {
+            "land_failed" => return Ok(Some(format!("{} could not be merged (conflict in {})", sub.title, e.payload["files"]))),
+            "stopped" => {}
+            _ => return Ok(Some(format!("{}: {}", sub.title, e.payload["error"].as_str().unwrap_or("error")))),
+        }
+    }
+    Ok(None)
 }
 
 /// The chat message announcing a finished task and its apps.
@@ -400,6 +468,7 @@ fn spawn_turn<F, Fut>(
         if let Err(e) = turn(db.clone(), cfg, live).await {
             report_error(&db, Some(task_id), &e);
             let _ = db.set_task_status(task_id, TaskStatus::Stuck);
+            let _ = raise_stuck_question(&db, task_id, &format!("{e:#}"));
         }
     });
     // Inserted while the lock is held, so the guard cannot remove it first.
@@ -457,6 +526,20 @@ fn lead_prompt(task: &Task, client: &Client, answers: &[(String, String)]) -> St
     format!("The owner answered:\n\n{}\n\nContinue: split the task.", pairs.join("\n\n"))
 }
 
+/// When the owner redirected a task that already has subtasks, lists them so the Lead can adjust them.
+fn subtasks_note(db: &Db, task: &Task, instructions: &str) -> Result<String> {
+    let subs = db.subtasks(task.id)?;
+    if instructions.is_empty() || subs.is_empty() {
+        return Ok(String::new());
+    }
+    let lines: Vec<String> = subs
+        .iter()
+        .map(|s| format!("- #{} {} [{}] ({})", s.id, s.title, s.status.as_str(), s.agent.as_deref().unwrap_or("any")))
+        .collect();
+    let rule = "Re-plan: adjust or add subtasks (set_done_command, set_loops, create_subtask) to match the new instructions, then call mark_split again. Do not duplicate finished work.";
+    Ok(format!("\n\nExisting subtasks:\n{}\n\n{rule}", lines.join("\n")))
+}
+
 /// Text block listing owner instructions, or an empty string when there are none.
 fn instructions_block(items: &[(i64, String)]) -> String {
     if items.is_empty() {
@@ -492,12 +575,31 @@ fn lead_tools(role: Option<&roster::Role>) -> Vec<String> {
     tools
 }
 
+/// Installs the role's skills plus the client's attached ones in `wt`, logs one `skill_used` event
+/// per installed skill, and returns the installed names.
+fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, client: &str, role_skills: &[String]) -> Result<Vec<String>> {
+    let mut names = role_skills.to_vec();
+    names.extend(skills::client_skills(&cfg.data_dir, client));
+    let names = skills::installable(&cfg.data_dir, &names);
+    let mut unique: Vec<String> = Vec::new();
+    for n in names {
+        if !unique.contains(&n) {
+            unique.push(n);
+        }
+    }
+    skills::install_skills(wt, &cfg.data_dir, &unique)?;
+    for n in &unique {
+        db.add_event(Some(task.id), agent, "skill_used", &json!({"skill": n}))?;
+    }
+    Ok(unique)
+}
+
 /// Builds the Lead's run for `task` (a parent task) in the client's repo, with the role's skills installed.
 fn lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, prompt: String) -> Result<AgentRun> {
     let role = roster::load(&cfg.data_dir, "lead");
     let repo = expand_home(&client.repo_path);
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    skills::install_skills(&repo, &cfg.data_dir, &names)?;
+    install_logged(db, cfg, &repo, task, "lead", &client.name, &names)?;
     Ok(AgentRun {
         role: Role::Lead,
         task_id: Some(task.id),
@@ -518,7 +620,7 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = client_for(db, &task)?;
     let block = take_instructions(db, task_id)?;
-    let prompt = format!("{block}{}", lead_prompt(&task, &client, &answers));
+    let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = lead_run(db, cfg, &task, &client, prompt)?;
     match run_logged(db, live, "lead", task_id, &run).await {
         Ok(out) => {
@@ -534,7 +636,8 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
 
 fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
     db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
-    db.set_task_status(task_id, TaskStatus::Stuck)
+    db.set_task_status(task_id, TaskStatus::Stuck)?;
+    raise_stuck_question(db, task_id, &format!("{e:#}"))
 }
 
 /// The prompt a Lead or Rui gets to decide one escalated question.
@@ -641,7 +744,8 @@ fn member_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str,
         db.add_event(Some(task.id), "scheduler", "role_missing", &payload)?;
     }
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    skills::install_skills(wt, &cfg.data_dir, &names)?;
+    let agent = task.agent.as_deref().unwrap_or("builder");
+    let names = install_logged(db, cfg, wt, task, agent, &client.name, &names)?;
     let loaded: Vec<Skill> = names.iter().filter_map(|n| skills::load(&cfg.data_dir, n)).collect();
     let tools = member_tools(role.as_ref(), &loaded, client, done);
     Ok((role_prompt(role.as_ref(), BUILDER_PROMPT), tools))
@@ -807,7 +911,8 @@ fn evaluator_tools(role: Option<&roster::Role>) -> Vec<String> {
 async fn evaluator_review(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done: &str) -> Result<String> {
     let role = roster::load(&cfg.data_dir, "evaluator");
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    skills::install_skills(wt, &cfg.data_dir, &names)?;
+    let client = client_for(db, task)?;
+    install_logged(db, cfg, wt, task, "evaluator", &client.name, &names)?;
     let run = AgentRun {
         role: Role::Builder,
         task_id: Some(task.id),
@@ -1263,5 +1368,98 @@ mod tests {
     fn skill_tools_wrap_patterns() {
         let s = skills::parse("---\nname: x\ndescription: d\nbash: [\"uv *\", \"curl *\"]\n---\nb\n").unwrap();
         assert_eq!(skill_tools(&s), ["Bash(uv *)", "Bash(curl *)"]);
+    }
+
+    fn chat_task(db: &Db, source_ref: Option<String>) -> Task {
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        db.create_task(&NewTask {
+            client_id: c.id,
+            parent_id: None,
+            title: "Guide".into(),
+            body: String::new(),
+            status: TaskStatus::Done,
+            done_command: None,
+            max_loops: 5,
+            role: Role::Lead,
+            source_kind: SourceKind::Chat,
+            source_ref,
+            agent: Some("lead".into()),
+            pod: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn done_notice_goes_to_the_chat_of_the_source_message() {
+        let db = Db::open_test();
+        let _first = db.create_chat().unwrap();
+        let chat = db.create_chat().unwrap();
+        for _ in 0..40 {
+            db.add_chat_message(_first.id, ChatRole::User, "pad").unwrap();
+        }
+        let msg = db.add_chat_message(chat.id, ChatRole::User, "make it").unwrap();
+        assert!(msg.id > chat.id, "message id differs from chat id");
+        let task = chat_task(&db, Some(format!("chat:{}", msg.id)));
+        post_done_notice(&db, &task, "/tmp/c", &[]).unwrap();
+        let last = db.list_chat(chat.id, 10).unwrap().pop().unwrap();
+        assert_eq!(last.role, ChatRole::Rui);
+        assert!(last.content.contains("Guide"));
+        let nothing = chat_task_ref_missing(&db);
+        post_done_notice(&db, &nothing, "/tmp/c", &[]).unwrap();
+    }
+
+    fn chat_task_ref_missing(db: &Db) -> Task {
+        let mut t = db.list_tasks().unwrap().pop().unwrap();
+        t.source_ref = Some("chat:99999".into());
+        t
+    }
+
+    #[test]
+    fn stuck_top_level_task_asks_the_owner_once() {
+        let db = Db::open_test();
+        let t = chat_task(&db, None);
+        db.set_task_status(t.id, TaskStatus::Stuck).unwrap();
+        raise_stuck_question(&db, t.id, "claude failed\nstack").unwrap();
+        raise_stuck_question(&db, t.id, "again").unwrap();
+        let qs = db.questions_for_task(t.id).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].level, "owner");
+        assert_eq!(qs[0].text, "Guide stopped: claude failed. Retry, give instructions, or cancel?");
+        let sub = mk(&db, t.client_id, Some(t.id), TaskStatus::Stuck);
+        raise_stuck_question(&db, sub.id, "x").unwrap();
+        assert!(db.questions_for_task(sub.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stuck_reason_ignores_owner_stops_and_reports_conflicts() {
+        let db = Db::open_test();
+        let t = chat_task(&db, None);
+        db.set_task_status(t.id, TaskStatus::Split).unwrap();
+        let sub = mk(&db, t.client_id, Some(t.id), TaskStatus::Stuck);
+        assert_eq!(stuck_reason(&db, t.id).unwrap(), None);
+        db.add_event(Some(sub.id), "owner", "stopped", &json!({})).unwrap();
+        assert_eq!(stuck_reason(&db, t.id).unwrap(), None);
+        db.add_event(Some(sub.id), "scheduler", "land_failed", &json!({"files": ["a.rs"]})).unwrap();
+        assert!(stuck_reason(&db, t.id).unwrap().unwrap().contains("conflict"));
+    }
+
+    #[test]
+    fn owner_answer_to_a_stuck_question_retries_or_redirects() {
+        let db = Db::open_test();
+        let t = chat_task(&db, None);
+        db.set_task_status(t.id, TaskStatus::Stuck).unwrap();
+        let sub = mk(&db, t.client_id, Some(t.id), TaskStatus::Stuck);
+        raise_stuck_question(&db, t.id, "boom").unwrap();
+        let q = db.questions_for_task(t.id).unwrap().pop().unwrap();
+        answer_question(&db, q.id, "Retry", None, "owner").unwrap();
+        let status = |id| db.get_task(id).unwrap().unwrap().status;
+        assert_eq!((status(t.id), status(sub.id)), (TaskStatus::Split, TaskStatus::Open));
+        db.set_task_status(t.id, TaskStatus::Stuck).unwrap();
+        db.set_task_status(sub.id, TaskStatus::Stuck).unwrap();
+        raise_stuck_question(&db, t.id, "boom").unwrap();
+        let q = db.questions_for_task(t.id).unwrap().pop().unwrap();
+        answer_question(&db, q.id, "only the API part", None, "owner").unwrap();
+        assert_eq!(status(t.id), TaskStatus::New);
+        assert_eq!(db.pending_instructions(t.id).unwrap()[0].1, "only the API part");
     }
 }

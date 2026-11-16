@@ -16,6 +16,9 @@ pub struct Skill {
     /// Bash patterns the member may run, e.g. `uv *`.
     pub bash: Vec<String>,
     pub run_hint: Option<String>,
+    pub license: Option<String>,
+    /// `source` inside `metadata: {...}`, usually a URL.
+    pub source: Option<String>,
     pub body: String,
 }
 
@@ -30,6 +33,17 @@ pub(crate) fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
 pub(crate) fn field<'a>(front: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}:");
     front.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::trim)
+}
+
+/// The `source` value inside a one-line `metadata: {source: "...", ...}`.
+fn metadata_source(front: &str) -> Option<String> {
+    let meta = field(front, "metadata")?;
+    let rest = meta[meta.find("source:")? + "source:".len()..].trim_start();
+    let value = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split([',', '}']).next()?.trim(),
+    };
+    Some(value.to_string()).filter(|v| !v.is_empty())
 }
 
 /// Parses SKILL.md text.
@@ -49,6 +63,8 @@ pub fn parse(text: &str) -> Result<Skill> {
         description: description.into(),
         bash,
         run_hint: field(front, "run_hint").filter(|v| !v.is_empty()).map(String::from),
+        license: field(front, "license").filter(|v| !v.is_empty()).map(String::from),
+        source: metadata_source(front),
         body: body.trim_end().into(),
     })
 }
@@ -122,16 +138,31 @@ fn exclude_installed_skills(wt: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The named skills that exist and are switched on.
+pub fn installable(data_dir: &Path, names: &[String]) -> Vec<String> {
+    let on = |n: &&String| crate::library::is_on(data_dir, crate::library::Kind::Skill, n);
+    names.iter().filter(on).cloned().collect()
+}
+
+/// Names of switched-on skills attached to the client by name.
+pub fn client_skills(data_dir: &Path, client: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(skills_dir(data_dir)) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| crate::library::read_meta(&e.path()).attach.clients.iter().any(|c| c == client))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    installable(data_dir, &names)
+}
+
 /// Copies the named skills into `<wt>/.claude/skills/`, replacing what is there, and keeps them out of git.
-/// Skills missing from the data dir are skipped.
+/// Skills that are missing or switched off are skipped.
 pub fn install_skills(wt: &Path, data_dir: &Path, names: &[String]) -> Result<()> {
     let target = wt.join(".claude/skills");
-    for name in names {
-        let src = skills_dir(data_dir).join(name);
-        if !src.is_dir() {
-            continue;
-        }
-        let dst = target.join(name);
+    for name in installable(data_dir, names) {
+        let src = skills_dir(data_dir).join(&name);
+        let dst = target.join(&name);
         if dst.exists() {
             std::fs::remove_dir_all(&dst)?;
         }
@@ -194,6 +225,18 @@ mod tests {
         assert!(s.bash.is_empty());
     }
 
+    #[test]
+    fn parses_license_and_metadata_source() {
+        let text = "---\nname: z\ndescription: d\nlicense: Apache-2.0\nmetadata: {source: \"https://github.com/a/b/blob/main/x.md\", adapted: true}\n---\nBody\n";
+        let s = parse(text).unwrap();
+        assert_eq!(s.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(s.source.as_deref(), Some("https://github.com/a/b/blob/main/x.md"));
+        let bare = parse("---\nname: z\ndescription: d\nmetadata: {source: Proprietary-RUI, adapted: false}\n---\nB\n").unwrap();
+        assert_eq!(bare.source.as_deref(), Some("Proprietary-RUI"));
+        let none = parse("---\nname: z\ndescription: d\n---\nB\n").unwrap();
+        assert_eq!((none.license, none.source), (None, None));
+    }
+
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
@@ -228,6 +271,24 @@ mod tests {
         let ok = std::process::Command::new("git").arg("init").arg(d.path()).output().unwrap().status.success();
         assert!(ok);
         d
+    }
+
+    #[test]
+    fn off_skills_are_not_installed_and_client_skills_are() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), git_repo());
+        write(&data.path().join("skills/on1/SKILL.md"), "x");
+        write(&data.path().join("skills/off1/SKILL.md"), "x");
+        write(&data.path().join("skills/off1/.rui.json"), "{\"status\":\"off\"}");
+        write(&data.path().join("skills/cl/SKILL.md"), "x");
+        write(&data.path().join("skills/cl/.rui.json"), "{\"attach\":{\"clients\":[\"acme\"]}}");
+        write(&data.path().join("skills/cloff/SKILL.md"), "x");
+        write(&data.path().join("skills/cloff/.rui.json"), "{\"status\":\"off\",\"attach\":{\"clients\":[\"acme\"]}}");
+        assert_eq!(client_skills(data.path(), "acme"), ["cl"]);
+        assert!(client_skills(data.path(), "other").is_empty());
+        let names = vec!["on1".to_string(), "off1".to_string()];
+        install_skills(repo.path(), data.path(), &names).unwrap();
+        assert!(repo.path().join(".claude/skills/on1/SKILL.md").exists());
+        assert!(!repo.path().join(".claude/skills/off1").exists());
     }
 
     #[test]

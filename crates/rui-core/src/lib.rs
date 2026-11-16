@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
@@ -104,6 +104,20 @@ fn owner_level() -> String {
 pub struct Rung {
     pub who: String,
     pub why: String,
+}
+
+/// A question Rui asked the owner from a chat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatAsk {
+    pub id: i64,
+    pub chat_id: i64,
+    pub chat_title: String,
+    pub text: String,
+    pub options: Vec<String>,
+    pub answer: Option<String>,
+    /// "open" or "answered".
+    pub status: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

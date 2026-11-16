@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__staff_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__staff_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
 
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
@@ -71,4 +71,19 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
     let reply = out.result_text.unwrap_or_default();
     db.add_chat_message(chat_id, ChatRole::Rui, &reply)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_and_tools_cover_stop_and_instruct() {
+        for t in ["stop_task", "instruct_task", "ask_owner"] {
+            assert!(RUI_PROMPT.contains(t), "{t} missing from rui.md");
+            assert!(RUI_TOOLS.contains(&format!("mcp__rui__{t}")), "{t} missing from RUI_TOOLS");
+        }
+        assert!(RUI_PROMPT.contains("duplicate"));
+        assert!(RUI_PROMPT.contains("STOP"));
+    }
 }
