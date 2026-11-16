@@ -3,12 +3,14 @@
 use crate::api::{self, AppInfo, Change, LiveSnapshot, RoleInfo, SkillInfo};
 use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity};
-use rui_core::{Chat, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
+use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, QuestionStatus, SeatInfo, Task, TaskRun};
 use std::collections::HashMap;
 use std::time::Duration;
 
 const MAX_EVENTS: usize = 300;
 const FIRST_EVENT_LIMIT: usize = 200;
+/// Answered asks kept for the chat page.
+const MAX_ANSWERED_ASKS: usize = 50;
 
 /// Chat list, the chat asked for, the chat resolved as current, and its messages.
 type ChatData = (Vec<Chat>, Option<i64>, Option<i64>, Vec<ChatMessage>);
@@ -45,6 +47,10 @@ pub struct Store {
     pub file_view: Option<(i64, String, Result<String, String>)>,
     /// What running tasks and chats are doing right now; refreshed every 300ms.
     pub live: LiveSnapshot,
+    /// Asks Rui has open, oldest first; refreshed every poll.
+    pub asks: Vec<ChatAsk>,
+    /// Newest answered asks, oldest first; the chat shows them as done.
+    pub answered_asks: Vec<ChatAsk>,
     /// Apps started for projects; refreshed every poll.
     pub apps: Vec<AppInfo>,
     /// Skills from the daemon; loaded at start and on refresh.
@@ -65,6 +71,8 @@ struct Extras {
     runs: Option<Vec<TaskRun>>,
     events: Option<Vec<Event>>,
     apps: Option<Vec<AppInfo>>,
+    asks: Option<Vec<ChatAsk>>,
+    answered: Option<Vec<ChatAsk>>,
 }
 
 fn fetch_extras(after_id: Option<i64>) -> Extras {
@@ -74,6 +82,8 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
         runs: api::get_task_runs().ok(),
         events: api::get_events_after(after_id, limit).ok(),
         apps: api::get_apps().ok(),
+        asks: api::get_asks_open().ok(),
+        answered: api::get_asks_answered().ok(),
     }
 }
 
@@ -149,6 +159,8 @@ impl Store {
             task_events: HashMap::new(),
             file_view: None,
             live: LiveSnapshot::default(),
+            asks: vec![],
+            answered_asks: vec![],
             apps: vec![],
             skills: vec![],
             roles: vec![],
@@ -208,6 +220,13 @@ impl Store {
     fn apply_extras(&mut self, extras: Extras) {
         if let Some(apps) = extras.apps {
             self.apps = apps;
+        }
+        if let Some(asks) = extras.asks {
+            self.asks = asks;
+        }
+        if let Some(done) = extras.answered {
+            let skip = done.len().saturating_sub(MAX_ANSWERED_ASKS);
+            self.answered_asks = done.into_iter().skip(skip).collect();
         }
         if extras.seat.is_some() {
             self.seat = extras.seat;
@@ -427,6 +446,30 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Answer one of Rui's asks, then refresh. A failure lands in `action_error`.
+    pub fn answer_ask(&mut self, ask_id: i64, text: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { api::post_ask_answer(ask_id, &text) }).await;
+            this.update(cx, |s, cx| {
+                s.action_error = res.as_ref().err().map(|e| format!("Request failed: {e}"));
+                if res.is_ok() {
+                    s.show_toast("Answered Rui", vec!["It can act now".into()], cx);
+                }
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// What waits on the owner: open owner questions plus open asks from Rui.
+pub fn inbox_count(questions: &[Question], asks: &[ChatAsk]) -> usize {
+    let owner = questions.iter().filter(|q| q.status == QuestionStatus::Open).count();
+    owner + asks.iter().filter(|a| a.status == "open").count()
+}
+
 /// Who picks an answer up: the member that first passed the question up.
 pub fn pickup_who(q: &Question) -> String {
     match q.ladder.first() {
@@ -453,6 +496,20 @@ mod tests {
         serde_json::from_value(serde_json::json!({"id":1,"task_id":2,"asked_by":"builder","text":"q",
             "answer":null,"status":"open","created_at":"a","ladder":ladder}))
         .unwrap()
+    }
+
+    fn ask(id: i64, status: &str) -> ChatAsk {
+        ChatAsk { id, chat_id: 1, chat_title: "t".into(), text: "q".into(), options: vec![], answer: None, status: status.into(), created_at: "a".into() }
+    }
+
+    #[test]
+    fn inbox_count_adds_open_asks_to_open_questions() {
+        let mut answered = question(serde_json::json!([]));
+        answered.status = QuestionStatus::Answered;
+        let questions = vec![question(serde_json::json!([])), answered];
+        let asks = vec![ask(1, "open"), ask(2, "answered"), ask(3, "open")];
+        assert_eq!(inbox_count(&questions, &asks), 3);
+        assert_eq!(inbox_count(&[], &[]), 0);
     }
 
     #[test]

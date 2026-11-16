@@ -15,25 +15,25 @@ use gpui::{
 };
 use gpui::AnimationExt;
 use views::motion::{self, spring};
-use rui_core::QuestionStatus;
-use store::Store;
+use store::{Store, inbox_count};
 use theme::{Theme, theme};
 use views::{
     activity::ThreadsView,
+    agents::AgentsView,
     apps::AppsView,
     board::BoardView,
     chat::ChatView,
     questions::QuestionsView,
     seat::{SeatView, seat_label},
+    library::Tooltip,
     skills::SkillsView,
-    team::TeamView,
 };
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
     Rui,
     Threads,
-    Team,
+    Agents,
     Apps,
     Inbox,
     Work,
@@ -43,7 +43,7 @@ enum Nav {
 
 impl Nav {
     const ALL: [Nav; 8] =
-        [Nav::Rui, Nav::Threads, Nav::Team, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
+        [Nav::Rui, Nav::Threads, Nav::Agents, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
 
     fn index(self) -> usize {
         Nav::ALL.iter().position(|n| *n == self).unwrap_or(0)
@@ -53,7 +53,7 @@ impl Nav {
         match self {
             Nav::Rui => "Rui",
             Nav::Threads => "Threads",
-            Nav::Team => "Team",
+            Nav::Agents => "Agents",
             Nav::Apps => "Apps",
             Nav::Inbox => "Inbox",
             Nav::Work => "Work",
@@ -66,29 +66,13 @@ impl Nav {
         match self {
             Nav::Rui => "icons/rui.svg",
             Nav::Threads => "icons/threads.svg",
-            Nav::Team => "icons/team.svg",
+            Nav::Agents => "icons/team.svg",
             Nav::Apps => "icons/apps.svg",
             Nav::Inbox => "icons/inbox.svg",
             Nav::Work => "icons/work.svg",
             Nav::Skills => "icons/skills.svg",
             Nav::Seats => "icons/seats.svg",
         }
-    }
-}
-
-struct Tooltip(SharedString);
-
-impl Render for Tooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = theme(cx);
-        div()
-            .px(px(10.))
-            .py(px(6.))
-            .rounded(px(8.))
-            .bg(th.ctl)
-            .text_size(px(12.))
-            .text_color(th.fg)
-            .child(self.0.clone())
     }
 }
 
@@ -108,7 +92,7 @@ struct Root {
     board: Entity<BoardView>,
     questions: Entity<QuestionsView>,
     activity: Entity<ThreadsView>,
-    team: Entity<TeamView>,
+    agents: Entity<AgentsView>,
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
@@ -138,7 +122,7 @@ impl Root {
             board: cx.new(|cx| BoardView::new(store.clone(), cx)),
             questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
             activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
-            team: cx.new(|cx| TeamView::new(store.clone(), cx)),
+            agents: cx.new(|cx| AgentsView::new(store.clone(), cx)),
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
@@ -150,7 +134,7 @@ impl Root {
         let page = match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
             Nav::Threads => self.activity.clone().into_any_element(),
-            Nav::Team => self.team.clone().into_any_element(),
+            Nav::Agents => self.agents.clone().into_any_element(),
             Nav::Apps => self.apps.clone().into_any_element(),
             Nav::Inbox => self.questions.clone().into_any_element(),
             Nav::Work => self.board.clone().into_any_element(),
@@ -204,8 +188,8 @@ impl Root {
     }
 
     fn open_questions(&self, cx: &Context<Self>) -> usize {
-        let qs = &self.store.read(cx).questions;
-        qs.iter().filter(|q| q.status == QuestionStatus::Open).count()
+        let s = self.store.read(cx);
+        inbox_count(&s.questions, &s.asks)
     }
 
     fn badge(&self, th: &Theme, count: usize) -> impl IntoElement + use<> {

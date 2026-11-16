@@ -1,6 +1,7 @@
 //! Chats page: the list of chats beside the selected chat.
 
 use super::live::live_action;
+use super::asks::{AskInputs, ask_card};
 use super::{chip, markdown, page_head, primary_button, question_card};
 use crate::api::LiveState;
 use crate::store::{self, Store};
@@ -13,7 +14,7 @@ use super::activity::{icon, parse_secs, summarize};
 use super::roster::role_title;
 use crate::api::RoleInfo;
 use serde_json::Value;
-use rui_core::{Chat, ChatMessage, ChatRole, Event, Question};
+use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question};
 use std::collections::HashMap;
 
 /// Chat list, messages of the selected chat, open questions and a composer.
@@ -21,6 +22,7 @@ pub struct ChatView {
     store: Entity<Store>,
     input: Entity<TextInput>,
     answers: HashMap<i64, Entity<TextInput>>,
+    ask_inputs: AskInputs,
     scroll: ScrollHandle,
     last_len: usize,
     last_chat: Option<i64>,
@@ -32,7 +34,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, answers: HashMap::new(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None }
+        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None }
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -67,6 +69,12 @@ impl ChatView {
         self.store.update(cx, |s, cx| s.answer(id, text, None, cx));
     }
 
+    /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
+    fn answer_ask(&mut self, id: i64, text: Option<String>, cx: &mut Context<Self>) {
+        let Some(text) = text.or_else(|| self.ask_inputs.take(id, cx)) else { return };
+        self.store.update(cx, |s, cx| s.answer_ask(id, text, cx));
+    }
+
     fn question(&self, q: &Question, cx: &mut Context<Self>) -> AnyElement {
         let id = q.id;
         let input = match self.answers.get(&id) {
@@ -82,6 +90,7 @@ impl ChatView {
         &mut self,
         chat: &[ChatMessage],
         questions: &[Question],
+        asks: &[ChatAsk],
         cards: &HashMap<i64, Vec<ActCard>>,
         live: Option<Vec<String>>,
         state: Option<&LiveState>,
@@ -89,6 +98,7 @@ impl ChatView {
     ) -> AnyElement {
         let th = theme(cx).clone();
         let open: Vec<AnyElement> = questions.iter().map(|q| self.question(q, cx)).collect();
+        let ask_cards: Vec<AnyElement> = asks.iter().map(|a| ask_card(a, &self.ask_inputs, Self::answer_ask, cx)).collect();
         let steps = live.or_else(|| state.map(|_| vec![]));
         let working = steps.map(|steps| working_bubble(&steps, state, &th));
         let mut list = div()
@@ -103,6 +113,7 @@ impl ChatView {
             .flex_col()
             .gap(px(20.))
             .children(chat.iter().map(|m| self.message_with_cards(m, cards, &th, cx)))
+            .children(ask_cards)
             .children(working)
             .children(open);
         if chat.is_empty() && questions.is_empty() {
@@ -315,6 +326,13 @@ fn working_bubble(steps: &[String], state: Option<&LiveState>, th: &Theme) -> An
     div().flex().flex_col().gap(px(7.)).child(meta).child(div().flex().child(bubble)).into_any_element()
 }
 
+/// Asks of one chat, answered ones first, oldest first.
+fn asks_of(chat: Option<i64>, open: &[ChatAsk], answered: &[ChatAsk]) -> Vec<ChatAsk> {
+    let mut asks: Vec<ChatAsk> = answered.iter().chain(open).filter(|a| Some(a.chat_id) == chat).cloned().collect();
+    asks.sort_by_key(|a| a.id);
+    asks
+}
+
 /// "HH:MM" from "YYYY-MM-DD HH:MM:SS"; empty when too short.
 pub(super) fn hhmm(created_at: &str) -> String {
     created_at.get(11..16).unwrap_or("").to_string()
@@ -455,25 +473,28 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (chat, chats, current, questions, live, state, cards) = {
+        let (chat, chats, current, questions, live, state, cards, asks) = {
             let s = self.store.read(cx);
             let live = s.current_chat.and_then(|id| live_steps(&s.chat, &s.events, id));
             let state = s.current_chat.and_then(|id| s.live.chat(id)).cloned();
             let cards = s.current_chat.map(|id| all_cards(&s.chat, &s.events, id, &s.roles)).unwrap_or_default();
-            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards)
+            let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
+            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks)
         };
         self.sync_inputs(&questions, cx);
+        let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
+        self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
         if current != self.last_chat {
             self.last_chat = current;
             self.last_len = 0;
         }
         let text_len = state.as_ref().map_or(0, |l| l.text.len() + 1);
-        let len = chat.len() * (1 << 20) + live.as_ref().map_or(0, |l| l.len() + 1) + text_len;
+        let len = chat.len() * (1 << 20) + open_asks.len() * (1 << 10) + live.as_ref().map_or(0, |l| l.len() + 1) + text_len;
         if len != self.last_len {
             self.last_len = len;
             self.scroll.scroll_to_bottom();
         }
-        let list = self.message_list(&chat, &questions, &cards, live, state.as_ref(), cx);
+        let list = self.message_list(&chat, &questions, &asks, &cards, live, state.as_ref(), cx);
         let composer = self.composer(cx);
         let main = div()
             .id("chat-main")
@@ -530,7 +551,7 @@ mod tests {
 
     #[test]
     fn staff_card_text() {
-        let role = |n: &str, t: &str| RoleInfo { name: n.into(), code: "X".into(), title: t.into(), description: String::new(), tools: vec![], skills: vec![], max_loops: 5 };
+        let role = |n: &str, t: &str| RoleInfo { name: n.into(), code: "X".into(), title: t.into(), max_loops: 5, ..Default::default() };
         let roles = [role("backend", "Backend Engineer")];
         let input = serde_json::json!({"project":"acme","title":"Add login","brief":"b","pod":["backend","tester"]});
         let c = staff_card(&input, &roles);
@@ -551,6 +572,16 @@ mod tests {
         let to = parse_secs("2026-11-15 10:00:09").unwrap();
         assert_eq!(staff_inputs(&events, 1, from, to).len(), 1);
         assert_eq!(staff_inputs(&events, 2, from, to).len(), 0);
+    }
+
+    #[test]
+    fn asks_of_keeps_one_chat_in_order() {
+        let ask = |id: i64, chat_id: i64, status: &str| ChatAsk {
+            id, chat_id, chat_title: "t".into(), text: "q".into(), options: vec![], answer: None, status: status.into(), created_at: "a".into(),
+        };
+        let got = asks_of(Some(1), &[ask(5, 1, "open"), ask(6, 2, "open")], &[ask(2, 1, "answered")]);
+        assert_eq!(got.iter().map(|a| a.id).collect::<Vec<_>>(), [2, 5]);
+        assert!(asks_of(None, &[ask(5, 1, "open")], &[]).is_empty());
     }
 
     #[test]

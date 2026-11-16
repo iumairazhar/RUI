@@ -1,12 +1,13 @@
 //! Inbox: owner-level questions, each with its escalation ladder, a reason field and an answer field.
 
 use super::activity::{LEAVE_MS, leave};
+use super::asks::{AskInputs, ask_card};
 use super::{card, chip, page_head, question_card};
-use crate::store::{self, Store, pickup_who};
+use crate::store::{self, Store, inbox_count, pickup_who};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, App, Context, Div, Entity, FontWeight, Stateful, Window, div, prelude::*, px};
-use rui_core::{Question, QuestionStatus, Rung};
+use rui_core::{ChatAsk, Question, QuestionStatus, Rung};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ pub struct QuestionsView {
     store: Entity<Store>,
     inputs: HashMap<i64, Entity<TextInput>>,
     whys: HashMap<i64, Entity<TextInput>>,
+    ask_inputs: AskInputs,
     /// Open questions at the last render, to spot ones that were answered.
     prev: HashMap<i64, Question>,
     /// Answered questions still sliding out, and when they started.
@@ -86,7 +88,7 @@ impl QuestionsView {
         store::observe(&store, cx);
         let (inputs, whys) = (HashMap::new(), HashMap::new());
         let (prev, leaving) = (HashMap::new(), HashMap::new());
-        Self { store, inputs, whys, prev, leaving, last_render: Instant::now() }
+        Self { store, inputs, whys, ask_inputs: AskInputs::default(), prev, leaving, last_render: Instant::now() }
     }
 
     /// Notice questions that left the open list since the last render, and drop finished ghosts.
@@ -143,6 +145,23 @@ impl QuestionsView {
         self.store.update(cx, |s, cx| s.answer(id, text, Some(reason), cx));
     }
 
+    /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
+    fn answer_ask(&mut self, id: i64, text: Option<String>, cx: &mut Context<Self>) {
+        let Some(text) = text.or_else(|| self.ask_inputs.take(id, cx)) else { return };
+        self.store.update(cx, |s, cx| s.answer_ask(id, text, cx));
+    }
+
+    /// One of Rui's asks as an Inbox item: the chat title over the ask card.
+    fn ask_item(&self, a: &ChatAsk, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
+        let title = div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(a.chat_title.clone());
+        let sub = div().text_size(px(11.)).text_color(th.muted).child("Rui asks from this chat");
+        let head = div().flex().flex_col().gap(px(2.)).child(title).child(sub);
+        let card = ask_card(a, &self.ask_inputs, Self::answer_ask, cx);
+        let body = div().flex().flex_col().gap(px(8.)).child(head).child(card);
+        body.id(("inbox-ask", a.id as usize)).into_any_element()
+    }
+
     fn open_card(&self, q: &Question, cx: &mut Context<Self>) -> AnyElement {
         let id = q.id;
         let th = theme(cx).clone();
@@ -196,8 +215,13 @@ fn answered_section(answered: &[&Question], cx: &App) -> impl IntoElement {
 
 impl Render for QuestionsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let questions = self.store.read(cx).questions.clone();
+        let (questions, asks) = {
+            let s = self.store.read(cx);
+            (s.questions.clone(), s.asks.clone())
+        };
         let th = theme(cx).clone();
+        let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
+        self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
         let open: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Open).collect();
         self.track_leaving(&open);
         self.sync_inputs(&open, cx);
@@ -207,11 +231,12 @@ impl Render for QuestionsView {
             .rev()
             .take(10)
             .collect();
+        let ask_items: Vec<_> = open_asks.iter().map(|a| self.ask_item(a, cx)).collect();
         let cards: Vec<_> = open.iter().map(|q| self.open_card(q, cx)).collect();
         let gone: Vec<_> = self.leaving.values().map(|(q, _)| q.clone()).collect();
         let ghosts = gone.iter().map(|q| leave(self.open_card(q, cx), ("inbox-out", q.id as usize)));
         let ghosts: Vec<_> = ghosts.collect();
-        let empty = open.is_empty().then(|| {
+        let empty = (open.is_empty() && open_asks.is_empty()).then(|| {
             card(cx).child(div().text_size(px(13.)).text_color(th.fg_2).child("Nothing needs you."))
         });
         let body = div()
@@ -224,12 +249,13 @@ impl Render for QuestionsView {
             .gap(px(12.))
             .pr(px(40.))
             .pb(px(28.))
+            .children(ask_items)
             .children(cards)
             .children(ghosts)
             .children(empty)
             .children((!answered.is_empty()).then(|| answered_section(&answered, cx)));
         let head = page_head("NEEDS A DECISION", "Inbox", cx);
-        div().flex().flex_col().size_full().child(head).child(lead_line(open.len(), &th)).child(body)
+        div().flex().flex_col().size_full().child(head).child(lead_line(inbox_count(&questions, &asks), &th)).child(body)
     }
 }
 

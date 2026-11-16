@@ -1,10 +1,10 @@
 //! Role titles, member numbering, pod lines and loop counts shared by Threads, Team and Skills.
 
-use crate::api::{RoleInfo, SkillInfo};
+use crate::api::RoleInfo;
 use rui_core::{Role, Task};
 
 /// "backend" becomes "Backend" when the roster has no title for it.
-fn capitalize(s: &str) -> String {
+pub fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
@@ -87,24 +87,6 @@ impl Loops {
     }
 }
 
-/// Titles of the roles whose skills include `skill`.
-pub fn used_by(roles: &[RoleInfo], skill: &str) -> Vec<String> {
-    let uses = |r: &&RoleInfo| r.skills.iter().any(|s| s == skill);
-    roles.iter().filter(uses).map(|r| r.title.clone()).collect()
-}
-
-/// "Apache-2.0 · github.com": the license plus the host of the source URL.
-pub fn source_text(skill: &SkillInfo) -> String {
-    let source = skill.source.as_deref().map(|s| s.split_whitespace().next().unwrap_or(s));
-    let host = source.map(|s| match s.split_once("://") {
-        Some((_, rest)) => rest.split('/').next().unwrap_or(rest).trim_start_matches("www."),
-        None => s,
-    });
-    let host = host.filter(|h| Some(*h) != skill.license.as_deref());
-    let parts: Vec<&str> = [skill.license.as_deref(), host].into_iter().flatten().collect();
-    if parts.is_empty() { "\u{2014}".into() } else { parts.join(" \u{b7} ") }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,9 +98,9 @@ mod tests {
             code: code.into(),
             title: title.into(),
             description: String::new(),
-            tools: vec![],
             skills: skills.iter().map(|s| s.to_string()).collect(),
             max_loops: 5,
+            ..Default::default()
         }
     }
 
@@ -178,35 +160,5 @@ mod tests {
         assert_eq!(over.dots(), vec![On, On, On, On, Over, Over]);
         assert_eq!((over.text(), over.over()), ("6/4".into(), true));
         assert!(Loops { used: 0, max: 0 }.dots().is_empty());
-    }
-
-    #[test]
-    fn used_by_lists_role_titles() {
-        let roles = [
-            role("backend", "BE", "Backend Engineer", &["fastapi", "api-design"]),
-            role("tester", "TE", "Tester", &["api-design"]),
-            role("writer", "WR", "Writer", &[]),
-        ];
-        assert_eq!(used_by(&roles, "api-design"), ["Backend Engineer", "Tester"]);
-        assert_eq!(used_by(&roles, "fastapi"), ["Backend Engineer"]);
-        assert!(used_by(&roles, "nope").is_empty());
-    }
-
-    #[test]
-    fn source_is_license_plus_host() {
-        let skill = |license: Option<&str>, source: Option<&str>| SkillInfo {
-            name: "x".into(),
-            description: "d".into(),
-            bash: vec![],
-            run_hint: None,
-            license: license.map(String::from),
-            source: source.map(String::from),
-            body: "b".into(),
-        };
-        let url = Some("https://github.com/a/b/blob/main/x.md ; https://other.dev/y");
-        assert_eq!(source_text(&skill(Some("Apache-2.0"), url)), "Apache-2.0 \u{b7} github.com");
-        assert_eq!(source_text(&skill(Some("Proprietary-RUI"), Some("Proprietary-RUI"))), "Proprietary-RUI");
-        assert_eq!(source_text(&skill(None, Some("https://www.x.io"))), "x.io");
-        assert_eq!(source_text(&skill(None, None)), "\u{2014}");
     }
 }

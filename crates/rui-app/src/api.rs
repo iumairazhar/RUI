@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
-use rui_core::{Chat, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
+use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -175,8 +175,39 @@ pub struct AppInfo {
     pub log: Vec<String>,
 }
 
-/// One skill (SKILL.md) from the daemon.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// One history line of a skill or role.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Hist {
+    pub when: String,
+    pub who: String,
+    pub what: String,
+    #[serde(default)]
+    pub why: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// An older saved version of a skill or role; `ts` is unix milliseconds, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Version {
+    pub ts: u64,
+}
+
+/// Where a skill is attached: roles by name, clients by name.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Attach {
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub clients: Vec<String>,
+}
+
+fn status_on() -> String {
+    "on".into()
+}
+
+/// One skill (SKILL.md) from the daemon. `text` and `versions` only come with `GET /skills/{name}`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
@@ -189,10 +220,26 @@ pub struct SkillInfo {
     #[serde(default)]
     pub source: Option<String>,
     pub body: String,
+    #[serde(default = "status_on")]
+    pub status: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub attach: Attach,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub hist: Vec<Hist>,
+    #[serde(default)]
+    pub used_7d: i64,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub versions: Vec<Version>,
 }
 
-/// One agent role from the roster.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// One agent role from the roster. `text` and `versions` only come with `GET /roles/{name}`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct RoleInfo {
     pub name: String,
     pub code: String,
@@ -204,6 +251,18 @@ pub struct RoleInfo {
     pub skills: Vec<String>,
     #[serde(default)]
     pub max_loops: i64,
+    #[serde(default = "status_on")]
+    pub status: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub owns_checks: bool,
+    #[serde(default)]
+    pub hist: Vec<Hist>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub versions: Vec<Version>,
 }
 
 /// Fetch all apps, sorted by project then name.
@@ -219,6 +278,49 @@ pub fn get_skills() -> Result<Vec<SkillInfo>> {
 /// Fetch all roles, sorted by name.
 pub fn get_roles() -> Result<Vec<RoleInfo>> {
     Ok(serde_json::from_value(get("/roles")?)?)
+}
+
+/// Fetch the asks Rui has open.
+pub fn get_asks_open() -> Result<Vec<ChatAsk>> {
+    Ok(serde_json::from_value(get("/asks?status=open")?)?)
+}
+
+/// Fetch the asks already answered.
+pub fn get_asks_answered() -> Result<Vec<ChatAsk>> {
+    Ok(serde_json::from_value(get("/asks?status=answered")?)?)
+}
+
+/// Answer one of Rui's asks.
+pub fn post_ask_answer(ask_id: i64, answer: &str) -> Result<()> {
+    post(&format!("/asks/{ask_id}/answer"), serde_json::json!({ "answer": answer }))
+}
+
+/// The `error` text of a daemon error body, else the status line.
+fn error_text(status: u16, body: &serde_json::Value) -> String {
+    match body["error"].as_str() {
+        Some(e) => e.to_string(),
+        None => format!("Request failed ({status})"),
+    }
+}
+
+/// A library call (skills and roles). Errors carry the daemon's `{error}` text.
+pub fn library(method: &str, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
+    let cfg = ureq::Agent::config_builder().http_status_as_error(false);
+    let agent: ureq::Agent = cfg.timeout_connect(Some(Duration::from_secs(2))).timeout_global(Some(Duration::from_secs(60))).build().into();
+    let url = format!("{}{}", base_url(), path);
+    let body = body.unwrap_or_else(|| serde_json::json!({}));
+    let mut res = match method {
+        "GET" => agent.get(&url).call()?,
+        "DELETE" => agent.delete(&url).call()?,
+        "PUT" => agent.put(&url).send_json(body)?,
+        _ => agent.post(&url).send_json(body)?,
+    };
+    let json: serde_json::Value = res.body_mut().read_json().unwrap_or(serde_json::Value::Null);
+    let status = res.status();
+    if status.is_success() {
+        return Ok(json);
+    }
+    Err(anyhow::anyhow!(error_text(status.as_u16(), &json)))
 }
 
 /// Restart a project's apps.
@@ -317,6 +419,33 @@ mod tests {
         let s = r#"[{"name":"x","description":"d","license":"MIT","source":"https://a.b/c","body":"b"}]"#;
         let v: Vec<SkillInfo> = serde_json::from_str(s).unwrap();
         assert_eq!((v[0].license.as_deref(), v[0].source.as_deref()), (Some("MIT"), Some("https://a.b/c")));
+    }
+
+    #[test]
+    fn parses_library_fields() {
+        let s = r#"{"name":"x","description":"d","body":"b","status":"review","author":"imported",
+            "attach":{"roles":["lead"],"clients":["acme"]},"tools":["Read"],"used_7d":4,
+            "hist":[{"when":"2026-11-16 10:00","who":"You","what":"imported it","from":"https://a.b"}],
+            "text":"t","versions":[{"ts":1700000000000}]}"#;
+        let v: SkillInfo = serde_json::from_str(s).unwrap();
+        assert_eq!((v.status.as_str(), v.attach.roles.len(), v.used_7d, v.versions[0].ts), ("review", 1, 4, 1_700_000_000_000));
+        assert_eq!((v.hist[0].why.clone(), v.hist[0].from.as_deref()), (None, Some("https://a.b")));
+        let bare: SkillInfo = serde_json::from_str(r#"{"name":"x","description":"d","body":"b"}"#).unwrap();
+        assert_eq!(bare.status, "on");
+    }
+
+    #[test]
+    fn error_text_prefers_the_error_field() {
+        assert_eq!(error_text(400, &serde_json::json!({"error": "bad name"})), "bad name");
+        assert_eq!(error_text(500, &serde_json::Value::Null), "Request failed (500)");
+    }
+
+    #[test]
+    fn parses_asks() {
+        let j = r#"[{"id":1,"chat_id":2,"chat_title":"Setup","text":"When?","options":["Today"],
+            "answer":null,"status":"open","created_at":"a"}]"#;
+        let v: Vec<ChatAsk> = serde_json::from_str(j).unwrap();
+        assert_eq!((v[0].options.len(), v[0].chat_title.as_str()), (1, "Setup"));
     }
 
     #[test]

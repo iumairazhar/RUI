@@ -1107,8 +1107,8 @@ fn effort_section(task: &Task, th: &Theme) -> AnyElement {
 }
 
 /// Drawer slide and scrim fade, in milliseconds.
-const DRAWER_MS: u64 = 440;
-const SCRIM_MS: u64 = 320;
+pub(super) const DRAWER_MS: u64 = 440;
+pub(super) const SCRIM_MS: u64 = 320;
 /// Band change: out of the old column, then a spring into the new one.
 pub(super) const LEAVE_MS: u64 = 300;
 const ARRIVE_MS: u64 = 620;
@@ -1231,10 +1231,10 @@ impl Render for ThreadsView {
 }
 
 /// How far the drawer travels when it slides; covers its 620 px max width plus gap.
-const DRAWER_TRAVEL: f32 = 660.;
+pub(super) const DRAWER_TRAVEL: f32 = 660.;
 
 /// Eased visibility of the drawer: rising when opening, falling when closing.
-fn shown(closing: bool, d: f32) -> f32 {
+pub(super) fn shown(closing: bool, d: f32) -> f32 {
     if closing { 1. - ease(d) } else { ease(d) }
 }
 

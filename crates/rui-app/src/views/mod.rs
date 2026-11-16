@@ -1,10 +1,13 @@
 //! UI views and shared building blocks.
 
 pub mod activity;
+pub mod agents;
 pub mod apps;
+pub mod asks;
 pub mod board;
 pub mod character;
 pub mod chat;
+pub mod library;
 pub mod live;
 pub mod markdown;
 pub mod motion;
@@ -12,7 +15,6 @@ pub mod questions;
 pub mod roster;
 pub mod seat;
 pub mod skills;
-pub mod team;
 pub mod toast;
 pub mod trace;
 
