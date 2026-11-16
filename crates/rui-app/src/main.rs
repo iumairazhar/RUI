@@ -3,6 +3,7 @@
 mod api;
 mod assets;
 mod store;
+mod text_editor;
 mod text_input;
 mod theme;
 mod views;
@@ -326,6 +327,7 @@ impl Render for Root {
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         text_input::bind_keys(cx);
+        text_editor::bind_keys(cx);
         cx.set_global(Theme::dark());
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(
