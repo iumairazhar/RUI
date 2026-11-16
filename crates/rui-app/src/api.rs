@@ -163,6 +163,29 @@ pub fn task_file(id: i64, path: &str) -> Result<TaskFile> {
     Ok(serde_json::from_value(get(&url)?)?)
 }
 
+/// A file a task (or its team) produced in the project repo.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ResultFile {
+    pub path: String,
+    pub abs_path: String,
+    #[serde(default)]
+    pub size: u64,
+    pub task_id: i64,
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Fetch the files a task and its team produced.
+pub fn get_results(task_id: i64) -> Result<Vec<ResultFile>> {
+    Ok(serde_json::from_value(get(&format!("/tasks/{task_id}/results"))?)?)
+}
+
+/// Fetch one produced file from the project repo.
+pub fn get_result_file(task_id: i64, path: &str) -> Result<TaskFile> {
+    let url = format!("/tasks/{task_id}/result-file?path={}", encode_path(path));
+    Ok(serde_json::from_value(get(&url)?)?)
+}
+
 /// One app a team started for a project.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AppInfo {
@@ -406,6 +429,13 @@ mod tests {
         let j = r#"[{"file":"a","added":0,"removed":0,"diff":"@@ -1 +1 @@"}]"#;
         let v: Vec<Change> = serde_json::from_str(j).unwrap();
         assert_eq!(v[0].diff, "@@ -1 +1 @@");
+    }
+
+    #[test]
+    fn parses_result_files() {
+        let j = r#"[{"path":"d/a.md","abs_path":"/r/d/a.md","size":12,"modified":5,"task_id":3,"agent":null}]"#;
+        let v: Vec<ResultFile> = serde_json::from_str(j).unwrap();
+        assert_eq!((v[0].path.as_str(), v[0].size, v[0].task_id, v[0].agent.clone()), ("d/a.md", 12, 3, None));
     }
 
     #[test]

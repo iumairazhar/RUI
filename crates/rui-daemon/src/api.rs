@@ -11,6 +11,7 @@ use axum::{
 use crate::apps::{self, AppInfo, Apps};
 use crate::live::{self, Live};
 use crate::scheduler::Runs;
+use crate::results::ResultFile;
 use crate::seat::SeatCache;
 use crate::worktree::{self, Change};
 use rui_core::{
@@ -82,6 +83,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/runs", get(list_task_runs))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
+        .route("/tasks/{id}/results", get(task_results))
+        .route("/tasks/{id}/result-file", get(result_file))
         .route("/tasks/{id}/stop", post(stop_task))
         .route("/tasks/{id}/instruct", post(instruct_task))
         .route("/apps", get(list_apps))
@@ -431,6 +434,31 @@ async fn task_file(
 ) -> ApiResult<Json<FileView>> {
     s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
     let dir = s.data_dir.join("worktrees").join(id.to_string());
+    let view = tokio::task::spawn_blocking(move || read_worktree_file(&dir, &q.path))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(view))
+}
+
+/// Files the task and its team produced, as found in the project repo.
+async fn task_results(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Vec<ResultFile>>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let store = s.db.clone();
+    let list = tokio::task::spawn_blocking(move || crate::results::collect(&store, &task))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(list))
+}
+
+/// Contents of one produced file in the project repo (read-only, capped at 256 KB).
+async fn result_file(
+    State(s): State<ApiState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FileQuery>,
+) -> ApiResult<Json<FileView>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let client = s.db.get_client(task.client_id)?.ok_or_else(|| not_found("project not found"))?;
+    let dir = crate::scheduler::expand_home(&client.repo_path);
     let view = tokio::task::spawn_blocking(move || read_worktree_file(&dir, &q.path))
         .await
         .map_err(anyhow::Error::from)??;
@@ -908,5 +936,28 @@ mod tests {
         assert_eq!(big["content"].as_str().unwrap().len(), 256 * 1024);
         let missing_task = call(&app, "GET", "/tasks/999/file?path=a", None).await;
         assert_eq!(missing_task.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn result_file_reads_repo_and_refuses_traversal() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("plan.md"), "# hi").unwrap();
+        std::fs::write(repo.path().parent().unwrap().join("outside-rui.txt"), "x").unwrap();
+        let (app, db, _rx) = setup();
+        let c = db.create_client("res", &repo.path().to_string_lossy(), None, &[]).unwrap();
+        let tid = seed_task_for(&db, c.id);
+        let get = |p: &str| {
+            let (app, uri) = (app.clone(), format!("/tasks/{tid}/result-file?path={p}"));
+            async move { call(&app, "GET", &uri, None).await }
+        };
+        let (st, v) = get("plan.md").await;
+        assert_eq!((st, v["content"].as_str(), v["truncated"].as_bool()), (StatusCode::OK, Some("# hi"), Some(false)));
+        assert_eq!(get("../outside-rui.txt").await.0, StatusCode::FORBIDDEN);
+        assert_eq!(get("/etc/hosts").await.0, StatusCode::FORBIDDEN);
+        assert_eq!(call(&app, "GET", "/tasks/999/result-file?path=a", None).await.0, StatusCode::NOT_FOUND);
+        let (st, v) = call(&app, "GET", "/tasks/999/results", None).await;
+        assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "task not found"})));
+        let (st, v) = call(&app, "GET", &format!("/tasks/{tid}/results"), None).await;
+        assert_eq!((st, v), (StatusCode::OK, json!([])));
     }
 }

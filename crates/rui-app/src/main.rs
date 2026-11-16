@@ -15,7 +15,7 @@ use gpui::{
 };
 use gpui::AnimationExt;
 use views::motion::{self, spring};
-use store::{Store, inbox_count};
+use store::{Store, StoreHandle, inbox_count};
 use theme::{Theme, theme};
 use views::{
     activity::ThreadsView,
@@ -24,6 +24,7 @@ use views::{
     board::BoardView,
     chat::ChatView,
     questions::QuestionsView,
+    results::ResultsView,
     seat::{SeatView, seat_label},
     library::Tooltip,
     skills::SkillsView,
@@ -96,6 +97,7 @@ struct Root {
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
+    results: Entity<ResultsView>,
 }
 
 impl Root {
@@ -107,9 +109,13 @@ impl Root {
         })
         .detach();
         let store = cx.new(Store::new);
+        cx.set_global(StoreHandle(store.clone()));
         cx.observe(&store, |this, store, cx| {
             if store.update(cx, |s, _| std::mem::take(&mut s.open_threads)) {
                 this.select(Nav::Threads, cx);
+            }
+            if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
+                this.results.update(cx, |v, cx| v.open(req, cx));
             }
             cx.notify();
         })
@@ -126,6 +132,7 @@ impl Root {
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
+            results: cx.new(|cx| ResultsView::new(store.clone(), cx)),
             store,
         }
     }
@@ -305,6 +312,7 @@ impl Render for Root {
             .child(self.header(&th, cx))
             .child(self.rail(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
+            .children(self.results.read(cx).is_open().then(|| self.results.clone()))
     }
 }
 

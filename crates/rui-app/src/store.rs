@@ -1,8 +1,8 @@
 //! Shared app state, refreshed from the daemon once a second.
 
-use crate::api::{self, AppInfo, Change, LiveSnapshot, RoleInfo, SkillInfo};
+use crate::api::{self, AppInfo, Change, LiveSnapshot, ResultFile, RoleInfo, SkillInfo};
 use crate::views::toast::{SHOW_MS, Toast};
-use gpui::{Context, Entity};
+use gpui::{Context, Entity, Global};
 use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, QuestionStatus, SeatInfo, Task, TaskRun};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -16,6 +16,18 @@ const MAX_ANSWERED_ASKS: usize = 50;
 type ChatData = (Vec<Chat>, Option<i64>, Option<i64>, Vec<ChatMessage>);
 type Core = anyhow::Result<(Vec<Client>, Vec<Task>, Vec<Question>, ChatData)>;
 type Snapshot = (Core, Extras);
+
+/// A request to open a produced file in the viewer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultRequest {
+    pub task_id: i64,
+    pub path: String,
+}
+
+/// The app's store as a global, so click handlers without a view can reach it.
+pub struct StoreHandle(pub Entity<Store>);
+
+impl Global for StoreHandle {}
 
 /// Holds the latest data from the daemon plus the last error, if any.
 pub struct Store {
@@ -41,6 +53,10 @@ pub struct Store {
     pub last_event_id: Option<i64>,
     /// Changed files per task, for tasks that were watched.
     pub changes: HashMap<i64, Vec<Change>>,
+    /// Files produced per task, for tasks that were watched.
+    pub results: HashMap<i64, Vec<ResultFile>>,
+    /// Set by a `rui://result` link or a Results row; the root opens the viewer and clears it.
+    pub result_request: Option<ResultRequest>,
     /// Full recent event history of the watched task, oldest first.
     pub task_events: HashMap<i64, Vec<Event>>,
     /// File picked in a thread's Files tab: (task id, path, content or error).
@@ -157,6 +173,8 @@ impl Store {
             last_event_id: None,
             changes: HashMap::new(),
             task_events: HashMap::new(),
+            results: HashMap::new(),
+            result_request: None,
             file_view: None,
             live: LiveSnapshot::default(),
             asks: vec![],
@@ -209,6 +227,12 @@ impl Store {
     /// Ask the root to switch to the Threads page.
     pub fn go_to_threads(&mut self, cx: &mut Context<Self>) {
         self.open_threads = true;
+        cx.notify();
+    }
+
+    /// Ask the root to open a produced file in the viewer.
+    pub fn request_result(&mut self, task_id: i64, path: String, cx: &mut Context<Self>) {
+        self.result_request = Some(ResultRequest { task_id, path });
         cx.notify();
     }
 
@@ -273,12 +297,16 @@ impl Store {
     fn reload_changes(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.watched else { return };
         cx.spawn(async move |this, cx| {
-            let fetch = async move { (api::changes(id).ok(), api::task_events(id).ok()) };
-            let (changes, events) = cx.background_executor().spawn(fetch).await;
+            let fetch = async move { (api::changes(id).ok(), api::task_events(id).ok(), api::get_results(id).ok()) };
+            let (changes, events, results) = cx.background_executor().spawn(fetch).await;
             this.update(cx, |s, cx| {
                 let mut changed = false;
                 if let Some(list) = changes.filter(|l| s.changes.get(&id) != Some(l)) {
                     s.changes.insert(id, list);
+                    changed = true;
+                }
+                if let Some(list) = results.filter(|l| s.results.get(&id) != Some(l)) {
+                    s.results.insert(id, list);
                     changed = true;
                 }
                 if let Some(list) = events.filter(|l| s.task_events.get(&id) != Some(l)) {

@@ -1,6 +1,7 @@
 //! The scheduler: plain rules that decide what runs next, plus the code that runs it.
 
 use crate::apps::{self, AppInfo, Apps};
+use crate::results::ResultFile;
 use crate::db::Db;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
@@ -374,7 +375,8 @@ async fn launch_and_report(db: &Db, apps: &Apps, task: &Task) -> Result<()> {
 fn post_done_notice(db: &Db, task: &Task, repo: &str, infos: &[AppInfo]) -> Result<()> {
     let Some(source) = task.source_ref.as_deref() else { return Ok(()) };
     let Some(chat_id) = db.chat_id_for_source_ref(source)? else { return Ok(()) };
-    db.add_chat_message(chat_id, ChatRole::Rui, &done_message(&task.title, repo, infos))?;
+    let files = crate::results::collect(db, task).unwrap_or_default();
+    db.add_chat_message(chat_id, ChatRole::Rui, &done_message(task, repo, infos, &files))?;
     Ok(())
 }
 
@@ -414,8 +416,21 @@ fn stuck_reason(db: &Db, parent_id: i64) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// The chat message announcing a finished task and its apps.
-fn done_message(title: &str, repo: &str, infos: &[AppInfo]) -> String {
+/// The chat message announcing a finished task, its apps and the files it produced.
+fn done_message(task: &Task, repo: &str, infos: &[AppInfo], files: &[ResultFile]) -> String {
+    let base = apps_message(&task.title, repo, infos);
+    if files.is_empty() {
+        return base;
+    }
+    let lines: Vec<String> = files
+        .iter()
+        .take(8)
+        .map(|f| format!("- [{}](rui://result/{}/{})", f.path, f.task_id, f.path))
+        .collect();
+    format!("{base}\n\n**Files:**\n{}", lines.join("\n"))
+}
+
+fn apps_message(title: &str, repo: &str, infos: &[AppInfo]) -> String {
     if infos.is_empty() {
         return format!("✅ **{title}** is done.\n\nProject folder: {repo}");
     }
@@ -1406,6 +1421,18 @@ mod tests {
         assert!(last.content.contains("Guide"));
         let nothing = chat_task_ref_missing(&db);
         post_done_notice(&db, &nothing, "/tmp/c", &[]).unwrap();
+    }
+
+    #[test]
+    fn done_message_lists_file_links() {
+        let db = Db::open_test();
+        let task = chat_task(&db, None);
+        let file = |p: &str| ResultFile { path: p.into(), abs_path: format!("/r/{p}"), size: 1, modified: 0, task_id: 7, agent: None };
+        let files: Vec<ResultFile> = (0..10).map(|i| file(&format!("d/f{i}.md"))).collect();
+        let msg = done_message(&task, "/r", &[], &files);
+        assert!(msg.contains("**Files:**\n- [d/f0.md](rui://result/7/d/f0.md)"));
+        assert!(msg.contains("f7.md") && !msg.contains("f8.md"));
+        assert!(!done_message(&task, "/r", &[], &[]).contains("Files"));
     }
 
     fn chat_task_ref_missing(db: &Db) -> Task {

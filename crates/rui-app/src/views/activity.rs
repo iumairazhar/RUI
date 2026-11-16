@@ -6,7 +6,8 @@ use super::character::{char_state, character};
 use super::motion::{self, delayed, ease, spring};
 use super::roster::{Dot, Loops, member_name, pod_line, role_code};
 use super::{chip, markdown, page_head, primary_button, role_chip, tag, task_status};
-use crate::api::{Change, LiveSnapshot, LiveState};
+use super::results::row_meta;
+use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
@@ -273,6 +274,7 @@ enum Tab {
     Trace,
     Changes,
     Files,
+    Results,
 }
 
 pub(super) const MONO: &str = "Menlo";
@@ -299,6 +301,8 @@ pub struct ThreadsView {
     open: Option<i64>,
     tab: Tab,
     file: Option<String>,
+    /// A done task's drawer should switch to Results once its files load.
+    auto_results: bool,
     input: Entity<TextInput>,
     scroll: ScrollHandle,
     last_len: usize,
@@ -322,7 +326,7 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -335,6 +339,7 @@ impl ThreadsView {
         self.closing = false;
         self.set_tab(Tab::Trace);
         self.file = None;
+        self.auto_results = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.status == TaskStatus::Done);
         self.expanded.clear();
         self.input.update(cx, |i, cx| i.clear(cx));
         self.store.update(cx, |s, cx| s.load_changes(Some(id), cx));
@@ -555,6 +560,11 @@ impl ThreadsView {
 
     fn drawer(&mut self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (events, changes) = self.task_data(t.task.id, cx);
+        let results = self.store.read(cx).results.get(&t.task.id).cloned().unwrap_or_default();
+        if self.auto_results && !results.is_empty() {
+            self.auto_results = false;
+            self.set_tab(Tab::Results);
+        }
         let rows = trace(&events);
         let live = self.store.read(cx).live.task(t.task.id).cloned();
         let sig = scroll_sig(rows.len(), live.as_ref());
@@ -570,6 +580,7 @@ impl ThreadsView {
             }
             Tab::Changes => section("What it changed", change_cards(&changes, th)),
             Tab::Files => self.files_tab(t.task.id, &rows, &changes, th, cx),
+            Tab::Results => section("Files it produced", self.result_rows(&results, th, cx)),
         };
         let scroll = div()
             .id("drawer-scroll")
@@ -605,7 +616,7 @@ impl ThreadsView {
             .shadow(th.card_shadow())
             .border_1()
             .border_color(th.glass_rim)
-            .child(drawer_head(t, now, th, close, self.tabs(th, cx), face))
+            .child(drawer_head(t, now, th, close, self.tabs(!results.is_empty(), th, cx), face))
             .child(scroll)
             .children(composer)
             .into_any_element()
@@ -629,8 +640,11 @@ impl ThreadsView {
             .into_any_element()
     }
 
-    fn tabs(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let tabs = [(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")];
+    fn tabs(&self, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut tabs = vec![(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")];
+        if has_results {
+            tabs.push((Tab::Results, "Results"));
+        }
         let items: Vec<AnyElement> = tabs
             .into_iter()
             .enumerate()
@@ -650,6 +664,7 @@ impl ThreadsView {
                     .bg(if on { th.accent_fill } else { gpui::transparent_black() })
                     .text_color(if on { th.on_accent } else { th.muted })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.auto_results = false;
                         this.set_tab(tab);
                         cx.notify();
                     }))
@@ -666,6 +681,35 @@ impl ThreadsView {
             .border_1()
             .border_color(th.hairline)
             .children(items)
+            .into_any_element()
+    }
+
+    fn result_rows(&self, files: &[ResultFile], th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        files.iter().enumerate().map(|(i, f)| self.result_row(i, f, th, cx)).collect()
+    }
+
+    fn result_row(&self, i: usize, f: &ResultFile, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let s = self.store.read(cx);
+        let agent = s.tasks.iter().find(|t| t.id == f.task_id).and_then(|t| member_name(t, &s.tasks, &s.roles));
+        let meta = row_meta(&agent.or_else(|| f.agent.clone()).unwrap_or_default(), f.size);
+        let (task_id, path, hover) = (f.task_id, f.path.clone(), th.surface_2);
+        let names = div().flex().flex_col().flex_1().min_w_0().gap(px(2.));
+        let names = names.child(mono(12., th.fg, f.path.clone()).truncate()).child(mono(11., th.muted, meta).truncate());
+        div()
+            .id(("result-row", i))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(9.))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.store.update(cx, |s, cx| s.request_result(task_id, path.clone(), cx));
+            }))
+            .child(icon("file", 16., th.fg_2))
+            .child(names)
             .into_any_element()
     }
 

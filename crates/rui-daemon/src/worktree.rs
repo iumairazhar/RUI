@@ -105,6 +105,13 @@ pub fn land(repo: &Path, branch: &str, message: &str) -> anyhow::Result<LandResu
     merge_failure(repo)
 }
 
+/// Files touched by the tip commit of `branch` (works after the branch is merged).
+pub fn branch_files(repo: &Path, branch: &str) -> anyhow::Result<Vec<String>> {
+    let args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", branch];
+    let out = git_stdout(repo, &args)?;
+    Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+}
+
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 
 /// What the branch in `wt` changed relative to main (or master), capped at 60 KB.

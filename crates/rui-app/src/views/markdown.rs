@@ -1,8 +1,10 @@
 //! A tiny markdown subset: paragraphs, lists, headings, fences, **bold**, `code` and links.
+//! Links are http(s) or `rui://result/<task>/<path>` (opens the file viewer).
 
+use crate::store::StoreHandle;
 use crate::theme::Theme;
 use gpui::{
-    AnyElement, Div, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, ParentElement,
+    AnyElement, App, Div, FontWeight, HighlightStyle, Hsla, InteractiveText, IntoElement, ParentElement,
     Styled, StyledText, UnderlineStyle, div, px,
 };
 use std::hash::{Hash, Hasher};
@@ -47,11 +49,24 @@ fn is_http(url: &str) -> bool {
     ["http://", "https://"].iter().any(|p| url.len() > p.len() && url.starts_with(p))
 }
 
-/// `[text](url)` at the start of `s`; only http(s) urls count.
+const RESULT_PREFIX: &str = "rui://result/";
+
+/// `(task id, path)` of a `rui://result/<task>/<path>` link.
+pub fn parse_result_link(url: &str) -> Option<(i64, String)> {
+    let (id, path) = url.strip_prefix(RESULT_PREFIX)?.split_once('/')?;
+    (!path.is_empty()).then_some(())?;
+    Some((id.parse().ok()?, path.to_string()))
+}
+
+fn is_link_url(url: &str) -> bool {
+    is_http(url) || (url.starts_with("rui://") && url.len() > "rui://".len())
+}
+
+/// `[text](url)` at the start of `s`; only http(s) and rui:// urls count.
 fn md_link(s: &str) -> Option<(Span, &str)> {
     let (text, after) = split_at_marker(&s[1..], "](")?;
     let (url, after) = split_at_marker(after, ")")?;
-    is_http(url).then(|| (Span::Link { text: text.into(), url: url.into() }, after))
+    is_link_url(url).then(|| (Span::Link { text: text.into(), url: url.into() }, after))
 }
 
 /// A bare `http(s)://` url at the start of `s`, minus trailing punctuation.
@@ -180,7 +195,17 @@ fn flatten(spans: &[Span], base: Hsla, link: Hsla) -> (String, Marks, Vec<(Range
     (text, marks, links)
 }
 
-/// Styled text; links are clickable and open in the browser.
+/// Opens a result link in the viewer and an http(s) link in the browser.
+fn open_link(url: &str, cx: &mut App) {
+    if let Some((task_id, path)) = parse_result_link(url) {
+        let store = cx.global::<StoreHandle>().0.clone();
+        store.update(cx, |s, cx| s.request_result(task_id, path, cx));
+    } else if is_http(url) {
+        cx.open_url(url);
+    }
+}
+
+/// Styled text; links are clickable.
 fn styled(spans: &[Span], base: Hsla, th: &Theme) -> AnyElement {
     let link = if base == th.on_accent { base } else { th.accent_text };
     let (text, marks, links) = flatten(spans, base, link);
@@ -192,7 +217,7 @@ fn styled(spans: &[Span], base: Hsla, th: &Theme) -> AnyElement {
         return styled.into_any_element();
     }
     let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-    InteractiveText::new(id, styled).on_click(ranges, move |i, _, cx| cx.open_url(&urls[i])).into_any_element()
+    InteractiveText::new(id, styled).on_click(ranges, move |i, _, cx| open_link(&urls[i], cx)).into_any_element()
 }
 
 fn marker_row(mark: String, width: f32, body: AnyElement) -> Div {
@@ -314,6 +339,17 @@ mod tests {
         let got = inline("see [the docs](https://a.io/x?y=1) now");
         assert_eq!(got, vec![t("see "), link("the docs", "https://a.io/x?y=1"), t(" now")]);
         assert_eq!(inline("[x](ftp://a)"), vec![t("[x](ftp://a)")]);
+    }
+
+    #[test]
+    fn result_links_parse() {
+        let got = inline("- [d/a.md](rui://result/12/d/a.md)");
+        assert_eq!(got, vec![t("- "), link("d/a.md", "rui://result/12/d/a.md")]);
+        assert_eq!(parse_result_link("rui://result/12/d/a.md"), Some((12, "d/a.md".into())));
+        assert_eq!(parse_result_link("rui://result/x/a.md"), None);
+        assert_eq!(parse_result_link("rui://result/12/"), None);
+        assert_eq!(parse_result_link("https://a.io/b"), None);
+        assert_eq!(inline("[x](rui://)"), vec![t("[x](rui://)")]);
     }
 
     #[test]
