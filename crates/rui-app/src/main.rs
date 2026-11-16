@@ -12,6 +12,8 @@ use gpui::{
     AnyElement, App, Application, Bounds, Context, Entity, FontWeight, SharedString,
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, size, svg,
 };
+use gpui::AnimationExt;
+use views::motion::{self, spring};
 use rui_core::QuestionStatus;
 use store::Store;
 use theme::{Theme, theme};
@@ -39,6 +41,10 @@ enum Nav {
 impl Nav {
     const ALL: [Nav; 7] =
         [Nav::Rui, Nav::Threads, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
+
+    fn index(self) -> usize {
+        Nav::ALL.iter().position(|n| *n == self).unwrap_or(0)
+    }
 
     fn label(self) -> &'static str {
         match self {
@@ -81,9 +87,18 @@ impl Render for Tooltip {
     }
 }
 
+/// Rail selection pill slide, with the spring.
+const PILL_MS: u64 = 540;
+/// Rail item height plus the gap between items.
+const RAIL_STEP: f32 = 47.;
+
 struct Root {
     store: Entity<Store>,
     nav: Nav,
+    /// Item the selection pill is sliding away from.
+    pill_from: Nav,
+    /// Bumped on every selection so the pill animation restarts.
+    pill_seq: usize,
     chat: Entity<ChatView>,
     board: Entity<BoardView>,
     questions: Entity<QuestionsView>,
@@ -105,6 +120,8 @@ impl Root {
         store::observe(&store, cx);
         Self {
             nav: Nav::Rui,
+            pill_from: Nav::Rui,
+            pill_seq: 0,
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
             board: cx.new(|cx| BoardView::new(store.clone(), cx)),
             questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
@@ -220,17 +237,36 @@ impl Root {
             .justify_center()
             .cursor_pointer()
             .child(icon)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.nav = nav;
-                if nav == Nav::Skills {
-                    this.store.update(cx, |s, cx| s.refresh_skills(cx));
-                }
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.select(nav, cx)))
             .tooltip(move |_, cx| cx.new(|_| Tooltip(label.into())).into());
-        let item = if active { item.bg(th.sel) } else { item.hover(move |s| s.bg(hairline)) };
+        let item = if active { item } else { item.hover(move |s| s.bg(hairline)) };
         let count = if nav == Nav::Inbox { self.open_questions(cx) } else { 0 };
         item.children((count > 0).then(|| self.badge(th, count)))
+    }
+
+    fn select(&mut self, nav: Nav, cx: &mut Context<Self>) {
+        if nav == self.nav {
+            return;
+        }
+        (self.pill_from, self.nav) = (self.nav, nav);
+        self.pill_seq += 1;
+        if nav == Nav::Skills {
+            self.store.update(cx, |s, cx| s.refresh_skills(cx));
+        }
+        if nav == Nav::Threads {
+            self.activity.update(cx, |v, _| v.reset_motion());
+        }
+        cx.notify();
+    }
+
+    /// Selection pill behind the rail items, springing between them.
+    fn pill(&self, th: &Theme) -> impl IntoElement + use<> {
+        let from = 8. + RAIL_STEP * self.pill_from.index() as f32;
+        let to = 8. + RAIL_STEP * self.nav.index() as f32;
+        let pill = div().absolute().left(px(8.)).top(px(to)).size(px(44.)).rounded(px(10.)).bg(th.sel);
+        pill.with_animation(("rail-pill", self.pill_seq), motion::once(PILL_MS), move |el, d| {
+            el.top(px(from + (to - from) * spring(d)))
+        })
     }
 
     fn rail(&self, th: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -251,6 +287,7 @@ impl Root {
             .flex_col()
             .items_center()
             .gap(px(3.))
+            .child(self.pill(th))
             .children(items)
     }
 }
@@ -269,6 +306,7 @@ impl Render for Root {
             .child(self.content())
             .child(self.header(&th, cx))
             .child(self.rail(&th, cx))
+            .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
     }
 }
 

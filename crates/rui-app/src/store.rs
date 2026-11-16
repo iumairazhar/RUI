@@ -1,6 +1,7 @@
 //! Shared app state, refreshed from the daemon once a second.
 
 use crate::api::{self, AppInfo, Change, LiveSnapshot, SkillInfo};
+use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity};
 use rui_core::{Chat, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
 use std::collections::HashMap;
@@ -48,6 +49,8 @@ pub struct Store {
     pub apps: Vec<AppInfo>,
     /// Skills from the daemon; loaded at start and on refresh.
     pub skills: Vec<SkillInfo>,
+    /// Toast confirming the last owner action; hides after a few seconds.
+    pub toast: Option<Toast>,
     /// Task whose changes and events are reloaded on every poll.
     watched: Option<i64>,
 }
@@ -144,6 +147,7 @@ impl Store {
             live: LiveSnapshot::default(),
             apps: vec![],
             skills: vec![],
+            toast: None,
             watched: None,
         }
     }
@@ -297,23 +301,46 @@ impl Store {
         .detach();
     }
 
+    /// Show a toast, replacing any current one, and hide it after `SHOW_MS`.
+    pub fn show_toast(&mut self, title: &str, chips: Vec<String>, cx: &mut Context<Self>) {
+        let seq = self.toast.as_ref().map_or(1, |t| t.seq + 1);
+        self.toast = Some(Toast { seq, title: title.into(), chips });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(SHOW_MS)).await;
+            this.update(cx, |s, cx| s.hide_toast(seq, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn hide_toast(&mut self, seq: usize, cx: &mut Context<Self>) {
+        if self.toast.as_ref().is_some_and(|t| t.seq == seq) {
+            self.toast = None;
+            cx.notify();
+        }
+    }
+
     /// Stop a task, then refresh.
     pub fn stop_task(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Stopped", vec![format!("Thread {id}")], cx);
         self.act(move || api::stop(id), cx);
     }
 
     /// Send new instructions to a task, then refresh.
     pub fn instruct_task(&mut self, id: i64, text: String, cx: &mut Context<Self>) {
+        self.show_toast("Instructions sent", vec![format!("Thread {id}")], cx);
         self.act(move || api::instruct(id, &text), cx);
     }
 
     /// Restart a project's apps, then refresh.
     pub fn restart_apps(&mut self, project: String, cx: &mut Context<Self>) {
+        self.show_toast("Restarting apps", vec![project.clone()], cx);
         self.act(move || api::restart_apps(&project), cx);
     }
 
     /// Stop a project's apps, then refresh.
     pub fn stop_apps(&mut self, project: String, cx: &mut Context<Self>) {
+        self.show_toast("Stopped apps", vec![project.clone()], cx);
         self.act(move || api::stop_apps(&project), cx);
     }
 
@@ -355,6 +382,7 @@ impl Store {
 
     /// Create a chat in the background, select it, then refresh.
     pub fn new_chat(&mut self, cx: &mut Context<Self>) {
+        self.show_toast("New chat started", vec![], cx);
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move { api::create_chat() }).await;
             this.update(cx, |s, cx| {

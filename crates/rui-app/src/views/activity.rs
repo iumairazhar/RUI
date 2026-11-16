@@ -2,20 +2,22 @@
 
 use super::live::live_action;
 use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files, trace};
-use super::{avatar, chip, markdown, page_head, primary_button, tag, task_status};
+use super::character::{char_state, character};
+use super::motion::{self, delayed, ease, spring};
+use super::{chip, markdown, page_head, primary_button, tag, task_status};
 use crate::api::{Change, LiveSnapshot, LiveState};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
 use gpui::{
-    AbsoluteLength, Animation, AnimationExt, AnyElement, App, Context, Div, Entity, FontWeight, Hsla, ScrollHandle,
+    AbsoluteLength, Animation, AnimationExt, AnyElement, Context, Div, Entity, FontWeight, Hsla, ScrollHandle,
     SharedString, Stateful, StyledText, Transformation, Window, div, prelude::*, px, radians,
     relative, svg,
 };
 use rui_core::{Event, QuestionStatus, Role, Task, TaskStatus};
 use serde_json::Value;
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -131,7 +133,7 @@ pub fn summarize(e: &Event) -> (String, bool) {
 
 
 /// Board column a thread belongs to.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Col {
     Needs,
     Standing,
@@ -285,6 +287,14 @@ pub struct ThreadsView {
     scroll: ScrollHandle,
     last_len: usize,
     expanded: HashSet<usize>,
+    /// Drawer is playing its slide-out before it closes.
+    closing: bool,
+    /// Last column of each thread, to spot band changes.
+    bands: HashMap<i64, Col>,
+    /// Threads that just changed column: the column they left and when.
+    moves: HashMap<i64, (Col, Instant)>,
+    /// Threads already shown since the view last appeared; new ones rise unstaggered.
+    seen: HashSet<i64>,
 }
 
 impl ThreadsView {
@@ -294,11 +304,19 @@ impl ThreadsView {
         let input = cx.new(|cx| TextInput::new("Answer it, or pass down new instructions…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         let scroll = ScrollHandle::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, input, scroll, last_len: 0, expanded: HashSet::new() }
+        let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
+        let expanded = HashSet::new();
+        Self { store, open: None, tab: Tab::Trace, file: None, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen }
+    }
+
+    /// Forget shown rows so the next render staggers them in again.
+    pub fn reset_motion(&mut self) {
+        self.seen.clear();
     }
 
     fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open = Some(id);
+        self.closing = false;
         self.set_tab(Tab::Trace);
         self.file = None;
         self.expanded.clear();
@@ -338,10 +356,47 @@ impl ThreadsView {
         self.last_len = usize::MAX;
     }
 
+    /// Slide the drawer out, then drop it.
     fn close(&mut self, cx: &mut Context<Self>) {
+        if self.open.is_none() || self.closing {
+            return;
+        }
+        self.closing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(DRAWER_MS)).await;
+            this.update(cx, |v, cx| v.finish_close(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn finish_close(&mut self, cx: &mut Context<Self>) {
+        if !self.closing {
+            return;
+        }
+        self.closing = false;
         self.open = None;
         self.store.update(cx, |s, cx| s.load_changes(None, cx));
         cx.notify();
+    }
+
+    /// Record column changes since the last render and drop finished ones.
+    fn track_moves(&mut self, threads: &[Thread]) {
+        let now = Instant::now();
+        for t in threads {
+            let Some(col) = col_of(&t.task.status) else { continue };
+            match self.bands.insert(t.task.id, col) {
+                Some(prev) if prev != col => _ = self.moves.insert(t.task.id, (prev, now)),
+                _ => {}
+            }
+        }
+        let keep = Duration::from_millis(LEAVE_MS + ARRIVE_MS + 100);
+        self.moves.retain(|_, (_, at)| at.elapsed() < keep);
+    }
+
+    /// Stagger slot for a row: its index on a fresh view, else none.
+    fn stagger(&self, i: usize) -> usize {
+        if self.seen.is_empty() { i } else { 0 }
     }
 
     fn pick_file(&mut self, id: i64, path: String, cx: &mut Context<Self>) {
@@ -382,11 +437,11 @@ impl ThreadsView {
 
     fn row(&self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let id = t.task.id;
-        let st = task_status(&t.task.status, th);
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
         let title = format!("{} \u{b7} {}", label(&t.task), t.task.title);
         let live = self.store.read(cx).live.task(id).cloned();
+        let state = char_state(&t.task.status, live.as_ref());
         let word = live.as_ref().map_or_else(|| state_word(&t.task.status).to_string(), live_sub);
         let parts = [t.client.clone(), word, elapsed(&t.task.updated_at, now)];
         let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
@@ -395,12 +450,13 @@ impl ThreadsView {
             .flex_col()
             .flex_1()
             .min_w_0()
-            .child(row_title(id, title, t.task.skill.as_deref(), live.is_some(), th))
+            .child(row_title(title, t.task.skill.as_deref(), th))
             .child(div().truncate().text_size(px(11.)).text_color(th.muted).child(sub))
             .children(team_line(&t.team, th));
         let hover = th.surface_2;
         let row = div()
             .id(("thread-row", id as usize))
+            .relative()
             .flex()
             .flex_none()
             .gap(px(10.))
@@ -412,21 +468,23 @@ impl ThreadsView {
             .shadow(th.card_shadow())
             .border_color(ring)
             .cursor_pointer()
-            .hover(move |s| s.bg(hover))
+            .hover(move |s| s.bg(hover).top(px(-1.)))
             .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
-            .child(avatar(color, st.base, px(34.), cx))
+            .child(character(state, px(34.), ("thread-rui", id as usize), color, th))
             .child(text);
         border_w(row, 1.5).into_any_element()
     }
 
-    fn column(&self, col: Col, items: &[&Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn column(&self, col: Col, items: &[&Thread], all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (name, empty) = match col {
             Col::Needs => ("Needs you", "Nothing here right now."),
             Col::Standing => ("Standing by", "Nothing here right now."),
             Col::Doing => ("Doing", "Nothing here right now."),
             Col::Landed => ("Landed", "Nothing has landed yet."),
         };
-        let rows: Vec<AnyElement> = items.iter().map(|t| self.row(t, now, th, cx)).collect();
+        let ghosts = self.leaving(col, all, now, th, cx);
+        let rows: Vec<AnyElement> =
+            items.iter().enumerate().map(|(i, t)| self.moving_row(t, i, now, th, cx)).collect();
         let none = items.is_empty().then(|| div().text_size(px(12.)).text_color(th.muted).child(empty));
         let list = div()
             .id(("threads-col-list", col as usize))
@@ -437,6 +495,7 @@ impl ThreadsView {
             .flex_col()
             .p(px(8.))
             .children(rows)
+            .children(ghosts)
             .children(none);
         div()
             .id(("threads-col", col as usize))
@@ -452,6 +511,28 @@ impl ThreadsView {
             .child(column_head(name, items.len(), th))
             .child(list)
             .into_any_element()
+    }
+
+    /// A row that rises in when new, or springs in after changing column.
+    fn moving_row(&self, t: &Thread, i: usize, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = t.task.id;
+        let row = self.row(t, now, th, cx);
+        let anim_id = ("thread-in", id as usize);
+        if self.moves.contains_key(&id) {
+            return arrive(row, anim_id).into_any_element();
+        }
+        let index = if self.seen.contains(&id) { 0 } else { self.stagger(i) };
+        motion::rise(div().child(row), anim_id, index).into_any_element()
+    }
+
+    /// Ghost rows sliding out of the column a thread just left.
+    fn leaving(&self, col: Col, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let left_here = |t: &&Thread| match self.moves.get(&t.task.id) {
+            Some((from, at)) => *from == col && at.elapsed() < Duration::from_millis(LEAVE_MS),
+            None => false,
+        };
+        let ghosts: Vec<&Thread> = all.iter().filter(left_here).collect();
+        ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
     fn drawer(&mut self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -482,6 +563,9 @@ impl ThreadsView {
             .child(body);
         let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
         let close = self.close_button(th, cx);
+        let color = th.client_color(t.task.client_id);
+        let state = char_state(&t.task.status, live.as_ref());
+        let face = character(state, px(58.), ("drawer-rui", t.task.id as usize), color, th);
         div()
             .id("threads-drawer")
             .occlude()
@@ -499,7 +583,7 @@ impl ThreadsView {
             .shadow(th.card_shadow())
             .border_1()
             .border_color(th.glass_rim)
-            .child(drawer_head(t, now, th, close, self.tabs(th, cx), cx))
+            .child(drawer_head(t, now, th, close, self.tabs(th, cx), face))
             .child(scroll)
             .children(composer)
             .into_any_element()
@@ -695,7 +779,7 @@ fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, cx: &App) -> AnyElement {
+fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, face: AnyElement) -> AnyElement {
     let st = task_status(&t.task.status, th);
     let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
     let top = div()
@@ -710,8 +794,7 @@ fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyEle
     let meta = div().flex().items_center().gap(px(8.)).child(tag(st, state_word(&t.task.status))).children(model).child(time);
     let sub = div().text_size(px(12.5)).text_color(th.muted).child(t.task.title.clone());
     let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub);
-    let color = th.client_color(t.task.client_id);
-    let state = div().flex().items_center().gap(px(12.)).mt(px(16.)).child(avatar(color, st.base, px(58.), cx)).child(info);
+    let state = div().flex().items_center().gap(px(12.)).mt(px(16.)).child(face).child(info);
     div()
         .flex()
         .flex_col()
@@ -950,11 +1033,35 @@ fn team_line(team: &[String], th: &Theme) -> Option<Div> {
     (!team.is_empty()).then(|| div().truncate().text_size(px(11.)).text_color(th.muted).child(text))
 }
 
-fn row_title(id: i64, title: String, skill: Option<&str>, live: bool, th: &Theme) -> Div {
+fn row_title(title: String, skill: Option<&str>, th: &Theme) -> Div {
     let text = div().flex_1().min_w_0().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
-    let dot = live.then(|| pulse_dot(("thread-live-dot", id as usize), th));
     let skill = skill.map(|s| tag(&th.think, s).flex_none());
-    div().flex().items_center().gap(px(6.)).child(text).children(skill).children(dot)
+    div().flex().items_center().gap(px(6.)).child(text).children(skill)
+}
+
+/// Drawer slide and scrim fade, in milliseconds.
+const DRAWER_MS: u64 = 440;
+const SCRIM_MS: u64 = 320;
+/// Band change: out of the old column, then a spring into the new one.
+const LEAVE_MS: u64 = 300;
+const ARRIVE_MS: u64 = 620;
+
+/// Spring in from the left after the old column's 300 ms exit.
+fn arrive(row: AnyElement, id: (&'static str, usize)) -> impl IntoElement {
+    let total = LEAVE_MS + ARRIVE_MS;
+    div().child(row).with_animation(id, motion::once(total), move |el, d| {
+        let p = delayed(d, total, LEAVE_MS, ARRIVE_MS);
+        el.relative().left(px(-24. * (1. - spring(p)))).opacity(p)
+    })
+}
+
+/// Slide 24 px right and fade out over 300 ms.
+fn leave(row: AnyElement, id: (&'static str, usize)) -> AnyElement {
+    let anim = div().child(row).with_animation(id, motion::once(LEAVE_MS), |el, d| {
+        let e = ease(d);
+        el.relative().left(px(24. * e)).opacity(1. - e)
+    });
+    anim.into_any_element()
 }
 
 /// Sub-line text for a live task: "Running cargo test...".
@@ -1031,13 +1138,15 @@ impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let threads = threads_of(self.store.read(cx));
+        self.track_moves(&threads);
         let now = now_secs();
         let in_col = |c: Col| threads.iter().filter(|t| col_of(&t.task.status) == Some(c)).collect::<Vec<_>>();
         let doing_ids: Vec<i64> = in_col(Col::Doing).iter().map(|t| t.task.id).collect();
         let doing = busy_count(&doing_ids, &self.store.read(cx).live);
         let waiting = in_col(Col::Needs).len();
         let cols = [Col::Needs, Col::Standing, Col::Doing, Col::Landed];
-        let columns: Vec<AnyElement> = cols.map(|c| self.column(c, &in_col(c), now, &th, cx)).into();
+        let columns: Vec<AnyElement> = cols.map(|c| self.column(c, &in_col(c), &threads, now, &th, cx)).into();
+        self.seen.extend(threads.iter().map(|t| t.task.id));
         let board = div().id("threads-board").flex().flex_1().min_h_0().gap(px(12.)).mr(px(40.)).mb(px(28.)).children(columns);
         let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
         let overlay = open.map(|t| self.overlay(&t, now, &th, cx));
@@ -1054,6 +1163,14 @@ impl Render for ThreadsView {
     }
 }
 
+/// How far the drawer travels when it slides; covers its 620 px max width plus gap.
+const DRAWER_TRAVEL: f32 = 660.;
+
+/// Eased visibility of the drawer: rising when opening, falling when closing.
+fn shown(closing: bool, d: f32) -> f32 {
+    if closing { 1. - ease(d) } else { ease(d) }
+}
+
 impl ThreadsView {
     fn overlay(&mut self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let scrim = div()
@@ -1066,7 +1183,16 @@ impl ThreadsView {
             .bg(gpui::black().opacity(0.3))
             .on_click(cx.listener(|this, _, _, cx| this.close(cx)));
         let drawer = self.drawer(t, now, th, cx);
-        div().id("threads-overlay").absolute().top_0().left_0().right_0().bottom_0().child(scrim).child(drawer).into_any_element()
+        let out = self.closing;
+        let scrim = scrim.with_animation(("threads-scrim-fade", out as usize), motion::once(SCRIM_MS), move |el, d| {
+            el.opacity(shown(out, d))
+        });
+        let slide = div().absolute().top_0().bottom_0().left_0().right_0().child(drawer);
+        let slide = slide.with_animation(("threads-drawer-slide", out as usize), motion::once(DRAWER_MS), move |el, d| {
+            let off = DRAWER_TRAVEL * (1. - shown(out, d));
+            el.left(px(off)).right(px(-off))
+        });
+        div().id("threads-overlay").absolute().top_0().left_0().right_0().bottom_0().child(scrim).child(slide).into_any_element()
     }
 }
 

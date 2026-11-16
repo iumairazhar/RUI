@@ -3,17 +3,20 @@
 pub mod activity;
 pub mod apps;
 pub mod board;
+pub mod character;
 pub mod chat;
 pub mod live;
 pub mod markdown;
+pub mod motion;
 pub mod questions;
 pub mod seat;
 pub mod skills;
+pub mod toast;
 pub mod trace;
 
 use crate::theme::{Status, Theme, theme};
 use gpui::{
-    AnyElement, App, Div, FontWeight, Hsla, Pixels, SharedString, Stateful, div, prelude::*, px,
+    AnyElement, App, Div, FontWeight, SharedString, Stateful, div, prelude::*, px,
     svg,
 };
 use rui_core::TaskStatus;
@@ -55,34 +58,6 @@ pub fn tag(status: &Status, text: &str) -> Div {
 pub fn card(cx: &App) -> Div {
     let th = theme(cx);
     div().bg(th.surface).rounded(px(9.)).py(px(9.)).px(px(10.)).shadow(th.card_shadow())
-}
-
-fn abs_box(x: f32, y: f32, w: f32, h: f32, r: f32, s: f32, color: Hsla) -> Div {
-    div()
-        .absolute()
-        .left(px(x * s))
-        .top(px(y * s))
-        .w(px(w * s))
-        .h(px(h * s))
-        .rounded(px(r * s))
-        .bg(color)
-}
-
-/// Little robot avatar drawn from divs, scaled from a 56 unit box.
-pub fn avatar(color: Hsla, bulb: Hsla, size: Pixels, cx: &App) -> Div {
-    let th = theme(cx);
-    let s = f32::from(size) / 56.;
-    let eye = |x: f32| abs_box(x - 2.8, 26.4 - 2.8, 5.6, 5.6, 2.8, s, th.fg);
-    div()
-        .relative()
-        .size(size)
-        .flex_none()
-        .child(abs_box(28. - 1., 9.6, 2., 6.4, 0., s, color))
-        .child(abs_box(10., 15., 36., 31., 12., s, color))
-        .child(abs_box(15.5, 19.5, 25., 17., 8.5, s, th.stage))
-        .child(eye(23.))
-        .child(eye(33.))
-        .child(abs_box(28. - 3.1, 7. - 3.1, 6.2, 6.2, 3.1, s, bulb))
 }
 
 /// Filled green action button.

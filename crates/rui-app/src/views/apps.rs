@@ -1,6 +1,7 @@
 //! Apps: what each project's team has running, with links and logs.
 
 use super::activity::{chevron, mono_block, text_lines};
+use super::motion;
 use super::{card, chip, page_head};
 use crate::api::AppInfo;
 use crate::store::{self, Store};
@@ -146,7 +147,9 @@ impl Render for AppsView {
         let mut base = 0;
         let mut cards: Vec<AnyElement> = Vec::new();
         for (gi, (project, list)) in by_project(&apps).iter().enumerate() {
-            cards.push(self.project_card(gi, project, list, base, &th, cx));
+            let card = self.project_card(gi, project, list, base, &th, cx);
+            let id = gpui::SharedString::from(format!("apps-rise-{project}"));
+            cards.push(motion::rise(div().child(card), id, gi).into_any_element());
             base += list.len();
         }
         let empty = apps.is_empty().then(|| div().id("apps-empty").text_size(px(13.)).text_color(th.muted).max_w(px(520.)).child(EMPTY));

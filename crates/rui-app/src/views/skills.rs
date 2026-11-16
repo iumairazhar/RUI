@@ -1,6 +1,7 @@
 //! Skills: read-only list of SKILL.md files with a detail drawer.
 
 use super::activity::{MONO, icon, muted_status, section};
+use super::motion;
 use super::{markdown, page_head, tag};
 use crate::api::SkillInfo;
 use crate::store::{self, Store};
@@ -171,7 +172,8 @@ impl Render for SkillsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let skills = self.store.read(cx).skills.clone();
-        let rows: Vec<AnyElement> = skills.iter().enumerate().map(|(i, s)| self.row(i, s, &th, cx)).collect();
+        let rise = |i: usize, row: AnyElement| motion::rise(div().child(row), ("skills-rise", i), i).into_any_element();
+        let rows: Vec<AnyElement> = skills.iter().enumerate().map(|(i, s)| rise(i, self.row(i, s, &th, cx))).collect();
         let open = self.open.as_ref().and_then(|n| skills.iter().find(|s| &s.name == n));
         let overlay = open.map(|s| self.drawer(s, &th, cx));
         let list = div().id("skills-list").flex().flex_col().gap(px(6.)).children(rows);
