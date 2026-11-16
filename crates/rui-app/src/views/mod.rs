@@ -135,16 +135,10 @@ pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, ans
     let th = theme(cx);
     let head = div()
         .flex()
-        .items_center()
+        .items_start()
         .gap(px(8.))
         .child(svg().path("icons/hand.svg").size(px(15.)).text_color(th.wait.fg))
-        .child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(th.wait.fg)
-                .child(text.to_string()),
-        );
+        .child(div().flex_1().child(markdown::render(text, th.wait.fg, 13., th)));
     let row = match why {
         Some(why) => div().flex().flex_col().gap(px(8.)).child(input).child(why).child(div().flex().child(answer_btn)),
         None => div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn),

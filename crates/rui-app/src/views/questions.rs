@@ -173,7 +173,7 @@ fn answered_card(q: &Question, cx: &App) -> impl IntoElement {
         .flex_col()
         .gap(px(4.))
         .max_w(px(660.))
-        .child(div().text_size(px(12.5)).text_color(th.fg_2).child(q.text.clone()))
+        .child(super::markdown::render(&q.text, th.fg_2, 12.5, th))
         .child(div().text_size(px(12.)).text_color(th.accent_text).child(format!("\u{2192} {answer}")))
 }
 
