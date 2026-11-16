@@ -4,7 +4,8 @@ use super::live::live_action;
 use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files, trace};
 use super::character::{char_state, character};
 use super::motion::{self, delayed, ease, spring};
-use super::{chip, markdown, page_head, primary_button, tag, task_status};
+use super::roster::{Dot, Loops, member_name, pod_line, role_code};
+use super::{chip, markdown, page_head, primary_button, role_chip, tag, task_status};
 use crate::api::{Change, LiveSnapshot, LiveState};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
@@ -152,11 +153,13 @@ pub fn col_of(s: &TaskStatus) -> Option<Col> {
     }
 }
 
-fn state_word(s: &TaskStatus) -> &'static str {
+/// State word for a task; a member waiting on an answer only "Needs you" when the owner must answer.
+fn state_word(s: &TaskStatus, owner_asked: bool) -> &'static str {
     match s {
         TaskStatus::Clarifying => "Thinking",
         TaskStatus::InProgress => "In the loop",
         TaskStatus::New | TaskStatus::Open => "Waiting",
+        TaskStatus::WaitingAnswer if !owner_asked => "Waiting",
         TaskStatus::WaitingAnswer | TaskStatus::Stuck => "Needs you",
         TaskStatus::Done => "Landed",
         TaskStatus::Split => "Split",
@@ -185,7 +188,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Unix seconds from "YYYY-MM-DD HH:MM:SS" or ISO "YYYY-MM-DDTHH:MM:SS...".
-fn parse_secs(s: &str) -> Option<i64> {
+pub(super) fn parse_secs(s: &str) -> Option<i64> {
     let n = |a: usize, b: usize| -> Option<i64> { s.get(a..b)?.parse().ok() };
     let days = days_from_civil(n(0, 4)?, n(5, 7)?, n(8, 10)?);
     Some(days * 86_400 + n(11, 13)? * 3600 + n(14, 16)? * 60 + n(17, 19).unwrap_or(0))
@@ -216,6 +219,14 @@ struct Thread {
     client: String,
     model: Option<String>,
     question: Option<(i64, String)>,
+    /// "Backend Engineer 01", or "Builder 7" when the task has no agent.
+    name: String,
+    /// Two-letter role code for the chip.
+    code: String,
+    /// Pod line such as "Lead, Pod: BE FE", set on a lead parent.
+    pod_line: Option<String>,
+    /// An owner-level question is open for this task.
+    owner_asked: bool,
     /// Distinct skills of child tasks, in child id order.
     team: Vec<String>,
 }
@@ -236,19 +247,24 @@ fn team_of(tasks: &[Task], parent: i64) -> Vec<String> {
 fn threads_of(s: &Store) -> Vec<Thread> {
     let open_q = |id: i64| {
         let q = s.questions.iter().find(|q| q.task_id == id && q.status == QuestionStatus::Open);
-        q.map(|q| (q.id, q.text.clone()))
+        q.map(|q| (q.id, q.text.clone(), q.level == "owner"))
     };
-    s.tasks
-        .iter()
-        .filter(|t| col_of(&t.status).is_some())
-        .map(|t| Thread {
-            task: t.clone(),
-            client: s.clients.iter().find(|c| c.id == t.client_id).map_or(String::new(), |c| c.name.clone()),
-            model: s.runs.get(&t.id).and_then(|r| r.model.clone()),
-            question: open_q(t.id),
-            team: team_of(&s.tasks, t.id),
-        })
-        .collect()
+    s.tasks.iter().filter(|t| col_of(&t.status).is_some()).map(|t| thread_of(s, t, open_q(t.id))).collect()
+}
+
+fn thread_of(s: &Store, t: &Task, question: Option<(i64, String, bool)>) -> Thread {
+    let agent = t.agent.as_deref().unwrap_or("builder");
+    Thread {
+        task: t.clone(),
+        client: s.clients.iter().find(|c| c.id == t.client_id).map_or(String::new(), |c| c.name.clone()),
+        model: s.runs.get(&t.id).and_then(|r| r.model.clone()),
+        owner_asked: question.as_ref().is_some_and(|q| q.2),
+        question: question.map(|q| (q.0, q.1)),
+        name: member_name(t, &s.tasks, &s.roles).unwrap_or_else(|| label(t)),
+        code: role_code(&s.roles, agent),
+        pod_line: pod_line(t, &s.roles),
+        team: team_of(&s.tasks, t.id),
+    }
 }
 
 /// Tab of the drawer.
@@ -417,7 +433,7 @@ impl ThreadsView {
         let qid = open_q.map(|q| q.id);
         self.input.update(cx, |i, cx| i.clear(cx));
         self.store.update(cx, |s, cx| match qid {
-            Some(q) => s.answer(q, text, cx),
+            Some(q) => s.answer(q, text, None, cx),
             None => s.instruct_task(id, text, cx),
         });
     }
@@ -439,10 +455,10 @@ impl ThreadsView {
         let id = t.task.id;
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
-        let title = format!("{} \u{b7} {}", label(&t.task), t.task.title);
+        let title = t.pod_line.clone().unwrap_or_else(|| format!("{} \u{b7} {}", t.name, t.task.title));
         let live = self.store.read(cx).live.task(id).cloned();
         let state = char_state(&t.task.status, live.as_ref());
-        let word = live.as_ref().map_or_else(|| state_word(&t.task.status).to_string(), live_sub);
+        let word = live.as_ref().map_or_else(|| state_word(&t.task.status, t.owner_asked).to_string(), live_sub);
         let parts = [t.client.clone(), word, elapsed(&t.task.updated_at, now)];
         let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
         let text = div()
@@ -450,8 +466,10 @@ impl ThreadsView {
             .flex_col()
             .flex_1()
             .min_w_0()
-            .child(row_title(title, t.task.skill.as_deref(), th))
-            .child(div().truncate().text_size(px(11.)).text_color(th.muted).child(sub))
+            .child(row_title(title, role_chip(&t.code, 18., color), t.task.skill.as_deref(), th))
+            .children(t.pod_line.as_ref().map(|_| muted_line(t.task.title.clone(), th)))
+            .child(muted_line(sub, th))
+            .child(div().mt(px(3.)).child(loops_line(loops_of(&t.task), 5., 10., th)))
             .children(team_line(&t.team, th));
         let hover = th.surface_2;
         let row = div()
@@ -559,7 +577,11 @@ impl ThreadsView {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .flex()
+            .flex_col()
+            .gap(px(20.))
             .p(px(20.))
+            .child(effort_section(&t.task, th))
             .child(body);
         let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
         let close = self.close_button(th, cx);
@@ -758,7 +780,7 @@ fn composer_hint(t: &Thread, th: &Theme) -> Div {
         Some(Col::Doing) => "It folds this into the work it is already doing.",
         _ => "It is holding its context, so it picks up where it stopped.",
     };
-    let text = format!("Goes straight to {}. {tail}", label(&t.task));
+    let text = format!("Goes straight to {}. {tail}", t.name);
     div().mt(px(-2.)).text_size(px(11.)).text_color(th.muted).child(text)
 }
 
@@ -781,6 +803,7 @@ fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
 
 fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, face: AnyElement) -> AnyElement {
     let st = task_status(&t.task.status, th);
+    let color = th.client_color(t.task.client_id);
     let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
     let top = div()
         .flex()
@@ -788,12 +811,14 @@ fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyEle
         .justify_between()
         .child(div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child(eyebrow))
         .child(close);
-    let title = div().text_size(px(23.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(label(&t.task));
+    let name = div().text_size(px(23.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(t.name.clone());
+    let title = div().flex().items_center().gap(px(10.)).child(role_chip(&t.code, 26., color)).child(name);
     let model = t.model.clone().map(|m| mono(11., th.muted, m));
     let time = mono(10.5, th.muted, elapsed(&t.task.updated_at, now));
-    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, state_word(&t.task.status))).children(model).child(time);
+    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, state_word(&t.task.status, t.owner_asked))).children(model).child(time);
     let sub = div().text_size(px(12.5)).text_color(th.muted).child(t.task.title.clone());
-    let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub);
+    let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
+    let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub).children(pod);
     let state = div().flex().items_center().gap(px(12.)).mt(px(16.)).child(face).child(info);
     div()
         .flex()
@@ -1033,17 +1058,59 @@ fn team_line(team: &[String], th: &Theme) -> Option<Div> {
     (!team.is_empty()).then(|| div().truncate().text_size(px(11.)).text_color(th.muted).child(text))
 }
 
-fn row_title(title: String, skill: Option<&str>, th: &Theme) -> Div {
+fn row_title(title: String, chip: Div, skill: Option<&str>, th: &Theme) -> Div {
     let text = div().flex_1().min_w_0().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
     let skill = skill.map(|s| tag(&th.think, s).flex_none());
-    div().flex().items_center().gap(px(6.)).child(text).children(skill)
+    div().flex().items_center().gap(px(6.)).child(chip).child(text).children(skill)
+}
+
+fn muted_line(text: String, th: &Theme) -> Div {
+    div().truncate().text_size(px(11.)).text_color(th.muted).child(text)
+}
+
+fn loops_of(t: &Task) -> Loops {
+    Loops { used: t.loops_used, max: t.max_loops }
+}
+
+/// Loop dots: off is a faint tile, used are the accent, past the limit the block color.
+fn loop_dots(loops: Loops, size: f32, th: &Theme) -> Div {
+    let color = |d: Dot| match d {
+        Dot::Off => th.fg.opacity(0.12),
+        Dot::On => th.accent_text,
+        Dot::Over => th.block.base,
+    };
+    let dots = loops.dots().into_iter().map(|d| div().flex_none().size(px(size)).rounded(px(size * 2. / 7.)).bg(color(d)));
+    div().flex().items_center().gap(px(size * 3. / 7.)).children(dots)
+}
+
+/// Dots, "n/max" and a red "Over" tag once past the limit.
+fn loops_line(loops: Loops, dot: f32, text: f32, th: &Theme) -> Div {
+    let num_color = if loops.over() { th.block.fg } else { th.muted };
+    let over = loops.over().then(|| tag(&th.block, "Over"));
+    let line = div().flex().items_center().gap(px(7.)).child(loop_dots(loops, dot, th));
+    line.child(mono(text, num_color, loops.text())).children(over)
+}
+
+/// "Effort" section of the drawer: what loops are for, and how many this task has used.
+fn effort_section(task: &Task, th: &Theme) -> AnyElement {
+    let loops = loops_of(task);
+    let copy = match loops.over() {
+        true => format!("Past the limit of {}. It escalates to its Lead rather than looping again.", task.max_loops),
+        false => format!("A task escalates to its Lead rather than looping past {}.", task.max_loops),
+    };
+    let tone = if loops.over() { th.wait.fg } else { th.muted };
+    let name = div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Loops used");
+    let text = div().text_size(px(11.5)).text_color(tone).child(copy);
+    let left = div().flex().flex_col().flex_1().min_w_0().gap(px(2.)).child(name).child(text);
+    let row = div().id("drawer-effort").flex().items_center().gap(px(12.)).child(left).child(loops_line(loops, 7., 12., th));
+    section("Effort", vec![row.into_any_element()])
 }
 
 /// Drawer slide and scrim fade, in milliseconds.
 const DRAWER_MS: u64 = 440;
 const SCRIM_MS: u64 = 320;
 /// Band change: out of the old column, then a spring into the new one.
-const LEAVE_MS: u64 = 300;
+pub(super) const LEAVE_MS: u64 = 300;
 const ARRIVE_MS: u64 = 620;
 
 /// Spring in from the left after the old column's 300 ms exit.
@@ -1056,7 +1123,7 @@ fn arrive(row: AnyElement, id: (&'static str, usize)) -> impl IntoElement {
 }
 
 /// Slide 24 px right and fade out over 300 ms.
-fn leave(row: AnyElement, id: (&'static str, usize)) -> AnyElement {
+pub(super) fn leave(row: AnyElement, id: (&'static str, usize)) -> AnyElement {
     let anim = div().child(row).with_animation(id, motion::once(LEAVE_MS), |el, d| {
         let e = ease(d);
         el.relative().left(px(24. * e)).opacity(1. - e)
@@ -1311,6 +1378,17 @@ mod tests {
         ];
         assert_eq!(team_of(&tasks, 1), ["fastapi", "tester"]);
         assert!(team_of(&tasks, 2).is_empty());
+    }
+
+    #[test]
+    fn state_words() {
+        assert_eq!(state_word(&TaskStatus::WaitingAnswer, true), "Needs you");
+        assert_eq!(state_word(&TaskStatus::WaitingAnswer, false), "Waiting");
+        assert_eq!(state_word(&TaskStatus::Stuck, false), "Needs you");
+        assert_eq!(state_word(&TaskStatus::Open, true), "Waiting");
+        assert_eq!(state_word(&TaskStatus::Clarifying, false), "Thinking");
+        assert_eq!(state_word(&TaskStatus::InProgress, false), "In the loop");
+        assert_eq!(state_word(&TaskStatus::Done, false), "Landed");
     }
 
     #[test]

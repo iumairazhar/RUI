@@ -25,12 +25,14 @@ use views::{
     questions::QuestionsView,
     seat::{SeatView, seat_label},
     skills::SkillsView,
+    team::TeamView,
 };
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
     Rui,
     Threads,
+    Team,
     Apps,
     Inbox,
     Work,
@@ -39,8 +41,8 @@ enum Nav {
 }
 
 impl Nav {
-    const ALL: [Nav; 7] =
-        [Nav::Rui, Nav::Threads, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
+    const ALL: [Nav; 8] =
+        [Nav::Rui, Nav::Threads, Nav::Team, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
 
     fn index(self) -> usize {
         Nav::ALL.iter().position(|n| *n == self).unwrap_or(0)
@@ -50,6 +52,7 @@ impl Nav {
         match self {
             Nav::Rui => "Rui",
             Nav::Threads => "Threads",
+            Nav::Team => "Team",
             Nav::Apps => "Apps",
             Nav::Inbox => "Inbox",
             Nav::Work => "Work",
@@ -62,6 +65,7 @@ impl Nav {
         match self {
             Nav::Rui => "icons/rui.svg",
             Nav::Threads => "icons/threads.svg",
+            Nav::Team => "icons/team.svg",
             Nav::Apps => "icons/apps.svg",
             Nav::Inbox => "icons/inbox.svg",
             Nav::Work => "icons/work.svg",
@@ -103,6 +107,7 @@ struct Root {
     board: Entity<BoardView>,
     questions: Entity<QuestionsView>,
     activity: Entity<ThreadsView>,
+    team: Entity<TeamView>,
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
@@ -117,7 +122,13 @@ impl Root {
         })
         .detach();
         let store = cx.new(Store::new);
-        store::observe(&store, cx);
+        cx.observe(&store, |this, store, cx| {
+            if store.update(cx, |s, _| std::mem::take(&mut s.open_threads)) {
+                this.select(Nav::Threads, cx);
+            }
+            cx.notify();
+        })
+        .detach();
         Self {
             nav: Nav::Rui,
             pill_from: Nav::Rui,
@@ -126,6 +137,7 @@ impl Root {
             board: cx.new(|cx| BoardView::new(store.clone(), cx)),
             questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
             activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
+            team: cx.new(|cx| TeamView::new(store.clone(), cx)),
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
@@ -137,6 +149,7 @@ impl Root {
         let page = match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
             Nav::Threads => self.activity.clone().into_any_element(),
+            Nav::Team => self.team.clone().into_any_element(),
             Nav::Apps => self.apps.clone().into_any_element(),
             Nav::Inbox => self.questions.clone().into_any_element(),
             Nav::Work => self.board.clone().into_any_element(),

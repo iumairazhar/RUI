@@ -1,6 +1,6 @@
 //! Shared app state, refreshed from the daemon once a second.
 
-use crate::api::{self, AppInfo, Change, LiveSnapshot, SkillInfo};
+use crate::api::{self, AppInfo, Change, LiveSnapshot, RoleInfo, SkillInfo};
 use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity};
 use rui_core::{Chat, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
@@ -49,6 +49,10 @@ pub struct Store {
     pub apps: Vec<AppInfo>,
     /// Skills from the daemon; loaded at start and on refresh.
     pub skills: Vec<SkillInfo>,
+    /// Agent roles from the daemon; loaded with the skills.
+    pub roles: Vec<RoleInfo>,
+    /// Set by a chat card to ask the root to switch to Threads; the root clears it.
+    pub open_threads: bool,
     /// Toast confirming the last owner action; hides after a few seconds.
     pub toast: Option<Toast>,
     /// Task whose changes and events are reloaded on every poll.
@@ -147,6 +151,8 @@ impl Store {
             live: LiveSnapshot::default(),
             apps: vec![],
             skills: vec![],
+            roles: vec![],
+            open_threads: false,
             toast: None,
             watched: None,
         }
@@ -173,19 +179,25 @@ impl Store {
         .detach();
     }
 
-    /// Fetch the skills in the background; keep the old list on error.
+    /// Fetch the skills and roles in the background; keep the old lists on error.
     fn load_skills(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { api::get_skills() }).await;
+            let fetch = async move { (api::get_skills(), api::get_roles()) };
+            let (skills, roles) = cx.background_executor().spawn(fetch).await;
             this.update(cx, |s, cx| {
-                if let Ok(list) = res {
-                    s.skills = list;
-                    cx.notify();
-                }
+                s.skills = skills.unwrap_or_else(|_| std::mem::take(&mut s.skills));
+                s.roles = roles.unwrap_or_else(|_| std::mem::take(&mut s.roles));
+                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Ask the root to switch to the Threads page.
+    pub fn go_to_threads(&mut self, cx: &mut Context<Self>) {
+        self.open_threads = true;
+        cx.notify();
     }
 
     /// Reload the skills (manual refresh).
@@ -395,16 +407,31 @@ impl Store {
         .detach();
     }
 
-    /// Answer a question, then refresh.
-    pub fn answer(&mut self, question_id: i64, text: String, cx: &mut Context<Self>) {
+    /// Answer a question (with the owner's reason, if any), then refresh.
+    /// On success a toast says who picks it up; a failure (such as 409) lands in `action_error`.
+    pub fn answer(&mut self, question_id: i64, text: String, why: Option<String>, cx: &mut Context<Self>) {
+        let who = self.questions.iter().find(|q| q.id == question_id).map(pickup_who).unwrap_or_default();
         cx.spawn(async move |this, cx| {
-            let task = cx
-                .background_executor()
-                .spawn(async move { api::post_answer(question_id, &text) });
-            let _ = task.await;
-            this.update(cx, |s, cx| s.refresh(cx)).ok();
+            let call = async move { api::post_answer(question_id, &text, why.as_deref()) };
+            let res = cx.background_executor().spawn(call).await;
+            this.update(cx, |s, cx| {
+                s.action_error = res.as_ref().err().map(|e| format!("Request failed: {e}"));
+                if res.is_ok() {
+                    s.show_toast(&format!("Sent down \u{b7} {who} picks it up now"), vec![], cx);
+                }
+                s.refresh(cx);
+            })
+            .ok();
         })
         .detach();
+    }
+}
+
+/// Who picks an answer up: the member that first passed the question up.
+pub fn pickup_who(q: &Question) -> String {
+    match q.ladder.first() {
+        Some(rung) => rung.who.clone(),
+        None => q.asked_by.as_str().to_string(),
     }
 }
 
@@ -416,4 +443,22 @@ fn file_text(res: anyhow::Result<api::TaskFile>) -> Result<String, String> {
 /// Re-render `view` whenever the store changes.
 pub fn observe<V: 'static>(store: &Entity<Store>, cx: &mut Context<V>) {
     cx.observe(store, |_, _, cx| cx.notify()).detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn question(ladder: serde_json::Value) -> Question {
+        serde_json::from_value(serde_json::json!({"id":1,"task_id":2,"asked_by":"builder","text":"q",
+            "answer":null,"status":"open","created_at":"a","ladder":ladder}))
+        .unwrap()
+    }
+
+    #[test]
+    fn pickup_is_first_rung_or_asker() {
+        let q = question(serde_json::json!([{"who":"Backend Engineer 7","why":"db?"},{"who":"Lead","why":"x"}]));
+        assert_eq!(pickup_who(&q), "Backend Engineer 7");
+        assert_eq!(pickup_who(&question(serde_json::json!([]))), "builder");
+    }
 }

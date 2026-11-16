@@ -2,8 +2,9 @@
 
 use super::activity::{MONO, icon, muted_status, section};
 use super::motion;
+use super::roster::{source_text, used_by};
 use super::{markdown, page_head, tag};
-use crate::api::SkillInfo;
+use crate::api::{RoleInfo, SkillInfo};
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, Window, div, prelude::*, px, relative};
@@ -11,6 +12,8 @@ use gpui::{AnyElement, Context, Div, Entity, FontWeight, Stateful, Window, div, 
 const NOTE: &str = "Edit these files in ~/Library/Application Support/RUI/skills. Editing in the app comes later.";
 const SKILL_W: f32 = 260.;
 const RUN_W: f32 = 200.;
+const USED_W: f32 = 170.;
+const SRC_W: f32 = 170.;
 
 /// Skills page: a table of skills and a drawer for the open one.
 pub struct SkillsView {
@@ -21,6 +24,12 @@ pub struct SkillsView {
 /// Bash patterns joined with " · ".
 fn commands_text(skill: &SkillInfo) -> String {
     skill.bash.join(" \u{b7} ")
+}
+
+/// Role titles that use a skill, joined with ", "; a dash when none do.
+fn used_by_text(roles: &[RoleInfo], skill: &str) -> String {
+    let titles = used_by(roles, skill);
+    if titles.is_empty() { "\u{2014}".into() } else { titles.join(", ") }
 }
 
 fn mono_cell(text: String, width: Option<f32>, th: &Theme) -> Div {
@@ -47,7 +56,9 @@ fn table_head(th: &Theme) -> Stateful<Div> {
         .px(px(14.))
         .pb(px(8.))
         .child(head_cell("Skill", Some(SKILL_W), th))
+        .child(head_cell("Used by", Some(USED_W), th))
         .child(head_cell("Commands", None, th))
+        .child(head_cell("Source", Some(SRC_W), th))
         .child(head_cell("Run", Some(RUN_W), th))
 }
 
@@ -69,7 +80,7 @@ impl SkillsView {
         cx.notify();
     }
 
-    fn row(&self, i: usize, skill: &SkillInfo, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn row(&self, i: usize, skill: &SkillInfo, roles: &[RoleInfo], th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let name = skill.name.clone();
         let run = skill.run_hint.clone().unwrap_or_else(|| "\u{2014}".into());
         let hover = th.surface_2;
@@ -86,7 +97,9 @@ impl SkillsView {
             .hover(move |s| s.bg(hover))
             .on_click(cx.listener(move |this, _, _, cx| this.set_open(Some(name.clone()), cx)))
             .child(name_cell(skill, th))
+            .child(mono_cell(used_by_text(roles, &skill.name), Some(USED_W), th))
             .child(mono_cell(commands_text(skill), None, th))
+            .child(mono_cell(source_text(skill), Some(SRC_W), th))
             .child(mono_cell(run, Some(RUN_W), th))
             .into_any_element()
     }
@@ -171,9 +184,12 @@ impl SkillsView {
 impl Render for SkillsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let skills = self.store.read(cx).skills.clone();
+        let (skills, roles) = {
+            let s = self.store.read(cx);
+            (s.skills.clone(), s.roles.clone())
+        };
         let rise = |i: usize, row: AnyElement| motion::rise(div().child(row), ("skills-rise", i), i).into_any_element();
-        let rows: Vec<AnyElement> = skills.iter().enumerate().map(|(i, s)| rise(i, self.row(i, s, &th, cx))).collect();
+        let rows: Vec<AnyElement> = skills.iter().enumerate().map(|(i, s)| rise(i, self.row(i, s, &roles, &th, cx))).collect();
         let open = self.open.as_ref().and_then(|n| skills.iter().find(|s| &s.name == n));
         let overlay = open.map(|s| self.drawer(s, &th, cx));
         let list = div().id("skills-list").flex().flex_col().gap(px(6.)).children(rows);
@@ -200,7 +216,7 @@ mod tests {
 
     #[test]
     fn commands_join_with_dot() {
-        let s = SkillInfo { name: "x".into(), description: "d".into(), bash: vec!["uv *".into(), "pytest *".into()], run_hint: None, body: "b".into() };
+        let s = SkillInfo { name: "x".into(), description: "d".into(), bash: vec!["uv *".into(), "pytest *".into()], run_hint: None, license: None, source: None, body: "b".into() };
         assert_eq!(commands_text(&s), "uv * \u{b7} pytest *");
     }
 }

@@ -9,14 +9,16 @@ pub mod live;
 pub mod markdown;
 pub mod motion;
 pub mod questions;
+pub mod roster;
 pub mod seat;
 pub mod skills;
+pub mod team;
 pub mod toast;
 pub mod trace;
 
 use crate::theme::{Status, Theme, theme};
 use gpui::{
-    AnyElement, App, Div, FontWeight, SharedString, Stateful, div, prelude::*, px,
+    AnyElement, App, Div, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
     svg,
 };
 use rui_core::TaskStatus;
@@ -52,6 +54,23 @@ pub fn tag(status: &Status, text: &str) -> Div {
         .border_1()
         .border_color(status.rim)
         .child(text.to_string())
+}
+
+/// Square role chip with the two-letter code on the client's color (mock `.ag-code`).
+pub fn role_chip(code: &str, size: f32, color: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded(px(size * 0.29))
+        .bg(color)
+        .text_color(gpui::white())
+        .font_family("Menlo")
+        .text_size(px(size * 0.375))
+        .font_weight(FontWeight::BOLD)
+        .child(code.to_string())
 }
 
 /// Raised surface card.
@@ -111,8 +130,8 @@ pub fn task_status<'a>(t: &TaskStatus, th: &'a Theme) -> &'a Status {
     }
 }
 
-/// Amber card holding a question, an answer input and its button.
-pub fn question_card(text: &str, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
+/// Amber card holding a question, an optional "why" input, an answer input and its button.
+pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
     let th = theme(cx);
     let head = div()
         .flex()
@@ -126,7 +145,10 @@ pub fn question_card(text: &str, input: AnyElement, answer_btn: AnyElement, cx: 
                 .text_color(th.wait.fg)
                 .child(text.to_string()),
         );
-    let row = div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn);
+    let row = match why {
+        Some(why) => div().flex().flex_col().gap(px(8.)).child(input).child(why).child(div().flex().child(answer_btn)),
+        None => div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn),
+    };
     div()
         .flex()
         .flex_col()

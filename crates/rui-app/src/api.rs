@@ -184,7 +184,26 @@ pub struct SkillInfo {
     pub bash: Vec<String>,
     #[serde(default)]
     pub run_hint: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
     pub body: String,
+}
+
+/// One agent role from the roster.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RoleInfo {
+    pub name: String,
+    pub code: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub max_loops: i64,
 }
 
 /// Fetch all apps, sorted by project then name.
@@ -195,6 +214,11 @@ pub fn get_apps() -> Result<Vec<AppInfo>> {
 /// Fetch all skills.
 pub fn get_skills() -> Result<Vec<SkillInfo>> {
     Ok(serde_json::from_value(get("/skills")?)?)
+}
+
+/// Fetch all roles, sorted by name.
+pub fn get_roles() -> Result<Vec<RoleInfo>> {
+    Ok(serde_json::from_value(get("/roles")?)?)
 }
 
 /// Restart a project's apps.
@@ -227,10 +251,10 @@ pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
     post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))
 }
 
-/// Answer a question by id.
-pub fn post_answer(question_id: i64, answer: &str) -> Result<()> {
+/// Answer a question by id, with the owner's reason when given.
+pub fn post_answer(question_id: i64, answer: &str, why: Option<&str>) -> Result<()> {
     let path = format!("/questions/{question_id}/answer");
-    post(&path, serde_json::json!({ "answer": answer }))
+    post(&path, serde_json::json!({ "answer": answer, "why": why }))
 }
 
 #[cfg(test)]
@@ -289,7 +313,18 @@ mod tests {
         assert_eq!((v[0].port, v[0].log.len()), (8101, 1));
         let s = r#"[{"name":"x","description":"d","bash":["a *"],"run_hint":null,"body":"b"}]"#;
         let v: Vec<SkillInfo> = serde_json::from_str(s).unwrap();
-        assert_eq!((v[0].bash.len(), v[0].run_hint.clone()), (1, None));
+        assert_eq!((v[0].bash.len(), v[0].run_hint.clone(), v[0].license.clone()), (1, None, None));
+        let s = r#"[{"name":"x","description":"d","license":"MIT","source":"https://a.b/c","body":"b"}]"#;
+        let v: Vec<SkillInfo> = serde_json::from_str(s).unwrap();
+        assert_eq!((v[0].license.as_deref(), v[0].source.as_deref()), (Some("MIT"), Some("https://a.b/c")));
+    }
+
+    #[test]
+    fn parses_roles() {
+        let j = r#"[{"name":"backend","code":"BE","title":"Backend Engineer","description":"d",
+            "tools":["Read"],"skills":["fastapi"],"max_loops":6}]"#;
+        let v: Vec<RoleInfo> = serde_json::from_str(j).unwrap();
+        assert_eq!((v[0].code.as_str(), v[0].max_loops, v[0].skills.len()), ("BE", 6, 1));
     }
 
     #[test]

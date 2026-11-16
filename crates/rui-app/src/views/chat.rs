@@ -9,7 +9,10 @@ use crate::theme::{Theme, theme};
 use gpui::{
     AnyElement, Context, Entity, FontWeight, ScrollHandle, Window, div, prelude::*, px, svg,
 };
-use super::activity::summarize;
+use super::activity::{icon, parse_secs, summarize};
+use super::roster::role_title;
+use crate::api::RoleInfo;
+use serde_json::Value;
 use rui_core::{Chat, ChatMessage, ChatRole, Event, Question};
 use std::collections::HashMap;
 
@@ -61,7 +64,7 @@ impl ChatView {
             return;
         }
         input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.answer(id, text, cx));
+        self.store.update(cx, |s, cx| s.answer(id, text, None, cx));
     }
 
     fn question(&self, q: &Question, cx: &mut Context<Self>) -> AnyElement {
@@ -72,13 +75,14 @@ impl ChatView {
         };
         let btn = chip(format!("answer-{id}"), "Answer", cx)
             .on_click(cx.listener(move |this, _, _, cx| this.answer(id, cx)));
-        question_card(&q.text, input, btn.into_any_element(), cx).into_any_element()
+        question_card(&q.text, None, input, btn.into_any_element(), cx).into_any_element()
     }
 
     fn message_list(
         &mut self,
         chat: &[ChatMessage],
         questions: &[Question],
+        cards: &HashMap<i64, Vec<ActCard>>,
         live: Option<Vec<String>>,
         state: Option<&LiveState>,
         cx: &mut Context<Self>,
@@ -98,13 +102,36 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap(px(20.))
-            .children(chat.iter().map(|m| message(m, &th)))
+            .children(chat.iter().map(|m| self.message_with_cards(m, cards, &th, cx)))
             .children(working)
             .children(open);
         if chat.is_empty() && questions.is_empty() {
             list = list.child(div().text_size(px(13.)).text_color(th.muted).child("Tell Rui what to set up."));
         }
         list.into_any_element()
+    }
+
+    fn message_with_cards(&self, m: &ChatMessage, cards: &HashMap<i64, Vec<ActCard>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let acts = cards.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        if acts.is_empty() {
+            return message(m, th);
+        }
+        let els: Vec<AnyElement> = acts.iter().enumerate().map(|(k, a)| self.act_card(m.id, k, a, th, cx)).collect();
+        div().flex().flex_col().child(message(m, th)).child(div().flex().flex_col().gap(px(8.)).mt(px(8.)).children(els)).into_any_element()
+    }
+
+    fn act_card(&self, mid: i64, k: usize, a: &ActCard, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let tool = div().font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child("Set up Pod");
+        let head = div().flex().items_center().gap(px(8.)).px(px(14.)).py(px(9.)).border_b_1().border_color(th.hairline);
+        let head = head.font_family("Menlo").text_size(px(11.)).text_color(th.muted);
+        let head = head.child(icon("term", 12., th.muted)).child(tool).child("\u{b7} tool run by Rui");
+        let body = div().px(px(14.)).pt(px(10.)).text_size(px(12.5)).text_color(th.fg_2).child(a.body.clone());
+        let scope = div().px(px(14.)).text_size(px(11.5)).text_color(th.muted).child(a.scope.clone());
+        let open = chip(format!("act-open-{mid}-{k}"), "Open the result", cx).h(px(26.));
+        let open = open.on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.go_to_threads(cx))));
+        let foot = div().flex().px(px(14.)).pb(px(11.)).child(open);
+        let card = div().id(("act-card", mid as usize * 16 + k)).max_w(px(620.)).rounded(px(12.)).bg(th.well);
+        card.border_1().border_color(th.hairline).flex().flex_col().gap(px(6.)).child(head).child(body).child(scope).child(foot).into_any_element()
     }
 
     fn composer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -179,6 +206,50 @@ fn rui_message(m: &ChatMessage, th: &Theme) -> AnyElement {
         .child(markdown::render(&m.content, th.fg, 13.5, th));
     let col = div().flex().flex_col().gap(px(7.)).child(meta).child(div().flex().child(bubble));
     col.into_any_element()
+}
+
+const STAFF_TOOL: &str = "mcp__rui__staff_task";
+
+/// Text of a "Set up Pod" card: the task with its pod roles, and the project line.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ActCard {
+    pub body: String,
+    pub scope: String,
+}
+
+/// Card text from a `staff_task` input `{project?, title, brief, pod: [..]}`.
+pub(super) fn staff_card(input: &Value, roles: &[RoleInfo]) -> ActCard {
+    let title = input["title"].as_str().unwrap_or("Untitled");
+    let pod: Vec<String> = input["pod"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).map(|r| role_title(roles, r)).collect();
+    let body = if pod.is_empty() { title.to_string() } else { format!("{title} \u{2014} {}", pod.join(", ")) };
+    let scope = match input["project"].as_str().filter(|p| !p.is_empty()) {
+        Some(p) => p.to_string(),
+        None => "General task".to_string(),
+    };
+    ActCard { body, scope }
+}
+
+/// `staff_task` inputs Rui called in a chat between two moments (unix seconds, inclusive).
+fn staff_inputs(events: &[Event], chat_id: i64, from: i64, to: i64) -> Vec<Value> {
+    let in_turn = |e: &&Event| {
+        let at = parse_secs(&e.created_at).unwrap_or(i64::MIN);
+        e.agent == "rui" && e.kind == "assistant" && e.chat_id == Some(chat_id) && (from..=to).contains(&at)
+    };
+    let blocks = events.iter().filter(in_turn).flat_map(|e| e.payload["message"]["content"].as_array().cloned().unwrap_or_default());
+    blocks.filter(|b| b["type"] == "tool_use" && b["name"] == STAFF_TOOL).map(|b| b["input"].clone()).collect()
+}
+
+/// Cards per Rui message id: the staff_task calls between the previous message and that one.
+fn all_cards(chat: &[ChatMessage], events: &[Event], chat_id: i64, roles: &[RoleInfo]) -> HashMap<i64, Vec<ActCard>> {
+    let mut out = HashMap::new();
+    for (i, m) in chat.iter().enumerate().filter(|(i, m)| *i > 0 && m.role == ChatRole::Rui) {
+        let (Some(from), Some(to)) = (parse_secs(&chat[i - 1].created_at), parse_secs(&m.created_at)) else { continue };
+        let cards: Vec<ActCard> = staff_inputs(events, chat_id, from, to).iter().map(|v| staff_card(v, roles)).collect();
+        if !cards.is_empty() {
+            out.insert(m.id, cards);
+        }
+    }
+    out
 }
 
 /// Rui's steps in one chat since the owner's last message, while that message has no reply yet.
@@ -384,11 +455,12 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (chat, chats, current, questions, live, state) = {
+        let (chat, chats, current, questions, live, state, cards) = {
             let s = self.store.read(cx);
             let live = s.current_chat.and_then(|id| live_steps(&s.chat, &s.events, id));
             let state = s.current_chat.and_then(|id| s.live.chat(id)).cloned();
-            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state)
+            let cards = s.current_chat.map(|id| all_cards(&s.chat, &s.events, id, &s.roles)).unwrap_or_default();
+            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards)
         };
         self.sync_inputs(&questions, cx);
         if current != self.last_chat {
@@ -401,7 +473,7 @@ impl Render for ChatView {
             self.last_len = len;
             self.scroll.scroll_to_bottom();
         }
-        let list = self.message_list(&chat, &questions, live, state.as_ref(), cx);
+        let list = self.message_list(&chat, &questions, &cards, live, state.as_ref(), cx);
         let composer = self.composer(cx);
         let main = div()
             .id("chat-main")
@@ -454,6 +526,31 @@ mod tests {
         assert_eq!(live_steps(&waiting, &events, 3).map(|s| s.len()), Some(0));
         let answered = vec![msg(ChatRole::User, "2026-11-15T10:00:03Z"), msg(ChatRole::Rui, "2026-11-15T10:00:09Z")];
         assert_eq!(live_steps(&answered, &events, 1), None);
+    }
+
+    #[test]
+    fn staff_card_text() {
+        let role = |n: &str, t: &str| RoleInfo { name: n.into(), code: "X".into(), title: t.into(), description: String::new(), tools: vec![], skills: vec![], max_loops: 5 };
+        let roles = [role("backend", "Backend Engineer")];
+        let input = serde_json::json!({"project":"acme","title":"Add login","brief":"b","pod":["backend","tester"]});
+        let c = staff_card(&input, &roles);
+        assert_eq!((c.body.as_str(), c.scope.as_str()), ("Add login \u{2014} Backend Engineer, Tester", "acme"));
+        let general = staff_card(&serde_json::json!({"title":"T","brief":"b","pod":[]}), &roles);
+        assert_eq!((general.body.as_str(), general.scope.as_str()), ("T", "General task"));
+    }
+
+    #[test]
+    fn staff_inputs_found_in_turn_window() {
+        let ev = |at: &str, name: &str| Event {
+            id: 1, task_id: None, chat_id: Some(1), agent: "rui".into(), kind: "assistant".into(),
+            payload: serde_json::json!({"message":{"content":[{"type":"tool_use","name":name,"input":{"title":"x"}}]}}),
+            created_at: at.into(),
+        };
+        let events = vec![ev("2026-11-15T10:00:05.000Z", STAFF_TOOL), ev("2026-11-15T10:00:06.000Z", "mcp__rui__use_repo"), ev("2026-11-15T09:00:00.000Z", STAFF_TOOL)];
+        let from = parse_secs("2026-11-15 10:00:03").unwrap();
+        let to = parse_secs("2026-11-15 10:00:09").unwrap();
+        assert_eq!(staff_inputs(&events, 1, from, to).len(), 1);
+        assert_eq!(staff_inputs(&events, 2, from, to).len(), 0);
     }
 
     #[test]

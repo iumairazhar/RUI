@@ -11,6 +11,8 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/rui.svg" => include_bytes!("../assets/icons/rui.svg").as_slice(),
         "icons/threads.svg" => include_bytes!("../assets/icons/threads.svg"),
         "icons/apps.svg" => include_bytes!("../assets/icons/apps.svg"),
+        "icons/team.svg" => include_bytes!("../assets/icons/team.svg"),
+        "icons/lock.svg" => include_bytes!("../assets/icons/lock.svg"),
         "icons/skills.svg" => include_bytes!("../assets/icons/skills.svg"),
         "icons/inbox.svg" => include_bytes!("../assets/icons/inbox.svg"),
         "icons/work.svg" => include_bytes!("../assets/icons/work.svg"),
@@ -63,7 +65,7 @@ mod tests {
 
     #[test]
     fn rail_icons_load() {
-        for p in ["rui", "threads", "apps", "skills", "inbox", "work", "seats", "hand", "check", "send", "file", "brain", "diff", "term", "you", "close", "plus", "chevron"] {
+        for p in ["rui", "threads", "team", "lock", "apps", "skills", "inbox", "work", "seats", "hand", "check", "send", "file", "brain", "diff", "term", "you", "close", "plus", "chevron"] {
             let path = format!("icons/{p}.svg");
             assert!(Assets.load(&path).unwrap().is_some(), "{path}");
         }
