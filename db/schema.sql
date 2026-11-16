@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   source_kind TEXT NOT NULL CHECK (source_kind IN ('chat','user')),
   source_ref TEXT,
   skill TEXT,
+  agent TEXT,
+  pod TEXT, -- JSON array of role names
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -44,6 +46,9 @@ CREATE TABLE IF NOT EXISTS questions (
   text TEXT NOT NULL,
   answer TEXT,
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered')),
+  level TEXT NOT NULL DEFAULT 'owner', -- lead | rui | owner
+  ladder TEXT NOT NULL DEFAULT '[]', -- JSON array of {who, why}
+  why TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -89,4 +94,4 @@ CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
 CREATE INDEX IF NOT EXISTS idx_events_chat_id ON events(chat_id);
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;

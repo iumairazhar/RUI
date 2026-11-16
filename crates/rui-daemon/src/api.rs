@@ -144,7 +144,8 @@ async fn list_questions(
         None => None,
         Some(v) => Some(QuestionStatus::parse(&v).ok_or_else(|| bad_request("invalid status"))?),
     };
-    Ok(Json(s.db.list_questions(status)?))
+    let owner_only = s.db.list_questions(status)?.into_iter().filter(|q| q.level == "owner").collect();
+    Ok(Json(owner_only))
 }
 
 const CHAT_GREETING: &str = "What do you want set up?";
@@ -251,6 +252,8 @@ async fn post_chat(
 #[derive(Deserialize)]
 struct AnswerBody {
     answer: String,
+    #[serde(default)]
+    why: Option<String>,
 }
 
 async fn answer_question(
@@ -259,8 +262,12 @@ async fn answer_question(
     Json(b): Json<AnswerBody>,
 ) -> ApiResult<Json<Question>> {
     require_text(&b.answer, "answer")?;
-    let q = s.db.answer_question(id, &b.answer)?;
-    Ok(Json(q.ok_or_else(|| not_found("question not found"))?))
+    let q = s.db.get_question(id)?.ok_or_else(|| not_found("question not found"))?;
+    if q.status == QuestionStatus::Answered {
+        return Err(conflict("question is already answered"));
+    }
+    let why = b.why.as_deref().map(str::trim).filter(|w| !w.is_empty());
+    Ok(Json(crate::scheduler::answer_question(&s.db, id, &b.answer, why, "owner")?))
 }
 
 #[derive(Deserialize)]
@@ -289,7 +296,8 @@ async fn create_task(
         role: Role::Lead,
         source_kind: SourceKind::User,
         source_ref: None,
-        skill: None,
+        agent: None,
+        pod: vec![],
     })?;
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -467,7 +475,8 @@ mod tests {
                 role: Role::Lead,
                 source_kind: SourceKind::User,
                 source_ref: None,
-                skill: None,
+                agent: None,
+                pod: vec![],
             })
             .unwrap();
         (c.id, t.id)
@@ -485,7 +494,8 @@ mod tests {
             role: Role::Lead,
             source_kind: SourceKind::User,
             source_ref: None,
-            skill: None,
+            agent: None,
+            pod: vec![],
         })
         .unwrap()
         .id
@@ -523,6 +533,43 @@ mod tests {
         assert_eq!((st, v[0]["name"].as_str()), (StatusCode::OK, Some("acme")));
         let (st, v) = call(&app, "GET", "/tasks", None).await;
         assert_eq!((st, v[0]["status"].as_str()), (StatusCode::OK, Some("new")));
+    }
+
+    #[tokio::test]
+    async fn owner_list_hides_lower_levels_and_answer_flows_to_member() {
+        let (app, db, _rx) = setup();
+        let (client, parent) = seed_task(&db);
+        let member = db
+            .create_task(&NewTask {
+                client_id: client,
+                parent_id: Some(parent),
+                title: "m".into(),
+                body: String::new(),
+                status: TaskStatus::WaitingAnswer,
+                done_command: Some("true".into()),
+                max_loops: 5,
+                role: Role::Builder,
+                source_kind: SourceKind::User,
+                source_ref: None,
+                agent: Some("backend".into()),
+                pod: vec![],
+            })
+            .unwrap();
+        let ask = |level: &str| db.create_ladder_question(member.id, Role::Builder, level, &[], "q").unwrap();
+        let (lead_q, owner_q) = (ask("lead"), ask("owner"));
+        let (_, v) = call(&app, "GET", "/questions?status=open", None).await;
+        let ids: Vec<i64> = v.as_array().unwrap().iter().map(|q| q["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![owner_q.id]);
+        let uri = format!("/questions/{}/answer", owner_q.id);
+        let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "go", "why": "scope"}))).await;
+        assert_eq!((st, v["why"].as_str()), (StatusCode::OK, Some("scope")));
+        assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::Open);
+        assert_eq!(db.pending_instructions(member.id).unwrap().len(), 1);
+        let (st, _) = call(&app, "POST", &uri, Some(json!({"answer": "again"}))).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        db.set_question_level(lead_q.id, "owner", &[]).unwrap();
+        let (_, v) = call(&app, "GET", "/questions?status=open", None).await;
+        assert_eq!(v.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -707,7 +754,8 @@ mod tests {
                 role: Role::Builder,
                 source_kind: SourceKind::User,
                 source_ref: None,
-                skill: None,
+                agent: None,
+                pod: vec![],
             })
             .unwrap();
         let uri = format!("/tasks/{}/instruct", sub.id);

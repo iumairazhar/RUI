@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
@@ -65,6 +65,12 @@ pub struct Task {
     pub depends_on: Vec<i64>,
     #[serde(default)]
     pub skill: Option<String>,
+    /// Role name of the team member this task is for (e.g. "backend", "lead").
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Roles staffed on a top-level task, lead first. Empty on child tasks.
+    #[serde(default)]
+    pub pod: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -78,6 +84,26 @@ pub struct Question {
     pub answer: Option<String>,
     pub status: QuestionStatus,
     pub created_at: String,
+    /// Who must answer now: "lead", "rui" or "owner".
+    #[serde(default = "owner_level")]
+    pub level: String,
+    /// Who passed the question up, and why, oldest first.
+    #[serde(default)]
+    pub ladder: Vec<Rung>,
+    /// The reason behind the answer, if one was given.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+fn owner_level() -> String {
+    "owner".into()
+}
+
+/// One step of a question's escalation ladder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rung {
+    pub who: String,
+    pub why: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

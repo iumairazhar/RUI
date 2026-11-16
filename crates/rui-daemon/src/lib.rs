@@ -5,6 +5,7 @@ pub mod db;
 pub mod live;
 pub mod mcp;
 pub mod projects;
+pub mod roster;
 pub mod runner;
 pub mod scheduler;
 pub mod seat;

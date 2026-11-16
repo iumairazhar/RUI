@@ -1,7 +1,8 @@
 //! Skills: SKILL.md files that tell a team member how to work with one stack.
 //!
-//! Starter skills are embedded in the binary and copied to `<data_dir>/skills`
-//! on startup (never overwriting edits). Frontmatter is parsed by hand.
+//! Starter skills live in the source tree (`skills/`) and are copied to
+//! `<data_dir>/skills` on startup, only for folders that are missing.
+//! Frontmatter is parsed by hand; unknown keys and nested lines are ignored.
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -18,24 +19,15 @@ pub struct Skill {
     pub body: String,
 }
 
-const EMBEDDED: &[(&str, &str)] = &[
-    ("fastapi", include_str!("../skills/fastapi/SKILL.md")),
-    ("node-express", include_str!("../skills/node-express/SKILL.md")),
-    ("react-vite", include_str!("../skills/react-vite/SKILL.md")),
-    ("tester", include_str!("../skills/tester/SKILL.md")),
-    ("fixer", include_str!("../skills/fixer/SKILL.md")),
-    ("reviewer", include_str!("../skills/reviewer/SKILL.md")),
-];
-
 /// Splits `---` frontmatter from the body.
-fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
+pub(crate) fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
     let rest = text.strip_prefix("---\n").context("missing frontmatter")?;
     let end = rest.find("\n---").context("unterminated frontmatter")?;
     let body = rest[end + 4..].trim_start_matches('\n');
     Ok((&rest[..end], body))
 }
 
-fn field<'a>(front: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn field<'a>(front: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}:");
     front.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::trim)
 }
@@ -65,19 +57,87 @@ fn skills_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("skills")
 }
 
-/// Writes each embedded skill to disk, only if its file is missing.
-pub fn seed(data_dir: &Path) {
-    for (name, text) in EMBEDDED {
-        let dir = skills_dir(data_dir).join(name);
-        let file = dir.join("SKILL.md");
-        if file.exists() {
-            continue;
-        }
-        let res = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&file, text));
-        if let Err(e) = res {
-            eprintln!("cannot seed skill {name}: {e}");
+/// Copies `src` into `dst` recursively, creating folders as needed.
+pub(crate) fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
         }
     }
+    Ok(())
+}
+
+/// Copies each top-level folder of `src_root` into `dst_root`, only if it is missing there.
+pub fn seed_from(src_root: &Path, dst_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(src_root) else { return };
+    for entry in entries.flatten() {
+        let target = dst_root.join(entry.file_name());
+        if !entry.path().is_dir() || target.exists() {
+            continue;
+        }
+        if let Err(e) = copy_dir(&entry.path(), &target) {
+            eprintln!("cannot seed {}: {e}", target.display());
+        }
+    }
+}
+
+/// Seeds `<data_dir>/skills` from the source tree's `skills/` folder.
+pub fn seed(data_dir: &Path) {
+    let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/skills"));
+    seed_from(src, &skills_dir(data_dir));
+}
+
+fn git_common_dir(wt: &Path) -> Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .context("run git")?;
+    if !out.status.success() {
+        bail!("not a git repository: {}", wt.display());
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    Ok(if dir.is_absolute() { dir } else { wt.join(dir) })
+}
+
+const EXCLUDE_LINE: &str = ".claude/skills/";
+
+/// Adds `.claude/skills/` to the repo's `info/exclude` unless it is already there.
+fn exclude_installed_skills(wt: &Path) -> Result<()> {
+    let info = git_common_dir(wt)?.join("info");
+    std::fs::create_dir_all(&info)?;
+    let file = info.join("exclude");
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    if text.lines().any(|l| l.trim() == EXCLUDE_LINE) {
+        return Ok(());
+    }
+    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+    std::fs::write(&file, format!("{text}{sep}{EXCLUDE_LINE}\n"))?;
+    Ok(())
+}
+
+/// Copies the named skills into `<wt>/.claude/skills/`, replacing what is there, and keeps them out of git.
+/// Skills missing from the data dir are skipped.
+pub fn install_skills(wt: &Path, data_dir: &Path, names: &[String]) -> Result<()> {
+    let target = wt.join(".claude/skills");
+    for name in names {
+        let src = skills_dir(data_dir).join(name);
+        if !src.is_dir() {
+            continue;
+        }
+        let dst = target.join(name);
+        if dst.exists() {
+            std::fs::remove_dir_all(&dst)?;
+        }
+        copy_dir(&src, &dst)?;
+    }
+    exclude_installed_skills(wt)
 }
 
 /// All parsable skills on disk, sorted by name.
@@ -127,21 +187,68 @@ mod tests {
     }
 
     #[test]
-    fn embedded_skills_all_parse() {
-        for (name, text) in EMBEDDED {
-            assert_eq!(&parse(text).unwrap().name, name);
-        }
+    fn extra_frontmatter_keys_are_ignored() {
+        let text = "---\nname: z\ndescription: d\nlicense: MIT\nmetadata:\n  author: me\n  name: other\n---\nBody\n";
+        let s = parse(text).unwrap();
+        assert_eq!((s.name.as_str(), s.description.as_str()), ("z", "d"));
+        assert!(s.bash.is_empty());
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
     }
 
     #[test]
-    fn seed_does_not_overwrite_edits() {
+    fn seed_copies_folders_only_when_missing() {
+        let (src, dst) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write(&src.path().join("a/SKILL.md"), WITH_HINT);
+        write(&src.path().join("a/refs/more.md"), "more");
+        write(&src.path().join("b/SKILL.md"), "---\nname: b\ndescription: d\n---\nB\n");
+        write(&dst.path().join("b/SKILL.md"), "edited");
+        seed_from(src.path(), dst.path());
+        assert_eq!(std::fs::read_to_string(dst.path().join("a/refs/more.md")).unwrap(), "more");
+        assert_eq!(std::fs::read_to_string(dst.path().join("b/SKILL.md")).unwrap(), "edited");
+        write(&dst.path().join("a/SKILL.md"), "edited too");
+        seed_from(src.path(), dst.path());
+        assert_eq!(std::fs::read_to_string(dst.path().join("a/SKILL.md")).unwrap(), "edited too");
+    }
+
+    #[test]
+    fn load_reads_seeded_skills() {
         let d = tempfile::tempdir().unwrap();
-        seed(d.path());
-        assert_eq!(load_all(d.path()).len(), 6);
-        let file = d.path().join("skills/tester/SKILL.md");
-        std::fs::write(&file, WITH_HINT.replace("name: x", "name: tester")).unwrap();
-        seed(d.path());
+        write(&d.path().join("skills/tester/SKILL.md"), WITH_HINT.replace("name: x", "name: tester").as_str());
+        assert_eq!(load_all(d.path()).len(), 1);
         assert_eq!(load(d.path(), "tester").unwrap().body, "Body line");
         assert!(load(d.path(), "nope").is_none());
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git").arg("init").arg(d.path()).output().unwrap().status.success();
+        assert!(ok);
+        d
+    }
+
+    #[test]
+    fn install_copies_replaces_and_is_not_committed() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), git_repo());
+        write(&data.path().join("skills/s1/SKILL.md"), "v1");
+        write(&data.path().join("skills/s1/extra/x.txt"), "x");
+        let names = vec!["s1".to_string(), "missing".to_string()];
+        install_skills(repo.path(), data.path(), &names).unwrap();
+        let installed = repo.path().join(".claude/skills/s1");
+        assert_eq!(std::fs::read_to_string(installed.join("extra/x.txt")).unwrap(), "x");
+        write(&data.path().join("skills/s1/SKILL.md"), "v2");
+        std::fs::remove_file(data.path().join("skills/s1/extra/x.txt")).unwrap();
+        install_skills(repo.path(), data.path(), &names).unwrap();
+        assert_eq!(std::fs::read_to_string(installed.join("SKILL.md")).unwrap(), "v2");
+        assert!(!installed.join("extra/x.txt").exists());
+        write(&repo.path().join("code.txt"), "c");
+        assert!(crate::worktree::commit_all(repo.path(), "m").unwrap());
+        let files = std::process::Command::new("git").arg("-C").arg(repo.path()).args(["ls-files"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&files.stdout).trim(), "code.txt");
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches(".claude/skills/").count(), 1);
     }
 }

@@ -105,6 +105,22 @@ pub fn land(repo: &Path, branch: &str, message: &str) -> anyhow::Result<LandResu
     merge_failure(repo)
 }
 
+const MAX_DIFF_BYTES: usize = 60 * 1024;
+
+/// What the branch in `wt` changed relative to main (or master), capped at 60 KB.
+pub fn diff_vs_main(wt: &Path) -> anyhow::Result<String> {
+    let base = ["main", "master"]
+        .into_iter()
+        .find(|b| git(wt, &["rev-parse", "--verify", "--quiet", b]).is_ok_and(|o| o.status.success()))
+        .context("no main or master branch")?;
+    let diff = git_stdout(wt, &["diff", &format!("{base}...HEAD")])?;
+    if diff.len() <= MAX_DIFF_BYTES {
+        return Ok(diff);
+    }
+    let cut = (0..=MAX_DIFF_BYTES).rev().find(|i| diff.is_char_boundary(*i)).unwrap_or(0);
+    Ok(format!("{}\n... (diff cut at 60 KB)\n", &diff[..cut]))
+}
+
 /// One changed file with line counts and its unified diff text.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Change {

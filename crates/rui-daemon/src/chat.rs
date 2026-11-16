@@ -4,7 +4,7 @@ use crate::db::Db;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, run_agent};
 use crate::scheduler::{Config, line_event};
-use crate::skills;
+use crate::roster;
 use anyhow::{Context, Result};
 use rui_core::{ChatMessage, ChatRole, Role};
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__start_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__staff_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps";
 
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
@@ -35,16 +35,9 @@ fn load_message(db: &Db, id: i64) -> Result<ChatMessage> {
     db.get_chat_message(id)?.context("chat message not found")
 }
 
-/// Rui's prompt plus the catalog of skills it can hire.
+/// Rui's prompt plus the catalog of roles it can staff.
 fn system_prompt(data_dir: &Path) -> String {
-    let lines: Vec<String> = skills::load_all(data_dir)
-        .iter()
-        .map(|s| match &s.run_hint {
-            Some(r) => format!("- {}: {} (run: {r})", s.name, s.description),
-            None => format!("- {}: {}", s.name, s.description),
-        })
-        .collect();
-    format!("{RUI_PROMPT}\n\n# Skills you can hire\n{}", lines.join("\n"))
+    format!("{RUI_PROMPT}\n\n# Roles you can staff\n{}", roster::catalog(data_dir))
 }
 
 async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<()> {

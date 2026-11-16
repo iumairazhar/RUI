@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use rui_core::{
-    Chat, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, SCHEMA_VERSION,
+    Chat, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, Rung, SCHEMA_VERSION,
     SourceKind, Task, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
@@ -11,11 +11,11 @@ use std::sync::{Mutex, MutexGuard};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const TASK_COLS: &str = "id, client_id, parent_id, title, body, status, done_command, max_loops, \
-     loops_used, role, branch, source_kind, source_ref, created_at, updated_at, skill";
+     loops_used, role, branch, source_kind, source_ref, created_at, updated_at, skill, agent, pod";
 const CLIENT_COLS: &str = "id, name, repo_path, test_command, allowed_commands, created_at";
 const EVENT_COLS: &str = "id, task_id, chat_id, agent, kind, payload, created_at";
 const CHAT_COLS: &str = "id, chat_id, role, content, created_at";
-const QUESTION_COLS: &str = "id, task_id, asked_by, text, answer, status, created_at";
+const QUESTION_COLS: &str = "id, task_id, asked_by, text, answer, status, created_at, level, ladder, why";
 
 /// Handle to the SQLite database, safe to share across threads.
 pub struct Db {
@@ -34,7 +34,8 @@ pub struct NewTask {
     pub role: Role,
     pub source_kind: SourceKind,
     pub source_ref: Option<String>,
-    pub skill: Option<String>,
+    pub agent: Option<String>,
+    pub pod: Vec<String>,
 }
 
 fn bad(idx: usize, msg: String) -> rusqlite::Error {
@@ -57,6 +58,11 @@ fn client_from_row(r: &Row) -> rusqlite::Result<Client> {
     })
 }
 
+fn json_list<T: serde::de::DeserializeOwned>(idx: usize, raw: Option<String>) -> rusqlite::Result<Vec<T>> {
+    let Some(text) = raw else { return Ok(Vec::new()) };
+    serde_json::from_str(&text).map_err(|e| bad(idx, e.to_string()))
+}
+
 fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
@@ -76,6 +82,8 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
         skill: r.get(15)?,
+        agent: r.get(16)?,
+        pod: json_list(17, r.get(17)?)?,
     })
 }
 
@@ -88,6 +96,9 @@ fn question_from_row(r: &Row) -> rusqlite::Result<Question> {
         answer: r.get(4)?,
         status: parse_enum(5, r.get(5)?, QuestionStatus::parse)?,
         created_at: r.get(6)?,
+        level: r.get(7)?,
+        ladder: json_list::<Rung>(8, r.get(8)?)?,
+        why: r.get(9)?,
     })
 }
 
@@ -253,8 +264,8 @@ impl Db {
     pub fn create_task(&self, t: &NewTask) -> Result<Task> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO tasks (client_id, parent_id, title, body, status, done_command, max_loops, role, source_kind, source_ref, skill) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO tasks (client_id, parent_id, title, body, status, done_command, max_loops, role, source_kind, source_ref, agent, pod) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 t.client_id,
                 t.parent_id,
@@ -266,7 +277,8 @@ impl Db {
                 t.role.as_str(),
                 t.source_kind.as_str(),
                 t.source_ref,
-                t.skill
+                t.agent,
+                serde_json::to_string(&t.pod)?
             ],
         )?;
         fetch_task(&conn, conn.last_insert_rowid())?.ok_or_else(|| anyhow!("task vanished"))
@@ -317,6 +329,20 @@ impl Db {
         Ok(())
     }
 
+    /// Change a task's loop limit.
+    pub fn set_max_loops(&self, id: i64, max_loops: i64) -> Result<()> {
+        let sql = format!("UPDATE tasks SET max_loops = ?1, updated_at = {NOW} WHERE id = ?2");
+        self.conn()?.execute(&sql, params![max_loops, id])?;
+        Ok(())
+    }
+
+    /// Change a task's done command.
+    pub fn set_done_command(&self, id: i64, done_command: &str) -> Result<()> {
+        let sql = format!("UPDATE tasks SET done_command = ?1, updated_at = {NOW} WHERE id = ?2");
+        self.conn()?.execute(&sql, params![done_command, id])?;
+        Ok(())
+    }
+
     /// Make `task_id` depend on `depends_on`.
     pub fn add_task_dep(&self, task_id: i64, depends_on: i64) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?1, ?2)";
@@ -334,6 +360,35 @@ impl Db {
             params![task_id, asked_by.as_str(), text],
         )?;
         fetch_question(&conn, conn.last_insert_rowid())?.ok_or_else(|| anyhow!("question vanished"))
+    }
+
+    /// Insert an open question at a given level with its ladder so far.
+    pub fn create_ladder_question(
+        &self,
+        task_id: i64,
+        asked_by: Role,
+        level: &str,
+        ladder: &[Rung],
+        text: &str,
+    ) -> Result<Question> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO questions (task_id, asked_by, text, level, ladder) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![task_id, asked_by.as_str(), text, level, serde_json::to_string(ladder)?],
+        )?;
+        fetch_question(&conn, conn.last_insert_rowid())?.ok_or_else(|| anyhow!("question vanished"))
+    }
+
+    /// Question by id, if it exists.
+    pub fn get_question(&self, id: i64) -> Result<Option<Question>> {
+        fetch_question(&*self.conn()?, id)
+    }
+
+    /// Move a question to another level, replacing its ladder.
+    pub fn set_question_level(&self, id: i64, level: &str, ladder: &[Rung]) -> Result<()> {
+        let sql = "UPDATE questions SET level = ?1, ladder = ?2 WHERE id = ?3";
+        self.conn()?.execute(sql, params![level, serde_json::to_string(ladder)?, id])?;
+        Ok(())
     }
 
     /// Questions, optionally filtered by status, oldest first.
@@ -356,11 +411,11 @@ impl Db {
     }
 
     /// Store an answer and mark answered. None if the id does not exist.
-    pub fn answer_question(&self, id: i64, answer: &str) -> Result<Option<Question>> {
+    pub fn answer_question(&self, id: i64, answer: &str, why: Option<&str>) -> Result<Option<Question>> {
         let conn = self.conn()?;
         let n = conn.execute(
-            "UPDATE questions SET answer = ?1, status = 'answered' WHERE id = ?2",
-            params![answer, id],
+            "UPDATE questions SET answer = ?1, why = ?2, status = 'answered' WHERE id = ?3",
+            params![answer, why, id],
         )?;
         if n == 0 {
             return Ok(None);
@@ -581,7 +636,8 @@ mod tests {
             role: Role::Lead,
             source_kind: SourceKind::User,
             source_ref: None,
-            skill: None,
+            agent: None,
+            pod: vec![],
         }
     }
 
@@ -638,10 +694,11 @@ mod tests {
         let t = db.create_task(&new_task(c.id, "t")).unwrap();
         let q1 = db.create_question(t.id, Role::Lead, "why?").unwrap();
         let q2 = db.create_question(t.id, Role::Builder, "how?").unwrap();
-        let ans = db.answer_question(q1.id, "because").unwrap().unwrap();
+        let ans = db.answer_question(q1.id, "because", Some("r")).unwrap().unwrap();
         assert_eq!(ans.status, QuestionStatus::Answered);
         assert_eq!(ans.answer.as_deref(), Some("because"));
-        assert_eq!(db.answer_question(999, "x").unwrap(), None);
+        assert_eq!((ans.level.as_str(), ans.why.as_deref()), ("owner", Some("r")));
+        assert_eq!(db.answer_question(999, "x", None).unwrap(), None);
         let open = db.list_questions(Some(QuestionStatus::Open)).unwrap();
         assert_eq!(open.iter().map(|q| q.id).collect::<Vec<_>>(), vec![q2.id]);
         assert_eq!(db.list_questions(None).unwrap().len(), 2);

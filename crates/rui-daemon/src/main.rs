@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, apps, chat, db::Db, live, mcp, scheduler, seat, skills, state};
+use rui_daemon::{api, apps, chat, db::Db, live, mcp, roster, scheduler, seat, skills, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ async fn main() {
     let live = live::Live::default();
     let apps = apps::Apps::default();
     skills::seed(&data_dir);
+    roster::seed(&data_dir);
     let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone(), runs: runs.clone(), live: live.clone(), data_dir: data_dir.clone(), apps: apps.clone() };
     let app = api::router(state).merge(mcp::mcp_router(db.clone(), data_dir, apps.clone()));
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
