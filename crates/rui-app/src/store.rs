@@ -75,6 +75,8 @@ pub struct Store {
     pub roles: Vec<RoleInfo>,
     /// Set by a chat card to ask the root to switch to Threads; the root clears it.
     pub open_threads: bool,
+    /// Thread to open once the root has switched to Threads; the root clears it.
+    pub open_task: Option<i64>,
     /// Selected sub-tab of each rail section, by section key.
     pub tabs: HashMap<&'static str, usize>,
     /// Toast confirming the last owner action; hides after a few seconds.
@@ -185,6 +187,7 @@ impl Store {
             skills: vec![],
             roles: vec![],
             open_threads: false,
+            open_task: None,
             tabs: HashMap::new(),
             toast: None,
             watched: None,
@@ -231,6 +234,12 @@ impl Store {
     pub fn go_to_threads(&mut self, cx: &mut Context<Self>) {
         self.open_threads = true;
         cx.notify();
+    }
+
+    /// Ask the root to switch to Threads and open one task's thread.
+    pub fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_task = Some(id);
+        self.go_to_threads(cx);
     }
 
     /// Ask the root to open a produced file in the viewer.

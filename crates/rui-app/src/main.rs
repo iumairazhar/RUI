@@ -165,6 +165,9 @@ impl Root {
                 store.update(cx, |s, _| s.tabs.insert(Sec::Work.key(), 0));
                 this.select(Nav::Work, cx);
             }
+            if let Some(id) = store.update(cx, |s, _| s.open_task.take()) {
+                this.activity.update(cx, |v, cx| v.open_thread(id, cx));
+            }
             if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
                 this.results.update(cx, |v, cx| v.open(req, cx));
             }

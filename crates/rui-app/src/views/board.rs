@@ -76,8 +76,14 @@ fn task_card(
         .child(div().size(px(8.)).flex_none().rounded_full().bg(th.client_color(t.client_id)))
         .child(meta_text(t, client));
     let note = run.map(|r| div().text_size(px(10.5)).text_color(th.muted).child(seat_text(r)));
+    let id = t.id;
     card(cx)
         .id(("task-card", t.id as usize))
+        .cursor_pointer()
+        .on_click(move |_, _, cx| {
+            let store = cx.global::<store::StoreHandle>().0.clone();
+            store.update(cx, |s, cx| s.open_thread(id, cx));
+        })
         .child(
             div()
                 .text_size(px(12.))

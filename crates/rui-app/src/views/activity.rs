@@ -341,7 +341,8 @@ impl ThreadsView {
         self.seen.clear();
     }
 
-    fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+    /// Open one task's thread in the side drawer.
+    pub fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open = Some(id);
         self.closing = false;
         self.set_tab(Tab::Trace);
