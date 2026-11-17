@@ -53,10 +53,25 @@ impl Nav {
         }
     }
 
-    /// Page to open at launch: `RUI_NAV=work` (any label, any case) for screenshots; Rui otherwise.
+    /// Page to open at launch: `RUI_NAV=work` or `RUI_NAV=clients:1` (section, then sub-tab) for screenshots.
     fn from_env() -> Nav {
         let want = std::env::var("RUI_NAV").unwrap_or_default().to_lowercase();
-        Nav::ALL.into_iter().find(|n| n.label().to_lowercase() == want).unwrap_or(Nav::Rui)
+        let name = want.split(':').next().unwrap_or("");
+        Nav::ALL.into_iter().find(|n| n.label().to_lowercase() == name).unwrap_or(Nav::Rui)
+    }
+
+    /// Sub-tab from `RUI_NAV=<section>:<n>`, keyed like the store's `tabs`.
+    fn tab_from_env() -> Option<(&'static str, usize)> {
+        let want = std::env::var("RUI_NAV").ok()?;
+        let n = want.split(':').nth(1)?.parse().ok()?;
+        let key = match Nav::from_env() {
+            Nav::Work => Sec::Work.key(),
+            Nav::Clients => Sec::Clients.key(),
+            Nav::Knowledge => Sec::Knowledge.key(),
+            Nav::Cost => Sec::Cost.key(),
+            _ => return None,
+        };
+        Some((key, n))
     }
 
     fn label(self) -> &'static str {
@@ -146,6 +161,9 @@ impl Root {
         .detach();
         let store = cx.new(Store::new);
         cx.set_global(StoreHandle(store.clone()));
+        if let Some((key, n)) = Nav::tab_from_env() {
+            store.update(cx, |s, _| s.tabs.insert(key, n));
+        }
         cx.observe(&store, |this, store, cx| {
             if store.update(cx, |s, _| std::mem::take(&mut s.open_threads)) {
                 store.update(cx, |s, _| s.tabs.insert(Sec::Work.key(), 0));
