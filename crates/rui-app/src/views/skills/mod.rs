@@ -5,7 +5,8 @@ mod table;
 
 use self::table::{Filter, counts, visible};
 use super::library::{self as lib, EditState, after_slide, run, slide_overlay, toast};
-use super::{chip, page_head, primary_button};
+use super::section::{Sec, section_top};
+use super::{chip, primary_button};
 use crate::api::{self, SkillInfo};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
@@ -493,7 +494,7 @@ impl Render for SkillsView {
         };
         let add = self.add.map(|m| self.add_bar(m, &th, cx));
         let page = div().id("skills-scroll").flex().flex_col().size_full().overflow_y_scroll().pr(px(40.)).pb(px(28.));
-        let page = page.child(page_head("TEAM", "Skills", cx)).child(self.toolbar(&skills, &th, cx)).children(add).child(body);
+        let page = page.child(section_top(Sec::Knowledge, None, None, cx)).child(self.toolbar(&skills, &th, cx)).children(add).child(body);
         let (overlay, confirm) = (self.overlay(&th, cx), self.confirm_view(&th, cx));
         div().id("skills-page").relative().size_full().child(page).children(overlay).children(confirm)
     }

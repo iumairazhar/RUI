@@ -75,6 +75,8 @@ pub struct Store {
     pub roles: Vec<RoleInfo>,
     /// Set by a chat card to ask the root to switch to Threads; the root clears it.
     pub open_threads: bool,
+    /// Selected sub-tab of each rail section, by section key.
+    pub tabs: HashMap<&'static str, usize>,
     /// Toast confirming the last owner action; hides after a few seconds.
     pub toast: Option<Toast>,
     /// Task whose changes and events are reloaded on every poll.
@@ -183,6 +185,7 @@ impl Store {
             skills: vec![],
             roles: vec![],
             open_threads: false,
+            tabs: HashMap::new(),
             toast: None,
             watched: None,
         }

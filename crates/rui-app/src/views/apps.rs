@@ -2,7 +2,8 @@
 
 use super::activity::{chevron, mono_block, text_lines};
 use super::motion;
-use super::{card, chip, page_head};
+use super::section::{Sec, section_top};
+use super::{card, chip};
 use crate::api::AppInfo;
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
@@ -161,7 +162,7 @@ impl Render for AppsView {
             .overflow_y_scroll()
             .pr(px(40.))
             .pb(px(28.))
-            .child(page_head("RUNNING", "Apps", cx))
+            .child(section_top(Sec::Work, None, None, cx))
             .child(div().id("apps-list").flex().flex_col().gap(px(12.)).children(cards))
             .children(empty)
     }

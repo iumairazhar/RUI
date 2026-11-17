@@ -8,15 +8,8 @@ pub struct Assets;
 
 fn icon_bytes(path: &str) -> Option<&'static [u8]> {
     Some(match path {
-        "icons/rui.svg" => include_bytes!("../assets/icons/rui.svg").as_slice(),
-        "icons/threads.svg" => include_bytes!("../assets/icons/threads.svg"),
-        "icons/apps.svg" => include_bytes!("../assets/icons/apps.svg"),
-        "icons/team.svg" => include_bytes!("../assets/icons/team.svg"),
+        "icons/threads.svg" => include_bytes!("../assets/icons/threads.svg").as_slice(),
         "icons/lock.svg" => include_bytes!("../assets/icons/lock.svg"),
-        "icons/skills.svg" => include_bytes!("../assets/icons/skills.svg"),
-        "icons/inbox.svg" => include_bytes!("../assets/icons/inbox.svg"),
-        "icons/work.svg" => include_bytes!("../assets/icons/work.svg"),
-        "icons/seats.svg" => include_bytes!("../assets/icons/seats.svg"),
         "icons/hand.svg" => include_bytes!("../assets/icons/hand.svg"),
         "icons/check.svg" => include_bytes!("../assets/icons/check.svg"),
         "icons/send.svg" => include_bytes!("../assets/icons/send.svg"),
@@ -28,6 +21,15 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
         "icons/chevron.svg" => include_bytes!("../assets/icons/chevron.svg"),
         "icons/close.svg" => include_bytes!("../assets/icons/close.svg"),
+        "icons/nav-rui.svg" => include_bytes!("../assets/icons/nav-rui.svg"),
+        "icons/nav-inbox.svg" => include_bytes!("../assets/icons/nav-inbox.svg"),
+        "icons/nav-clients.svg" => include_bytes!("../assets/icons/nav-clients.svg"),
+        "icons/nav-knowledge.svg" => include_bytes!("../assets/icons/nav-knowledge.svg"),
+        "icons/nav-cost.svg" => include_bytes!("../assets/icons/nav-cost.svg"),
+        "icons/nav-analytics.svg" => include_bytes!("../assets/icons/nav-analytics.svg"),
+        "icons/nav-settings.svg" => include_bytes!("../assets/icons/nav-settings.svg"),
+        "icons/nav-filter.svg" => include_bytes!("../assets/icons/nav-filter.svg"),
+        "icons/claude.svg" => include_bytes!("../assets/icons/claude.svg"),
         "rui/shadow.svg" => include_bytes!("../assets/rui/shadow.svg"),
         "rui/stem.svg" => include_bytes!("../assets/rui/stem.svg"),
         "rui/bulb.svg" => include_bytes!("../assets/rui/bulb.svg"),
@@ -65,7 +67,7 @@ mod tests {
 
     #[test]
     fn rail_icons_load() {
-        for p in ["rui", "threads", "team", "lock", "apps", "skills", "inbox", "work", "seats", "hand", "check", "send", "file", "brain", "diff", "term", "you", "close", "plus", "chevron"] {
+        for p in ["nav-rui", "nav-inbox", "nav-clients", "nav-knowledge", "nav-cost", "nav-analytics", "nav-settings", "nav-filter", "claude", "threads", "lock", "hand", "check", "send", "file", "brain", "diff", "term", "you", "close", "plus", "chevron"] {
             let path = format!("icons/{p}.svg");
             assert!(Assets.load(&path).unwrap().is_some(), "{path}");
         }

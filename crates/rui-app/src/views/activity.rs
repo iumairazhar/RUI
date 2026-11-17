@@ -2,6 +2,7 @@
 
 mod team_view;
 mod teams;
+mod timeline;
 
 use super::live::live_action;
 use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files, trace};
@@ -10,7 +11,8 @@ use super::motion::{self, delayed, ease, spring};
 use super::roster::{Dot, Loops, member_name, pod_line, role_code};
 use team_view::{Phase, stopped_ids};
 use teams::can_stop;
-use super::{chip, markdown, page_head, primary_button, role_chip, tag, task_status};
+use super::section::{Sec, section_top};
+use super::{chip, markdown, primary_button, role_chip, tag, task_status};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
 use crate::store::{self, Store};
@@ -233,25 +235,8 @@ struct Thread {
     pod_line: Option<String>,
     /// An owner-level question is open for this task.
     owner_asked: bool,
-    /// Distinct skills of child tasks, in child id order.
-    team: Vec<String>,
     /// Stuck because it was stopped, so it is not waiting on the owner.
     stopped: bool,
-    /// No parent and no children: shown as a single row, not in a team.
-    solo: bool,
-}
-
-/// Distinct skills of a task's children, in child id order.
-fn team_of(tasks: &[Task], parent: i64) -> Vec<String> {
-    let mut kids: Vec<&Task> = tasks.iter().filter(|t| t.parent_id == Some(parent)).collect();
-    kids.sort_by_key(|t| t.id);
-    let mut team: Vec<String> = Vec::new();
-    for skill in kids.iter().filter_map(|t| t.skill.as_ref()) {
-        if !team.contains(skill) {
-            team.push(skill.clone());
-        }
-    }
-    team
 }
 
 fn threads_of(s: &Store, stopped: &HashSet<i64>) -> Vec<Thread> {
@@ -273,9 +258,7 @@ fn thread_of(s: &Store, t: &Task, question: Option<(i64, String, bool)>, stopped
         name: member_name(t, &s.tasks, &s.roles).unwrap_or_else(|| label(t)),
         code: role_code(&s.roles, agent),
         pod_line: pod_line(t, &s.roles),
-        team: team_of(&s.tasks, t.id),
         stopped: t.status == TaskStatus::Stuck && stopped.contains(&t.id),
-        solo: t.parent_id.is_none() && !s.tasks.iter().any(|c| c.parent_id == Some(t.id)),
     }
 }
 
@@ -331,9 +314,7 @@ pub struct ThreadsView {
     moves: HashMap<i64, (Col, Instant)>,
     /// Threads already shown since the view last appeared; new ones rise unstaggered.
     seen: HashSet<i64>,
-    /// Teams the owner folded or unfolded, against their default.
-    folds: HashMap<i64, bool>,
-    /// Landed band shows every team, not just the newest few.
+    /// Landed band shows every card, not just the newest few.
     show_landed: bool,
     /// The Stopped group of the Standing band is open.
     show_stopped: bool,
@@ -352,7 +333,7 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen, folds: HashMap::new(), show_landed: false, show_stopped: false, stopping: HashMap::new(), confirm_all: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen, show_landed: false, show_stopped: false, stopping: HashMap::new(), confirm_all: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -482,32 +463,29 @@ impl ThreadsView {
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
+    /// One agent card: avatar, "Agent · task", "Client · state · elapsed", and the seat mark when running.
     fn row(&self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let id = t.task.id;
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
-        let title = t.pod_line.clone().unwrap_or_else(|| format!("{} \u{b7} {}", t.name, t.task.title));
         let live = self.store.read(cx).live.task(id).cloned();
         let state = char_state(&t.task.status, live.as_ref());
         let word = live.as_ref().map_or_else(|| state_word(&t.task.status, t.owner_asked).to_string(), live_sub);
         let parts = [t.client.clone(), word, elapsed(&t.task.updated_at, now)];
         let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
-        let text = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .child(row_title(title, role_chip(&t.code, 18., color), t.task.skill.as_deref(), th))
-            .children(t.pod_line.as_ref().map(|_| muted_line(t.task.title.clone(), th)))
-            .child(muted_line(sub, th))
-            .child(div().mt(px(3.)).child(loops_line(loops_of(&t.task), 5., 10., th)))
-            .children(team_line(&t.team, th));
+        let title = format!("{} \u{b7} {}", t.name, t.task.title);
+        let name = div().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
+        let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
+        let text = div().flex().flex_col().flex_1().min_w_0().child(name).child(muted_line(sub, th).mt(px(2.)));
+        let group = SharedString::from(format!("thread-card-{id}"));
         let hover = th.surface_2;
         let row = div()
             .id(("thread-row", id as usize))
+            .group(group.clone())
             .relative()
             .flex()
             .flex_none()
+            .items_center()
             .gap(px(10.))
             .px(px(10.))
             .py(px(9.))
@@ -521,9 +499,10 @@ impl ThreadsView {
             .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
             .child(character(state, px(34.), ("thread-rui", id as usize), color, th))
             .child(text)
+            .children(seat_mark(&t.task.status))
             .children(can_stop(&t.task.status).then(|| {
-                let pill = self.stop_pill(format!("thread-stop-{id}"), false, id, th, cx);
-                div().flex().flex_none().items_center().child(pill)
+                let pill = self.stop_pill(format!("thread-stop-{id}"), id, th, cx);
+                pill.absolute().right(px(8.)).top(px(15.)).opacity(0.).group_hover(group, |s| s.opacity(1.))
             }));
         border_w(row, 1.5).into_any_element()
     }
@@ -548,7 +527,7 @@ impl ThreadsView {
     /// Ghost rows sliding out of the column a thread just left.
     fn leaving(&self, col: Col, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let left_here = |t: &&Thread| match self.moves.get(&t.task.id) {
-            Some((from, at)) => t.solo && !self.stopping.contains_key(&t.task.id) && *from == col && at.elapsed() < Duration::from_millis(LEAVE_MS),
+            Some((from, at)) => !self.stopping.contains_key(&t.task.id) && *from == col && at.elapsed() < Duration::from_millis(LEAVE_MS),
             None => false,
         };
         let ghosts: Vec<&Thread> = all.iter().filter(left_here).collect();
@@ -1093,18 +1072,6 @@ fn pulse_dot(id: impl Into<gpui::ElementId>, th: &Theme) -> impl IntoElement {
     dot.with_animation(id, anim, move |el, delta| el.opacity(wave(delta)))
 }
 
-/// Muted "Team: fastapi \u{b7} tester" line for a task whose children have skills.
-fn team_line(team: &[String], th: &Theme) -> Option<Div> {
-    let text = format!("Team: {}", team.join(" \u{b7} "));
-    (!team.is_empty()).then(|| div().truncate().text_size(px(11.)).text_color(th.muted).child(text))
-}
-
-fn row_title(title: String, chip: Div, skill: Option<&str>, th: &Theme) -> Div {
-    let text = div().flex_1().min_w_0().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
-    let skill = skill.map(|s| tag(&th.think, s).flex_none());
-    div().flex().items_center().gap(px(6.)).child(chip).child(text).children(skill)
-}
-
 fn muted_line(text: String, th: &Theme) -> Div {
     div().truncate().text_size(px(11.)).text_color(th.muted).child(text)
 }
@@ -1225,12 +1192,35 @@ fn live_code(code: &str, th: &Theme) -> AnyElement {
     line.child(StyledText::new(format!("{code}\u{2026}")).with_highlights(marks)).into_any_element()
 }
 
-fn lead_line(running: usize, needs: usize, th: &Theme) -> Stateful<Div> {
-    let bold = |n: usize| div().font_weight(FontWeight::BOLD).text_color(th.fg).child(n.to_string());
-    let noun = if running == 1 { " agent working \u{b7} " } else { " agents working \u{b7} " };
-    let tone = if needs > 0 { th.wait.fg } else { th.fg_2 };
-    let tail = div().flex().text_color(tone).child(bold(needs)).child(" waiting on you");
-    div().id("threads-lead").flex().text_size(px(14.)).text_color(th.fg_2).pb(px(16.)).child(bold(running)).child(noun).child(tail)
+/// The Claude mark on a card whose agent is holding a seat.
+fn seat_mark(status: &TaskStatus) -> Option<Div> {
+    let running = matches!(status, TaskStatus::Clarifying | TaskStatus::InProgress);
+    let spark = svg().path("icons/claude.svg").size(px(16.)).text_color(gpui::rgb(0xD97757));
+    running.then(|| div().flex().flex_none().items_center().child(spark))
+}
+
+/// Counts for the lead line: agents holding a seat and threads waiting on the owner.
+fn lead_counts(s: &Store, threads: &[Thread]) -> (usize, usize) {
+    let doing: Vec<i64> = threads.iter().filter(|t| thread_col(t) == Some(Col::Doing)).map(|t| t.task.id).collect();
+    let needs = threads.iter().filter(|t| thread_col(t) == Some(Col::Needs)).count();
+    (busy_count(&doing, &s.live), needs)
+}
+
+/// "**4** agents are holding a seat and working. **1 is waiting on you.**"
+fn lead_line(running: usize, needs: usize, th: &Theme) -> AnyElement {
+    let bold = |n: usize| div().text_size(px(19.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(n.to_string());
+    let noun = if running == 1 { "agent is" } else { "agents are" };
+    let tail = match needs {
+        0 => div().child("Nothing is waiting on you."),
+        n => {
+            let verb = if n == 1 { "is" } else { "are" };
+            let text = format!("{n} {verb} waiting on you");
+            let jump = div().font_weight(FontWeight::SEMIBOLD).text_color(th.block.fg).border_b_1().border_color(th.block.rim);
+            div().flex().child(jump.child(text)).child(".")
+        }
+    };
+    let lead = div().id("threads-lead").flex().items_baseline().gap(px(5.)).text_size(px(15.)).text_color(th.fg_2);
+    lead.child(bold(running)).child(format!("{noun} holding a seat and working.")).child(tail).into_any_element()
 }
 
 impl Render for ThreadsView {
@@ -1241,28 +1231,21 @@ impl Render for ThreadsView {
         self.track_moves(&threads);
         self.prune_stopping(cx);
         let now = now_secs();
-        let doing_ids: Vec<i64> = (threads.iter()).filter(|t| thread_col(t) == Some(Col::Doing)).map(|t| t.task.id).collect();
-        let running = busy_count(&doing_ids, &self.store.read(cx).live);
-        let needs = threads.iter().filter(|t| thread_col(t) == Some(Col::Needs)).count();
-        let bands = self.bands(&threads, &stopped, cx);
+        let (running, needs) = lead_counts(self.store.read(cx), &threads);
+        let bands = self.bands(&threads);
         let cols = [Col::Needs, Col::Standing, Col::Doing, Col::Landed];
         let columns: Vec<AnyElement> = cols.map(|c| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
         self.seen.extend(threads.iter().map(|t| t.task.id));
-        let board = div().id("threads-board").flex().flex_1().min_h_0().overflow_hidden().gap(px(12.)).mr(px(40.)).mb(px(28.)).children(columns);
+        let chart = self.chart(&threads, now, &th, cx);
+        let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
+        let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll();
+        let body = body.child(timeline::view(chart, &th)).child(board);
         let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
         let overlay = open.map(|t| self.overlay(&t, now, &th, cx));
         let confirm = self.confirm_view(&th, cx);
-        div()
-            .id("threads-page")
-            .relative()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(self.page_top(&th, cx))
-            .child(lead_line(running, needs, &th))
-            .child(board)
-            .children(overlay)
-            .children(confirm)
+        let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
+        let page = div().id("threads-page").relative().flex().flex_col().size_full();
+        page.child(top.pr(px(40.))).child(body).children(overlay).children(confirm)
     }
 }
 
@@ -1394,26 +1377,6 @@ mod tests {
         assert_eq!(col_of(&TaskStatus::InProgress), Some(Col::Doing));
         assert_eq!(col_of(&TaskStatus::Done), Some(Col::Landed));
         assert_eq!(col_of(&TaskStatus::Split), None);
-    }
-
-    #[test]
-    fn team_lists_distinct_child_skills_in_id_order() {
-        let task = |id: i64, parent: Option<i64>, skill: Option<&str>| -> Task {
-            serde_json::from_value(json!({"id":id,"client_id":1,"parent_id":parent,"title":"t","body":"",
-                "status":"open","done_command":null,"max_loops":5,"loops_used":0,"role":"builder",
-                "branch":null,"source_kind":"user","source_ref":null,"depends_on":[],"skill":skill,
-                "created_at":"a","updated_at":"b"}))
-            .unwrap()
-        };
-        let tasks = vec![
-            task(1, None, None),
-            task(4, Some(1), Some("tester")),
-            task(2, Some(1), Some("fastapi")),
-            task(3, Some(1), Some("tester")),
-            task(5, Some(1), None),
-        ];
-        assert_eq!(team_of(&tasks, 1), ["fastapi", "tester"]);
-        assert!(team_of(&tasks, 2).is_empty());
     }
 
     #[test]

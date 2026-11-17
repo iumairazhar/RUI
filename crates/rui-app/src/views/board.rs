@@ -1,6 +1,7 @@
 //! Work page: commitments laid out in lanes, left to right.
 
-use super::{card, page_head};
+use super::section::{Sec, section_top};
+use super::card;
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
 use gpui::{Context, Entity, FontWeight, Window, div, prelude::*, px};
@@ -174,8 +175,7 @@ impl Render for BoardView {
             .flex_col()
             .size_full()
             .pr(px(40.))
-            .child(page_head("COMMITMENTS", "Work", cx))
-            .child(lead_line(open, &th))
+            .child(section_top(Sec::Work, Some(lead_line(open, &th).into_any_element()), None, cx))
             .child(
                 div()
                     .id("work-lanes")

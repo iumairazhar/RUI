@@ -9,78 +9,108 @@ mod theme;
 mod views;
 
 use assets::Assets;
-use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px, size, svg,
-};
 use gpui::AnimationExt;
-use views::motion::{self, spring};
+use gpui::{
+    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, size, svg,
+};
+use rui_core::{Task, TaskStatus};
 use store::{Store, StoreHandle, inbox_count};
 use theme::{Theme, theme};
+use views::motion::{self, spring};
+use views::section::{Sec, active_tab, empty_page};
 use views::{
-    activity::ThreadsView,
-    agents::AgentsView,
-    apps::AppsView,
-    board::BoardView,
-    chat::ChatView,
-    questions::QuestionsView,
-    results::ResultsView,
-    seat::{SeatView, seat_label},
-    library::Tooltip,
-    skills::SkillsView,
+    activity::ThreadsView, agents::AgentsView, apps::AppsView, board::BoardView, chat::ChatView, clients,
+    library::Tooltip, questions::QuestionsView, results::ResultsView, seat::SeatView, skills::SkillsView,
 };
 
 #[derive(Clone, Copy, PartialEq)]
 enum Nav {
     Rui,
-    Threads,
-    Agents,
-    Apps,
     Inbox,
     Work,
-    Skills,
-    Seats,
+    Clients,
+    Knowledge,
+    Cost,
+    Analytics,
+    Settings,
 }
 
 impl Nav {
     const ALL: [Nav; 8] =
-        [Nav::Rui, Nav::Threads, Nav::Agents, Nav::Apps, Nav::Inbox, Nav::Work, Nav::Skills, Nav::Seats];
+        [Nav::Rui, Nav::Inbox, Nav::Work, Nav::Clients, Nav::Knowledge, Nav::Cost, Nav::Analytics, Nav::Settings];
 
     fn index(self) -> usize {
         Nav::ALL.iter().position(|n| *n == self).unwrap_or(0)
     }
 
+    /// Rail group: dividers sit between groups.
+    fn group(self) -> usize {
+        match self {
+            Nav::Rui | Nav::Inbox | Nav::Work => 0,
+            Nav::Settings => 2,
+            _ => 1,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Nav::Rui => "Rui",
-            Nav::Threads => "Threads",
-            Nav::Agents => "Agents",
-            Nav::Apps => "Apps",
             Nav::Inbox => "Inbox",
             Nav::Work => "Work",
-            Nav::Skills => "Skills",
-            Nav::Seats => "Seats",
+            Nav::Clients => "Clients",
+            Nav::Knowledge => "Knowledge",
+            Nav::Cost => "Cost",
+            Nav::Analytics => "Analytics",
+            Nav::Settings => "Settings",
         }
     }
 
     fn icon(self) -> &'static str {
         match self {
-            Nav::Rui => "icons/rui.svg",
-            Nav::Threads => "icons/threads.svg",
-            Nav::Agents => "icons/team.svg",
-            Nav::Apps => "icons/apps.svg",
-            Nav::Inbox => "icons/inbox.svg",
-            Nav::Work => "icons/work.svg",
-            Nav::Skills => "icons/skills.svg",
-            Nav::Seats => "icons/seats.svg",
+            Nav::Rui => "icons/nav-rui.svg",
+            Nav::Inbox => "icons/nav-inbox.svg",
+            Nav::Work => "icons/threads.svg",
+            Nav::Clients => "icons/nav-clients.svg",
+            Nav::Knowledge => "icons/nav-knowledge.svg",
+            Nav::Cost => "icons/nav-cost.svg",
+            Nav::Analytics => "icons/nav-analytics.svg",
+            Nav::Settings => "icons/nav-settings.svg",
         }
     }
 }
 
 /// Rail selection pill slide, with the spring.
 const PILL_MS: u64 = 540;
-/// Rail item height plus the gap between items.
+/// Rail item height plus the gap below it.
 const RAIL_STEP: f32 = 47.;
+/// Brand tile with its gap, then a divider block (margins plus the hairline).
+const RAIL_TILE: f32 = 51.;
+const RAIL_DIVIDER: f32 = 17.5;
+
+/// Top of a rail item inside the rail's padding box.
+fn rail_y(nav: Nav) -> f32 {
+    let dividers = nav.group() + 1;
+    RAIL_TILE + RAIL_DIVIDER * dividers as f32 + RAIL_STEP * nav.index() as f32
+}
+
+/// "4 clients · 11 threads · 1 seat free".
+fn summary_text(clients: usize, threads: usize, free: usize) -> String {
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let parts = [plural(clients, "client", "clients"), plural(threads, "thread", "threads"), plural(free, "seat", "seats")];
+    format!("{} \u{b7} {} \u{b7} {} free", parts[0], parts[1], parts[2])
+}
+
+/// Top-level tasks that are not done.
+fn open_threads(tasks: &[Task]) -> usize {
+    tasks.iter().filter(|t| t.parent_id.is_none() && t.status != TaskStatus::Done).count()
+}
+
+/// One seat for now: taken while any agent runs.
+fn seats_free(s: &Store) -> usize {
+    let running = s.tasks.iter().any(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Clarifying));
+    usize::from(!running && s.live.tasks.is_empty())
+}
 
 struct Root {
     store: Entity<Store>,
@@ -112,7 +142,8 @@ impl Root {
         cx.set_global(StoreHandle(store.clone()));
         cx.observe(&store, |this, store, cx| {
             if store.update(cx, |s, _| std::mem::take(&mut s.open_threads)) {
-                this.select(Nav::Threads, cx);
+                store.update(cx, |s, _| s.tabs.insert(Sec::Work.key(), 0));
+                this.select(Nav::Work, cx);
             }
             if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
                 this.results.update(cx, |v, cx| v.open(req, cx));
@@ -137,17 +168,35 @@ impl Root {
         }
     }
 
-    fn content(&self) -> AnyElement {
-        let page = match self.nav {
+    /// The page for the selected rail section and its sub-tab.
+    fn page(&self, cx: &App) -> AnyElement {
+        let tab = |sec| active_tab(sec, cx);
+        match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
-            Nav::Threads => self.activity.clone().into_any_element(),
-            Nav::Agents => self.agents.clone().into_any_element(),
-            Nav::Apps => self.apps.clone().into_any_element(),
             Nav::Inbox => self.questions.clone().into_any_element(),
-            Nav::Work => self.board.clone().into_any_element(),
-            Nav::Skills => self.skills.clone().into_any_element(),
-            Nav::Seats => self.seats.clone().into_any_element(),
-        };
+            Nav::Work => match tab(Sec::Work) {
+                0 => self.activity.clone().into_any_element(),
+                1 => self.board.clone().into_any_element(),
+                _ => self.apps.clone().into_any_element(),
+            },
+            Nav::Clients => match tab(Sec::Clients) {
+                0 => clients::page(cx),
+                _ => self.agents.clone().into_any_element(),
+            },
+            Nav::Knowledge => match tab(Sec::Knowledge) {
+                0 => self.skills.clone().into_any_element(),
+                _ => empty_page(Sec::Knowledge, "Lessons land here when you answer the Inbox with a reason.", cx),
+            },
+            Nav::Cost => match tab(Sec::Cost) {
+                0 => empty_page(Sec::Cost, "Cost tracking comes later.", cx),
+                _ => self.seats.clone().into_any_element(),
+            },
+            Nav::Analytics => empty_page(Sec::Analytics, "Analytics comes later.", cx),
+            Nav::Settings => empty_page(Sec::Settings, "Settings come later.", cx),
+        }
+    }
+
+    fn content(&self, cx: &App) -> AnyElement {
         div()
             .id("content")
             .absolute()
@@ -156,18 +205,13 @@ impl Root {
             .right_0()
             .bottom_0()
             .pl(px(96.))
-            .child(div().id("content-page").size_full().child(page))
+            .child(div().id("content-page").size_full().child(self.page(cx)))
             .into_any_element()
     }
 
     fn summary(&self, cx: &Context<Self>) -> String {
         let s = self.store.read(cx);
-        let mut text = format!("{} clients · {} tasks", s.clients.len(), s.tasks.len());
-        if let Some(seat) = &s.seat {
-            text.push_str(" · ");
-            text.push_str(&seat_label(seat));
-        }
-        text
+        summary_text(s.clients.len(), open_threads(&s.tasks), seats_free(s))
     }
 
     fn header(&self, th: &Theme, cx: &Context<Self>) -> impl IntoElement + use<> {
@@ -184,13 +228,7 @@ impl Root {
             .items_center()
             .gap(px(9.))
             .child(div().id("header-title").text_size(px(15.)).font_weight(FontWeight::BOLD).child("Rui"))
-            .child(
-                div()
-                    .id("header-summary")
-                    .text_size(px(12.))
-                    .text_color(th.muted)
-                    .child(self.summary(cx)),
-            )
+            .child(div().id("header-summary").text_size(px(12.)).text_color(th.muted).child(self.summary(cx)))
             .children(error.map(|e| e.text_size(px(12.))))
     }
 
@@ -236,8 +274,10 @@ impl Root {
             .group(group)
             .relative()
             .size(px(44.))
+            .mb(px(3.))
             .rounded(px(10.))
             .flex()
+            .flex_none()
             .items_center()
             .justify_center()
             .cursor_pointer()
@@ -255,10 +295,10 @@ impl Root {
         }
         (self.pill_from, self.nav) = (self.nav, nav);
         self.pill_seq += 1;
-        if nav == Nav::Skills {
+        if nav == Nav::Knowledge {
             self.store.update(cx, |s, cx| s.refresh_skills(cx));
         }
-        if nav == Nav::Threads {
+        if nav == Nav::Work {
             self.activity.update(cx, |v, _| v.reset_motion());
         }
         cx.notify();
@@ -266,16 +306,45 @@ impl Root {
 
     /// Selection pill behind the rail items, springing between them.
     fn pill(&self, th: &Theme) -> impl IntoElement + use<> {
-        let from = 8. + RAIL_STEP * self.pill_from.index() as f32;
-        let to = 8. + RAIL_STEP * self.nav.index() as f32;
-        let pill = div().absolute().left(px(8.)).top(px(to)).size(px(44.)).rounded(px(10.)).bg(th.sel);
+        let (from, to) = (8. + rail_y(self.pill_from), 8. + rail_y(self.nav));
+        let pill = div().id("rail-pill").absolute().left(px(8.)).top(px(to)).size(px(44.)).rounded(px(10.)).bg(th.sel);
         pill.with_animation(("rail-pill", self.pill_seq), motion::once(PILL_MS), move |el, d| {
             el.top(px(from + (to - from) * spring(d)))
         })
     }
 
+    /// The brand/filter tile at the top of the rail.
+    fn brand_tile(&self, th: &Theme) -> impl IntoElement + use<> {
+        let ov = if th.dark { gpui::white() } else { gpui::black() };
+        let icon = svg().path("icons/nav-filter.svg").size(px(19.)).text_color(th.fg_2);
+        div()
+            .id("rail-brand")
+            .size(px(44.))
+            .mb(px(7.))
+            .rounded(px(12.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .bg(ov.opacity(0.10))
+            .border_1()
+            .border_color(th.glass_rim)
+            .child(icon)
+            .tooltip(|_, cx| cx.new(|_| Tooltip("All clients".into())).into())
+    }
+
+    fn divider(&self, id: usize, th: &Theme) -> impl IntoElement + use<> {
+        div().id(("rail-divider", id)).flex_none().w(px(24.)).h(px(0.5)).mt(px(6.)).mb(px(11.)).bg(th.glass_rim)
+    }
+
     fn rail(&self, th: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let items: Vec<_> = Nav::ALL.iter().map(|n| self.rail_item(*n, th, cx)).collect();
+        let mut items: Vec<AnyElement> = vec![self.brand_tile(th).into_any_element()];
+        for (i, nav) in Nav::ALL.iter().enumerate() {
+            if i == 0 || Nav::ALL[i - 1].group() != nav.group() {
+                items.push(self.divider(nav.group(), th).into_any_element());
+            }
+            items.push(self.rail_item(*nav, th, cx).into_any_element());
+        }
         div()
             .id("rail")
             .absolute()
@@ -291,7 +360,6 @@ impl Root {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(3.))
             .child(self.pill(th))
             .children(items)
     }
@@ -308,7 +376,7 @@ impl Render for Root {
             .font_family(".SystemUIFont")
             .text_color(th.fg)
             .text_size(px(13.))
-            .child(self.content())
+            .child(self.content(cx))
             .child(self.header(&th, cx))
             .child(self.rail(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
@@ -338,4 +406,23 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rail_positions_follow_the_dividers() {
+        assert_eq!(rail_y(Nav::Rui), 68.5);
+        assert_eq!(rail_y(Nav::Work), 162.5);
+        assert_eq!(rail_y(Nav::Clients), 227.);
+        assert_eq!(rail_y(Nav::Settings), 432.5);
+    }
+
+    #[test]
+    fn summary_reads_like_the_mock() {
+        assert_eq!(summary_text(4, 11, 1), "4 clients \u{b7} 11 threads \u{b7} 1 seat free");
+        assert_eq!(summary_text(1, 1, 0), "1 client \u{b7} 1 thread \u{b7} 0 seats free");
+    }
 }

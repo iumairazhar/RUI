@@ -1,6 +1,7 @@
-//! Seat label and seat page.
+//! Seat page.
 
-use super::{card, page_head, tag};
+use super::section::{Sec, section_top};
+use super::{card, tag};
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
 use gpui::{App, Context, Div, Entity, FontWeight, Window, div, prelude::*, px};
@@ -94,77 +95,8 @@ impl Render for SeatView {
             .overflow_y_scroll()
             .pr(px(40.))
             .pb(px(28.))
-            .child(page_head("ACCOUNTS", "Seats", cx))
+            .child(section_top(Sec::Cost, None, None, cx))
             .child(seat_card(seat.as_ref(), &th, cx))
             .child(note)
-    }
-}
-
-fn subscription_name(seat: &SeatInfo) -> String {
-    match seat.subscription_type.as_deref() {
-        Some(t) if !t.is_empty() => {
-            let mut chars = t.chars();
-            let first = chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-            format!("Claude {first}{}", chars.as_str())
-        }
-        _ => seat.auth_method.clone().unwrap_or_else(|| "Unknown seat".into()),
-    }
-}
-
-/// One-line description of the seat, e.g. `Claude Max · me@example.com · Model: claude-opus-5-5`.
-pub fn seat_label(seat: &SeatInfo) -> String {
-    if !seat.logged_in {
-        return match &seat.error {
-            Some(e) => format!("Not signed in · {e}"),
-            None => "Not signed in".into(),
-        };
-    }
-    // The account email is private and never shown in the UI.
-    let mut parts = vec![subscription_name(seat)];
-    parts.push(format!("Model: {}", seat.last_model.as_deref().unwrap_or("—")));
-    parts.join(" · ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn seat() -> SeatInfo {
-        SeatInfo {
-            logged_in: true,
-            auth_method: Some("claude.ai".into()),
-            email: Some("me@example.com".into()),
-            subscription_type: Some("max".into()),
-            last_model: Some("claude-opus-5-5".into()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn full_label() {
-        assert_eq!(seat_label(&seat()), "Claude Max · Model: claude-opus-5-5");
-        assert!(!seat_label(&seat()).contains('@'), "email must never be shown");
-    }
-
-    #[test]
-    fn pro_and_missing_model() {
-        let s = SeatInfo { subscription_type: Some("pro".into()), last_model: None, ..seat() };
-        assert_eq!(seat_label(&s), "Claude Pro · Model: —");
-    }
-
-    #[test]
-    fn falls_back_to_auth_method_then_unknown() {
-        let s = SeatInfo { subscription_type: None, email: None, ..seat() };
-        assert_eq!(seat_label(&s), "claude.ai · Model: claude-opus-5-5");
-        let s = SeatInfo { subscription_type: None, auth_method: None, ..seat() };
-        assert!(seat_label(&s).starts_with("Unknown seat"));
-    }
-
-    #[test]
-    fn not_signed_in() {
-        let s = SeatInfo::default();
-        assert_eq!(seat_label(&s), "Not signed in");
-        let s = SeatInfo { error: Some("boom".into()), ..SeatInfo::default() };
-        assert_eq!(seat_label(&s), "Not signed in · boom");
     }
 }
