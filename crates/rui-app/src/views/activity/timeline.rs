@@ -24,6 +24,14 @@ const LABEL_W: f32 = 186.;
 pub struct Line {
     pub pts: Vec<(i64, Word)>,
     pub color: Hsla,
+    /// The task this line belongs to; its end dot opens that task.
+    pub task_id: i64,
+    pub title: String,
+}
+
+/// Vertical offset of line `i` of `n`, so lines in one band don't sit on top of each other.
+fn spread(i: usize, n: usize) -> f32 {
+    if n > 1 { (i as f32 / (n - 1) as f32 - 0.5) * 42. } else { 0. }
 }
 
 /// Everything the chart needs, already computed.
@@ -202,8 +210,8 @@ fn paint_chart(b: Bounds<Pixels>, chart: &Chart, th: &Theme, window: &mut gpui::
 fn paint_lines(window: &mut gpui::Window, chart: &Chart, th: &Theme, (top, x_of): (f32, &dyn Fn(i64) -> f32)) {
     let n = chart.lines.len();
     for (i, line) in chart.lines.iter().enumerate() {
-        let spread = if n > 1 { (i as f32 / (n - 1) as f32 - 0.5) * 42. } else { 0. };
-        let pts: Vec<(f32, f32)> = line.pts.iter().map(|(t, c)| (x_of(*t), top + row_y(row_of(*c)) + spread)).collect();
+        let dy = spread(i, n);
+        let pts: Vec<(f32, f32)> = line.pts.iter().map(|(t, c)| (x_of(*t), top + row_y(row_of(*c)) + dy)).collect();
         stroke_line(window, &pts, line.color);
         let inner = pts.len().saturating_sub(1);
         for p in pts.iter().take(inner).skip(1) {
@@ -214,6 +222,27 @@ fn paint_lines(window: &mut gpui::Window, chart: &Chart, th: &Theme, (top, x_of)
             circle(window, end.0, end.1, 5., line.color, None);
         }
     }
+}
+
+/// An invisible, clickable target over each line's end dot: hover shows the task, click opens it.
+fn end_targets(chart: &Chart) -> Vec<AnyElement> {
+    let from = window_start(chart.now);
+    let n = chart.lines.len();
+    let target = |(i, line): (usize, &Line)| {
+        let (t, word) = *line.pts.last()?;
+        let frac = (t - from) as f32 / WINDOW_SECS as f32;
+        let (id, title) = (line.task_id, line.title.clone());
+        let dot = div().id(("tl-end", id as usize)).absolute().left(relative(frac)).ml(px(-10.)).size(px(20.)).rounded_full();
+        let dot = dot.top(px(row_y(row_of(word)) + spread(i, n) - 10.)).cursor_pointer();
+        let dot = dot.tooltip(move |_, cx| cx.new(|_| crate::views::library::Tooltip(title.clone().into())).into());
+        Some(dot.on_click(move |_, _, cx| open_task(id, cx)).into_any_element())
+    };
+    chart.lines.iter().enumerate().filter_map(target).collect()
+}
+
+fn open_task(id: i64, cx: &mut gpui::App) {
+    let store = cx.global::<crate::store::StoreHandle>().0.clone();
+    store.update(cx, |s, cx| s.open_thread(id, cx));
 }
 
 fn legend(clients: &[(String, Hsla)], th: &Theme) -> AnyElement {
@@ -265,7 +294,7 @@ pub fn view(chart: Chart, th: &Theme) -> AnyElement {
     let ticks = hour_ticks(from, from + WINDOW_SECS, local_offset());
     let ticks = ticks.into_iter().map(|(t, text)| tick((t - from) as f32 / WINDOW_SECS as f32, text, th));
     let axis = div().absolute().top_0().bottom_0().left(px(PLOT_LEFT)).right(px(PLOT_RIGHT));
-    let axis = axis.child(now_label(th)).children(ticks);
+    let axis = axis.child(now_label(th)).children(ticks).children(end_targets(&chart));
     let bands: Vec<AnyElement> = (0..ROWS.len()).map(|i| band_label(i, chart.counts[i], th)).collect();
     let theme = th.clone();
     let paint = canvas(|_, _, _| (), move |b, _, window, _| paint_chart(b, &chart, &theme, window));

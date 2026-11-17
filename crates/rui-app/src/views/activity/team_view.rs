@@ -58,7 +58,7 @@ impl ThreadsView {
             if !worth_drawing(&pts, from, t.word) {
                 return None;
             }
-            Some(Line { pts, color: th.client_color(t.task.client_id) })
+            Some(Line { pts, color: th.client_color(t.task.client_id), task_id: t.task.id, title: t.task.title.clone() })
         };
         let counts = ROWS.map(|(c, _)| threads.iter().filter(|t| t.word == c).count());
         let clients = s.clients.iter().map(|c| (c.name.clone(), th.client_color(c.id))).collect();
