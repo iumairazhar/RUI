@@ -515,6 +515,19 @@ impl Db {
         Ok(self.conn()?.execute(sql, [chat_id])?)
     }
 
+    /// Delete a chat and its messages, asks and sessions; events stay, detached from the chat.
+    pub fn delete_chat(&self, id: i64) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE events SET chat_id = NULL WHERE chat_id = ?1", [id])?;
+        tx.execute("DELETE FROM agent_sessions WHERE chat_id = ?1", [id])?;
+        tx.execute("DELETE FROM chat_asks WHERE chat_id = ?1", [id])?;
+        tx.execute("DELETE FROM chat_messages WHERE chat_id = ?1", [id])?;
+        let deleted = tx.execute("DELETE FROM chats WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
     /// All chats, most recently active first.
     pub fn list_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn()?;
@@ -735,6 +748,19 @@ mod tests {
         let db = Db::open_test();
         let c = db.create_client("acme", "/repo", Some("cargo test"), &["ls".into()]).unwrap();
         (db, c)
+    }
+
+    #[test]
+    fn delete_chat_keeps_events_detached() {
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        db.add_chat_message(chat.id, ChatRole::User, "hi").unwrap();
+        let eid = db.add_event_in_chat(chat.id, "rui", "text", &serde_json::json!({})).unwrap();
+        assert!(db.delete_chat(chat.id).unwrap());
+        assert!(db.get_chat(chat.id).unwrap().is_none());
+        assert!(!db.delete_chat(chat.id).unwrap());
+        let ev = db.list_events(None, 10).unwrap().into_iter().find(|e| e.id == eid).unwrap();
+        assert_eq!(ev.chat_id, None);
     }
 
     #[test]

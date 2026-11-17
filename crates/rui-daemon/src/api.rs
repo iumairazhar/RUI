@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use crate::apps::{self, AppInfo, Apps};
 use crate::live::{self, Live};
@@ -74,6 +74,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
         .route("/chats", get(list_chats).post(create_chat))
+        .route("/chats/{id}", delete(delete_chat))
         .route("/chat", get(list_chat).post(post_chat))
         .route("/asks", get(list_asks))
         .route("/asks/{id}/answer", post(answer_ask))
@@ -168,6 +169,18 @@ async fn create_chat(State(s): State<ApiState>) -> ApiResult<(StatusCode, Json<C
 struct ChatQuery {
     chat_id: Option<i64>,
     limit: Option<i64>,
+}
+
+/// Deletes a chat; refused while Rui is mid-turn in it.
+async fn delete_chat(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    let busy = s.live.lock().map(|m| m.contains_key(&live::LiveKey::Chat(id))).unwrap_or(false);
+    if busy {
+        return Err(conflict("Rui is still answering in this chat. Stop it or wait, then delete."));
+    }
+    if !s.db.delete_chat(id)? {
+        return Err(not_found("chat not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_chat(
@@ -679,6 +692,32 @@ mod tests {
         let (st, _) = call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": ""}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chats_delete_removes_chat_and_404s_after() {
+        let (app, _db, _rx) = setup();
+        let (_, c) = call(&app, "POST", "/chats", None).await;
+        let cid = c["id"].as_i64().unwrap();
+        call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": "hi"}))).await;
+        assert_eq!(call(&app, "DELETE", &format!("/chats/{cid}"), None).await.0, StatusCode::NO_CONTENT);
+        let (_, list) = call(&app, "GET", "/chats", None).await;
+        assert!(list.as_array().unwrap().is_empty());
+        assert_eq!(call(&app, "DELETE", &format!("/chats/{cid}"), None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chats_delete_conflicts_while_rui_is_answering() {
+        let (app, db, _rx) = setup();
+        let cid = db.create_chat().unwrap().id;
+        let (chat_tx, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let live = Live::default();
+        live.lock().unwrap().insert(crate::live::LiveKey::Chat(cid), Default::default());
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let busy_app = router(state);
+        assert_eq!(call(&busy_app, "DELETE", &format!("/chats/{cid}"), None).await.0, StatusCode::CONFLICT);
+        assert!(db.get_chat(cid).unwrap().is_some());
+        let _ = app;
     }
 
     #[tokio::test]
