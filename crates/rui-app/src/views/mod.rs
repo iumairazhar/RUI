@@ -20,6 +20,7 @@ pub mod roster;
 pub mod seat;
 pub mod section;
 pub mod skills;
+pub mod status;
 pub mod toast;
 pub mod trace;
 

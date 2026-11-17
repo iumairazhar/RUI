@@ -769,7 +769,7 @@ impl ThreadsView {
             }
             let stop = small_chip("thread-stop".to_string(), "Stop and hand it back", cx);
             let stop = stop.on_click(cx.listener(move |this, _, _, cx| {
-                this.store.update(cx, |s, cx| s.stop_task(id, cx));
+                this.store.update(cx, |s, cx| s.stop_task(id, "Thread drawer", cx));
             }));
             chips.push(stop.into_any_element());
         }

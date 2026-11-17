@@ -1,10 +1,11 @@
 //! Shared app state, refreshed from the daemon once a second.
 
-use crate::api::{self, AppInfo, Change, LiveSnapshot, ResultFile, RoleInfo, SkillInfo};
+use crate::api::{self, AppInfo, Change, InboxItem, LiveSnapshot, OwnerState, ResultFile, RoleInfo, SkillInfo};
+use crate::notify;
 use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity, Global};
-use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, QuestionStatus, SeatInfo, Task, TaskRun};
-use std::collections::HashMap;
+use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const MAX_EVENTS: usize = 300;
@@ -47,8 +48,10 @@ pub struct Store {
     pub seat: Option<SeatInfo>,
     /// Latest run per task id.
     pub runs: HashMap<i64, TaskRun>,
-    /// Stuck tasks that were stopped, from the daemon; older than the loaded events window.
-    pub stopped: std::collections::HashSet<i64>,
+    /// Everything that needs the owner, newest first.
+    pub inbox: Vec<InboxItem>,
+    /// Status word and reason per task id.
+    pub states: HashMap<i64, OwnerState>,
     /// Newest events, oldest first (at most 300).
     pub events: Vec<Event>,
     /// Highest event id seen so far.
@@ -85,13 +88,18 @@ pub struct Store {
     pub toast: Option<Toast>,
     /// Task whose changes and events are reloaded on every poll.
     watched: Option<i64>,
+    /// (kind, id) of inbox items already seen, so only new ones notify.
+    seen_inbox: HashSet<(String, i64)>,
+    /// The inbox has loaded once; the first load never notifies.
+    inbox_loaded: bool,
 }
 
 /// Extra data fetched each poll; each part may fail on its own.
 struct Extras {
     seat: Option<SeatInfo>,
     runs: Option<Vec<TaskRun>>,
-    stopped: Option<Vec<i64>>,
+    inbox: Option<Vec<InboxItem>>,
+    states: Option<Vec<OwnerState>>,
     events: Option<Vec<Event>>,
     apps: Option<Vec<AppInfo>>,
     asks: Option<Vec<ChatAsk>>,
@@ -103,7 +111,8 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
     Extras {
         seat: api::get_seat().ok(),
         runs: api::get_task_runs().ok(),
-        stopped: api::get_stopped().ok(),
+        inbox: api::get_inbox().ok(),
+        states: api::get_task_states().ok(),
         events: api::get_events_after(after_id, limit).ok(),
         apps: api::get_apps().ok(),
         asks: api::get_asks_open().ok(),
@@ -177,7 +186,8 @@ impl Store {
             action_error: None,
             seat: None,
             runs: HashMap::new(),
-            stopped: Default::default(),
+            inbox: vec![],
+            states: HashMap::new(),
             events: vec![],
             last_event_id: None,
             changes: HashMap::new(),
@@ -196,6 +206,8 @@ impl Store {
             tabs: HashMap::new(),
             toast: None,
             watched: None,
+            seen_inbox: HashSet::new(),
+            inbox_loaded: false,
         }
     }
 
@@ -275,14 +287,27 @@ impl Store {
         if let Some(runs) = extras.runs {
             self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();
         }
-        if let Some(ids) = extras.stopped {
-            self.stopped = ids.into_iter().collect();
+        if let Some(states) = extras.states {
+            self.states = states.into_iter().map(|s| (s.task_id, s)).collect();
+        }
+        if let Some(inbox) = extras.inbox {
+            self.apply_inbox(inbox);
         }
         let Some(new) = extras.events else { return };
         self.events.extend(new);
         let excess = self.events.len().saturating_sub(MAX_EVENTS);
         self.events.drain(..excess);
         self.last_event_id = self.events.last().map(|e| e.id);
+    }
+
+    /// Store the inbox; notify for new stuck and review items, except on the first load.
+    fn apply_inbox(&mut self, inbox: Vec<InboxItem>) {
+        let fresh = notify::fresh(&mut self.seen_inbox, &inbox);
+        if std::mem::replace(&mut self.inbox_loaded, true) {
+            let items: Vec<(String, String)> = fresh.into_iter().map(|i| (i.title, i.reason)).collect();
+            std::thread::spawn(move || items.iter().for_each(|(t, r)| notify::send(t, r)));
+        }
+        self.inbox = inbox;
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -399,14 +424,14 @@ impl Store {
         }
     }
 
-    /// Stop a task and its unfinished subtasks, toast how many stopped, then refresh.
-    pub fn stop_task(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.stop_call(move || api::stop(id), cx);
+    /// Stop a task and its unfinished subtasks from `source`, toast how many stopped, then refresh.
+    pub fn stop_task(&mut self, id: i64, source: &'static str, cx: &mut Context<Self>) {
+        self.stop_call(move || api::stop(id, source, None), cx);
     }
 
     /// Stop every running team, toast how many stopped, then refresh.
     pub fn stop_all(&mut self, cx: &mut Context<Self>) {
-        self.stop_call(api::stop_all, cx);
+        self.stop_call(|| api::stop_all("Work \u{2192} Stop all"), cx);
     }
 
     fn stop_call(&mut self, call: impl FnOnce() -> anyhow::Result<Vec<i64>> + Send + 'static, cx: &mut Context<Self>) {
@@ -424,10 +449,39 @@ impl Store {
         .detach();
     }
 
-    /// Send new instructions to a task, then refresh.
+    /// Send new instructions to a task; toast the daemon's note when it sends one, then refresh.
     pub fn instruct_task(&mut self, id: i64, text: String, cx: &mut Context<Self>) {
-        self.show_toast("Instructions sent", vec![format!("Thread {id}")], cx);
-        self.act(move || api::instruct(id, &text), cx);
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { api::instruct(id, &text) }).await;
+            this.update(cx, |s, cx| {
+                s.action_error = res.as_ref().err().map(|e| format!("Request failed: {e}"));
+                if let Ok(note) = res {
+                    s.show_toast("Sent", vec![note.unwrap_or_else(|| format!("Thread {id}"))], cx);
+                }
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Review landed work: "Looks good" (`ok`) or send it back with `text`.
+    pub fn review_task(&mut self, id: i64, ok: bool, text: Option<String>, cx: &mut Context<Self>) {
+        let (title, verdict) = if ok { ("Marked as good", "ok") } else { ("Sent back for changes", "changes") };
+        self.show_toast(title, vec![format!("Thread {id}")], cx);
+        self.act(move || api::review(id, verdict, text.as_deref()), cx);
+    }
+
+    /// Drop a stuck task, then refresh.
+    pub fn drop_task(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Dropped", vec![format!("Thread {id}")], cx);
+        self.act(move || api::drop_task(id), cx);
+    }
+
+    /// Retry a stuck task, then refresh.
+    pub fn retry_task(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Retrying", vec![format!("Thread {id}")], cx);
+        self.act(move || api::retry_task(id), cx);
     }
 
     /// Restart a project's apps, then refresh.
@@ -554,12 +608,6 @@ impl Store {
     }
 }
 
-/// What waits on the owner: open owner questions plus open asks from Rui.
-pub fn inbox_count(questions: &[Question], asks: &[ChatAsk]) -> usize {
-    let owner = questions.iter().filter(|q| q.status == QuestionStatus::Open).count();
-    owner + asks.iter().filter(|a| a.status == "open").count()
-}
-
 /// Who picks an answer up: the member that first passed the question up.
 pub fn pickup_who(q: &Question) -> String {
     match q.ladder.first() {
@@ -592,20 +640,6 @@ mod tests {
         serde_json::from_value(serde_json::json!({"id":1,"task_id":2,"asked_by":"builder","text":"q",
             "answer":null,"status":"open","created_at":"a","ladder":ladder}))
         .unwrap()
-    }
-
-    fn ask(id: i64, status: &str) -> ChatAsk {
-        ChatAsk { id, chat_id: 1, chat_title: "t".into(), text: "q".into(), options: vec![], answer: None, status: status.into(), created_at: "a".into() }
-    }
-
-    #[test]
-    fn inbox_count_adds_open_asks_to_open_questions() {
-        let mut answered = question(serde_json::json!([]));
-        answered.status = QuestionStatus::Answered;
-        let questions = vec![question(serde_json::json!([])), answered];
-        let asks = vec![ask(1, "open"), ask(2, "answered"), ask(3, "open")];
-        assert_eq!(inbox_count(&questions, &asks), 3);
-        assert_eq!(inbox_count(&[], &[]), 0);
     }
 
     #[test]

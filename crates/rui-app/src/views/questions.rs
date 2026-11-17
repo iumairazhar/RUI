@@ -4,8 +4,10 @@ use super::asks::AskInputs;
 use super::character::{CharState, character};
 use super::library::{after_slide, close_button, drawer_shell, scroll_body, scrim, slide_overlay};
 use super::motion::rise;
-use super::{markdown, page_head, primary_button, tag};
-use crate::store::{self, Store, inbox_count};
+use super::status::{Word, char_state, style};
+use super::{chip, markdown, page_head, primary_button, tag};
+use crate::api::InboxItem;
+use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{
@@ -17,14 +19,19 @@ use std::collections::HashMap;
 
 const WHY_HINT: &str = "Why \u{2014} this becomes a lesson in the Playbook, so the team doesn\u{2019}t ask again";
 const ASK_SUB: &str = "Rui \u{b7} asked in chat";
-const NONE_TEXT: &str = "Nothing is waiting on you. Every thread settled below you.";
+const NONE_TEXT: &str = "Nothing needs you right now.";
 
 /// What the drawer shows.
 #[derive(Clone, Copy, PartialEq)]
 enum Open {
     Question(i64),
     Ask(i64),
+    Stuck(i64),
+    Review(i64),
 }
+
+/// Key of a drawer's text input: (kind, id).
+type InputKey = (&'static str, i64);
 
 /// Open questions and asks as rows; the open one slides in as a drawer.
 pub struct QuestionsView {
@@ -32,6 +39,12 @@ pub struct QuestionsView {
     inputs: HashMap<i64, Entity<TextInput>>,
     whys: HashMap<i64, Entity<TextInput>>,
     ask_inputs: AskInputs,
+    /// Inputs of the stuck, review and fallback-question drawers.
+    notes: HashMap<InputKey, Entity<TextInput>>,
+    /// "Ask for changes" input is showing in the review drawer.
+    reveal: bool,
+    /// "Drop it" was clicked once and waits for a second click.
+    confirm_drop: bool,
     open: Option<Open>,
     /// Drawer is playing its slide-out before it closes.
     closing: bool,
@@ -60,8 +73,8 @@ pub fn ladder_text(ladder: &[Rung]) -> String {
 /// Text after the bold count in the lead line.
 fn lead_tail(n: usize) -> &'static str {
     match n {
-        1 => " thread stopped rather than guess. Everything else settled below you.",
-        _ => " threads stopped rather than guess. Everything else settled below you.",
+        1 => " item needs you.",
+        _ => " items need you.",
     }
 }
 
@@ -69,11 +82,6 @@ fn lead_tail(n: usize) -> &'static str {
 fn first_line(text: &str) -> String {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     line.chars().filter(|c| !"#*_".contains(*c)).collect::<String>().trim().to_string()
-}
-
-/// "Client · Agent stopped and passed it up".
-fn sub_line(client: Option<&str>, agent: &str) -> String {
-    format!("{} \u{b7} {agent} stopped and passed it up", client.unwrap_or("General"))
 }
 
 fn lead_line(n: usize, th: &Theme) -> Stateful<Div> {
@@ -142,7 +150,7 @@ impl QuestionsView {
         let (inputs, whys) = (HashMap::new(), HashMap::new());
         let focus = cx.focus_handle();
         Self {
-            store, inputs, whys, ask_inputs: AskInputs::default(), open: None, closing: false, pick: None, focus, want_focus: false,
+            store, inputs, whys, ask_inputs: AskInputs::default(), notes: HashMap::new(), reveal: false, confirm_drop: false, open: None, closing: false, pick: None, focus, want_focus: false,
         }
     }
 
@@ -150,6 +158,7 @@ impl QuestionsView {
 
     fn open_item(&mut self, item: Open, cx: &mut Context<Self>) {
         (self.open, self.closing, self.pick, self.want_focus) = (Some(item), false, None, true);
+        (self.reveal, self.confirm_drop) = (false, false);
         cx.notify();
     }
 
@@ -167,6 +176,7 @@ impl QuestionsView {
             return;
         }
         (self.closing, self.open, self.pick) = (false, None, None);
+        (self.reveal, self.confirm_drop) = (false, false);
         cx.notify();
     }
 
@@ -176,9 +186,12 @@ impl QuestionsView {
         }
     }
 
-    fn open_thread(&mut self, cx: &mut Context<Self>) {
+    fn open_thread(&mut self, task_id: Option<i64>, cx: &mut Context<Self>) {
         (self.open, self.closing) = (None, false);
-        self.store.update(cx, |s, cx| s.go_to_threads(cx));
+        match task_id {
+            Some(id) => self.store.update(cx, |s, cx| s.open_thread(id, cx)),
+            None => self.store.update(cx, |s, cx| s.go_to_threads(cx)),
+        }
     }
 
     // ---- answering ----
@@ -237,26 +250,39 @@ impl QuestionsView {
         let name = div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(13.));
         let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(r.title);
         let text = div().flex().flex_col().flex_1().min_w_0().gap(px(2.)).child(name).child(muted_line(r.sub, 11.5, &th));
-        let face = character(CharState::Blocked, px(36.), (r.key, n), r.color, &th);
+        let face = character(r.face, px(36.), (r.key, n), r.color, &th);
         let row = div().id((r.key, n)).flex().items_center().gap(px(12.)).px(px(14.)).py(px(11.)).mb(px(6.));
         let row = row.rounded(px(10.)).bg(th.surface).cursor_pointer().hover(move |s| s.bg(hover));
         let row = row.on_click(cx.listener(move |this, _, _, cx| this.open_item(item, cx)));
-        let row = row.child(face).child(text).child(tag(&th.block, "Needs you"));
+        let row = row.child(face).child(text).child(tag(style(r.word, &th), r.tag));
         rise(row, (r.rise, n), i).into_any_element()
     }
 
-    fn rows(&self, questions: &[&Question], asks: &[&ChatAsk], cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn rows(&self, items: &[InboxItem], cx: &mut Context<Self>) -> Vec<AnyElement> {
         let th = theme(cx).clone();
-        let mut out: Vec<Row> = questions.iter().map(|q| self.question_row(q, &th, cx)).collect();
-        out.extend(asks.iter().map(|a| ask_row(a, &th)));
-        out.into_iter().enumerate().map(|(i, r)| self.row(i, r, cx)).collect()
+        let rows: Vec<Row> = items.iter().filter_map(|it| self.item_row(it, &th, cx)).collect();
+        rows.into_iter().enumerate().map(|(i, r)| self.row(i, r, cx)).collect()
     }
 
-    fn question_row(&self, q: &Question, th: &Theme, cx: &Context<Self>) -> Row {
-        let o = Origin::new(q, self.store.read(cx));
-        let sub = sub_line(o.client.as_deref(), &o.agent);
-        Row { open: Open::Question(q.id), id: q.id, key: "inbox-q", rise: "inbox-q-rise", color: o.color(th), title: first_line(&q.text), sub }
+    fn item_row(&self, it: &InboxItem, th: &Theme, cx: &Context<Self>) -> Option<Row> {
+        let (open, key, rise, tag, word) = kind_parts(&it.kind, it.id)?;
+        let s = self.store.read(cx);
+        let task = it.task_id.and_then(|id| s.tasks.iter().find(|t| t.id == id));
+        let color = th.client_color(task.map_or(0, |t| t.client_id));
+        let face = char_state(word);
+        Some(Row { open, id: it.id, key, rise, color, face, title: first_line(&it.title), sub: it.reason.clone(), tag, word })
     }
+}
+
+/// Drawer target, element keys, tag text and word for an inbox kind.
+fn kind_parts(kind: &str, id: i64) -> Option<(Open, &'static str, &'static str, &'static str, Word)> {
+    Some(match kind {
+        "question" => (Open::Question(id), "inbox-q", "inbox-q-rise", "Question", Word::NeedsYou),
+        "ask" => (Open::Ask(id), "inbox-a", "inbox-a-rise", "Asked in chat", Word::NeedsYou),
+        "stuck" => (Open::Stuck(id), "inbox-s", "inbox-s-rise", "Stuck", Word::NeedsYou),
+        "review" => (Open::Review(id), "inbox-r", "inbox-r-rise", "Review", Word::Done),
+        _ => return None,
+    })
 }
 
 /// What one list row shows.
@@ -266,13 +292,11 @@ struct Row {
     key: &'static str,
     rise: &'static str,
     color: Hsla,
+    face: CharState,
     title: String,
     sub: String,
-}
-
-fn ask_row(a: &ChatAsk, th: &Theme) -> Row {
-    let (open, sub) = (Open::Ask(a.id), ASK_SUB.to_string());
-    Row { open, id: a.id, key: "inbox-a", rise: "inbox-a-rise", color: th.client_color(0), title: first_line(&a.text), sub }
+    tag: &'static str,
+    word: Word,
 }
 
 fn answered_row(q: &Question, th: &Theme) -> AnyElement {
@@ -295,6 +319,8 @@ impl QuestionsView {
         let drawer = match self.open? {
             Open::Question(id) => self.question_drawer(id, th, cx)?,
             Open::Ask(id) => self.ask_drawer(id, th, cx)?,
+            Open::Stuck(id) => self.stuck_drawer(id, th, cx)?,
+            Open::Review(id) => self.review_drawer(id, th, cx)?,
         };
         let scrim = scrim("inbox-scrim", Self::close, cx);
         Some(slide_overlay("inbox", scrim, drawer, self.closing))
@@ -321,7 +347,8 @@ impl QuestionsView {
     }
 
     fn question_drawer(&mut self, id: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let q = self.store.read(cx).questions.iter().find(|q| q.id == id && q.status == QuestionStatus::Open)?.clone();
+        let found = self.store.read(cx).questions.iter().find(|q| q.id == id && q.status == QuestionStatus::Open).cloned();
+        let Some(q) = found else { return self.question_fallback(id, th, cx) };
         let o = Origin::new(&q, self.store.read(cx));
         let eyebrow = format!("{} \u{b7} needs a decision", o.client.clone().unwrap_or_else(|| "General".into()));
         let head = self.drawer_head(eyebrow, first_line(&q.text), th, cx);
@@ -337,13 +364,14 @@ impl QuestionsView {
 
     fn thread_section(&self, o: &Origin, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(task) = &o.task else { return div().into_any_element() };
+        let task_id = task.id;
         let face = character(CharState::Blocked, px(32.), ("inbox-thread-rui", task.id as usize), o.color(th), th);
         let name = div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(o.agent.clone());
         let text = div().flex().flex_col().flex_1().min_w_0().child(name).child(muted_line(task.title.clone(), 11.5, th));
         let hover = th.surface_2;
         let row = div().id("inbox-thread").flex().items_center().gap(px(10.)).px(px(12.)).py(px(9.)).rounded(px(10.));
         let row = row.bg(th.well).cursor_pointer().hover(move |s| s.bg(hover));
-        let row = row.on_click(cx.listener(|this, _, _, cx| this.open_thread(cx))).child(face).child(text);
+        let row = row.on_click(cx.listener(move |this, _, _, cx| this.open_thread(Some(task_id), cx))).child(face).child(text);
         let col = div().flex().flex_col().gap(px(8.)).child(heading("The thread waiting on this", th));
         col.child(row).into_any_element()
     }
@@ -379,15 +407,141 @@ impl QuestionsView {
     }
 }
 
+// ---- stuck, review and fallback drawers ----
+
+impl QuestionsView {
+    /// The shared input for a drawer, created on first use; Enter sends it.
+    fn note_input(&mut self, key: InputKey, hint: &'static str, cx: &mut Context<Self>) -> Entity<TextInput> {
+        if let Some(input) = self.notes.get(&key) {
+            return input.clone();
+        }
+        let input = cx.new(|cx| TextInput::new(hint, cx));
+        cx.subscribe(&input, move |this, _, _: &Submit, cx| this.send_note(key, cx)).detach();
+        self.notes.insert(key, input.clone());
+        input
+    }
+
+    /// Send what was typed in a drawer's input, then close the drawer.
+    fn send_note(&mut self, (kind, id): InputKey, cx: &mut Context<Self>) {
+        let Some(input) = self.notes.get(&(kind, id)).cloned() else { return };
+        let text = input.read(cx).content();
+        if text.trim().is_empty() {
+            return;
+        }
+        input.update(cx, |i, cx| i.clear(cx));
+        let task_id = self.task_of(id, kind, cx);
+        self.store.update(cx, |s, cx| match (kind, task_id) {
+            ("stuck", Some(t)) => s.instruct_task(t, text, cx),
+            ("review", Some(t)) => s.review_task(t, false, Some(text), cx),
+            _ => s.answer(id, text, None, cx),
+        });
+        self.close(cx);
+    }
+
+    fn item(&self, kind: &str, id: i64, cx: &Context<Self>) -> Option<InboxItem> {
+        self.store.read(cx).inbox.iter().find(|i| i.kind == kind && i.id == id).cloned()
+    }
+
+    fn task_of(&self, id: i64, kind: &str, cx: &Context<Self>) -> Option<i64> {
+        self.item(kind, id, cx).and_then(|i| i.task_id)
+    }
+
+    fn open_link(&self, task_id: Option<i64>, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let link = div().id("inbox-open-task").text_size(px(12.5)).text_color(th.run.fg).cursor_pointer();
+        let link = link.child("Open the task");
+        Some(link.on_click(cx.listener(move |this, _, _, cx| this.open_thread(task_id, cx))).into_any_element())
+            .filter(|_| task_id.is_some())
+    }
+
+    fn question_fallback(&mut self, id: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let it = self.item("question", id, cx)?;
+        let head = self.drawer_head("Question".into(), first_line(&it.title), th, cx);
+        let reason = markdown::render(&it.reason, th.fg, 13., th);
+        let body = scroll_body("inbox-drawer-scroll", vec![reason]);
+        let input = self.note_input(("question", id), "Your answer...", cx);
+        let send = primary_button("inbox-send", "Send answer", cx).on_click(cx.listener(move |this, _, _, cx| this.send_note(("question", id), cx)));
+        let foot = self.composer(vec![Self::field(Some(input), th)], send.into_any_element(), None, th);
+        Some(drawer_shell("inbox-drawer", th).child(head).child(body).child(foot).into_any_element())
+    }
+
+    fn stuck_drawer(&mut self, id: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let it = self.item("stuck", id, cx)?;
+        let task = it.task_id;
+        let head = self.drawer_head("Stuck".into(), first_line(&it.title), th, cx);
+        let mut body = vec![markdown::render(&it.reason, th.fg, 13., th)];
+        body.extend(self.open_link(task, th, cx));
+        body.push(self.stuck_buttons(task, cx));
+        let body = scroll_body("inbox-drawer-scroll", body);
+        let input = self.note_input(("stuck", id), "New instructions...", cx);
+        let send = primary_button("inbox-send", "Send instructions", cx).on_click(cx.listener(move |this, _, _, cx| this.send_note(("stuck", id), cx)));
+        let foot = self.composer(vec![Self::field(Some(input), th)], send.into_any_element(), None, th);
+        Some(drawer_shell("inbox-drawer", th).child(head).child(body).child(foot).into_any_element())
+    }
+
+    fn stuck_buttons(&mut self, task: Option<i64>, cx: &mut Context<Self>) -> AnyElement {
+        let drop_label = if self.confirm_drop { "Click again to drop" } else { "Drop it" };
+        let retry = primary_button("inbox-retry", "Retry", cx).on_click(cx.listener(move |this, _, _, cx| {
+            let Some(t) = task else { return };
+            this.store.update(cx, |s, cx| s.retry_task(t, cx));
+            this.close(cx);
+        }));
+        let drop = chip("inbox-drop", drop_label, cx).on_click(cx.listener(move |this, _, _, cx| this.drop_click(task, cx)));
+        div().flex().gap(px(8.)).child(retry).child(drop).into_any_element()
+    }
+
+    /// First click arms the drop; the second one drops the task.
+    fn drop_click(&mut self, task: Option<i64>, cx: &mut Context<Self>) {
+        let Some(t) = task else { return };
+        if !self.confirm_drop {
+            self.confirm_drop = true;
+            cx.notify();
+            return;
+        }
+        self.store.update(cx, |s, cx| s.drop_task(t, cx));
+        self.close(cx);
+    }
+
+    fn review_drawer(&mut self, id: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let it = self.item("review", id, cx)?;
+        let task = it.task_id;
+        let head = self.drawer_head("Review".into(), first_line(&it.title), th, cx);
+        let mut body = vec![markdown::render(&it.reason, th.fg, 13., th)];
+        body.extend(self.open_link(task, th, cx));
+        body.push(self.review_buttons(task, cx));
+        let body = scroll_body("inbox-drawer-scroll", body);
+        let drawer = drawer_shell("inbox-drawer", th).child(head).child(body);
+        if !self.reveal {
+            return Some(drawer.into_any_element());
+        }
+        let input = self.note_input(("review", id), "What should change?", cx);
+        let send = primary_button("inbox-send", "Send changes", cx).on_click(cx.listener(move |this, _, _, cx| this.send_note(("review", id), cx)));
+        let foot = self.composer(vec![Self::field(Some(input), th)], send.into_any_element(), None, th);
+        Some(drawer.child(foot).into_any_element())
+    }
+
+    fn review_buttons(&mut self, task: Option<i64>, cx: &mut Context<Self>) -> AnyElement {
+        let good = primary_button("inbox-good", "Looks good", cx).on_click(cx.listener(move |this, _, _, cx| {
+            let Some(t) = task else { return };
+            this.store.update(cx, |s, cx| s.review_task(t, true, None, cx));
+            this.close(cx);
+        }));
+        let changes = chip("inbox-changes", "Ask for changes", cx).on_click(cx.listener(|this, _, _, cx| {
+            this.reveal = true;
+            cx.notify();
+        }));
+        div().flex().gap(px(8.)).child(good).child(changes).into_any_element()
+    }
+}
+
 impl Render for QuestionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.want_focus {
             self.want_focus = false;
             window.focus(&self.focus);
         }
-        let (questions, asks) = {
+        let (questions, asks, inbox) = {
             let s = self.store.read(cx);
-            (s.questions.clone(), s.asks.clone())
+            (s.questions.clone(), s.asks.clone(), s.inbox.clone())
         };
         let th = theme(cx).clone();
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
@@ -395,13 +549,12 @@ impl Render for QuestionsView {
         let open: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Open).collect();
         self.sync_inputs(&open, cx);
         let answered: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Answered).rev().take(10).collect();
-        let rows = self.rows(&open, &open_asks, cx);
-        let empty = rows.is_empty().then(|| muted_line("Nothing needs a decision right now.".into(), 13., &th));
+        let rows = self.rows(&inbox, cx);
         let body = div().id("questions-scroll").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
-        let body = body.pr(px(40.)).pb(px(28.)).children(rows).children(empty);
+        let body = body.pr(px(40.)).pb(px(28.)).children(rows);
         let body = body.children((!answered.is_empty()).then(|| answered_section(&answered, &th)));
         let page = div().flex().flex_col().size_full().child(page_head("NEEDS A DECISION", "Inbox", cx));
-        let page = page.child(lead_line(inbox_count(&questions, &asks), &th)).child(body);
+        let page = page.child(lead_line(inbox.len(), &th)).child(body);
         let overlay = self.overlay(&th, cx);
         let root = div().id("inbox-page").relative().size_full().track_focus(&self.focus);
         root.on_key_down(cx.listener(|this, ev, _, cx| this.key_down(ev, cx))).child(page).children(overlay)
@@ -427,19 +580,13 @@ mod tests {
 
     #[test]
     fn lead_tail_is_singular_for_one() {
-        assert!(lead_tail(1).starts_with(" thread stopped"));
-        assert!(lead_tail(3).starts_with(" threads stopped"));
+        assert!(lead_tail(1).starts_with(" item needs"));
+        assert!(lead_tail(3).starts_with(" items need"));
     }
 
     #[test]
     fn first_line_strips_markdown() {
         assert_eq!(first_line("\n## **Use** _Postgres_?\nmore"), "Use Postgres?");
         assert_eq!(first_line(""), "");
-    }
-
-    #[test]
-    fn sub_line_names_client_and_agent() {
-        assert_eq!(sub_line(Some("Fide"), "Backend 7"), "Fide \u{b7} Backend 7 stopped and passed it up");
-        assert!(sub_line(None, "Pod Lead").starts_with("General \u{b7} Pod Lead"));
     }
 }

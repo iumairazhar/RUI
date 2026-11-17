@@ -6,6 +6,7 @@ use super::{Col, Thread, ThreadsView, parse_secs, thread_col};
 use crate::store::Store;
 use crate::theme::Theme;
 use crate::views::library::{confirm_modal, danger_button};
+use crate::views::status::Word;
 use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, div, prelude::*, px};
 use rui_core::{Task, TaskStatus};
 use std::cmp::Reverse;
@@ -27,10 +28,10 @@ pub(super) struct Band {
     stopped: Vec<Thread>,
 }
 
-/// Ids of tasks that have a `stopped` event.
+/// Ids of tasks whose status word is Stopped.
 pub(super) fn stopped_ids(s: &Store) -> HashSet<i64> {
-    let recent = s.events.iter().filter(|e| e.kind == "stopped").filter_map(|e| e.task_id);
-    recent.chain(s.stopped.iter().copied()).collect()
+    let stopped = s.states.values().filter(|o| Word::from_str(&o.word) == Word::Stopped);
+    stopped.map(|o| o.task_id).collect()
 }
 
 fn find(tasks: &[Task], id: i64) -> Option<&Task> {
@@ -98,7 +99,7 @@ impl ThreadsView {
     fn stop_group(&mut self, id: i64, cx: &mut Context<Self>) {
         let targets = stop_targets(&self.store.read(cx).tasks, id);
         self.begin_stopping(targets, cx);
-        self.store.update(cx, |s, cx| s.stop_task(id, cx));
+        self.store.update(cx, |s, cx| s.stop_task(id, "Work", cx));
     }
 
     pub(super) fn cancel_stop_all(&mut self, cx: &mut Context<Self>) {

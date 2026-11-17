@@ -73,9 +73,43 @@ pub fn get_seat() -> Result<SeatInfo> {
     Ok(serde_json::from_value(get("/seat")?)?)
 }
 
-/// Ids of stuck tasks that were stopped rather than stuck on their own.
-pub fn get_stopped() -> Result<Vec<i64>> {
-    Ok(serde_json::from_value(get("/tasks/stopped")?)?)
+/// One item that needs the owner, from `GET /inbox`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InboxItem {
+    /// "question", "ask", "stuck" or "review".
+    pub kind: String,
+    pub id: i64,
+    #[serde(default)]
+    pub task_id: Option<i64>,
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// A task's owner-facing status word and reason, from `GET /tasks/state`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OwnerState {
+    pub task_id: i64,
+    /// "Needs you", "Working", "Waiting", "Stopped" or "Done".
+    pub word: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub since: String,
+}
+
+/// Fetch everything that needs the owner, newest first.
+pub fn get_inbox() -> Result<Vec<InboxItem>> {
+    Ok(serde_json::from_value(get("/inbox")?)?)
+}
+
+/// Fetch every task's status word and reason.
+pub fn get_task_states() -> Result<Vec<OwnerState>> {
+    Ok(serde_json::from_value(get("/tasks/state")?)?)
 }
 
 /// Fetch the latest run (model and seat) per task.
@@ -389,19 +423,40 @@ fn stopped_ids(v: &serde_json::Value) -> Vec<i64> {
     v["stopped"].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default()
 }
 
+/// Body of a stop call: where it came from and an optional reason.
+fn stop_body(source: &str, reason: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "source": source, "reason": reason })
+}
+
 /// Stop a task and its unfinished subtasks; returns every id stopped.
-pub fn stop(id: i64) -> Result<Vec<i64>> {
-    Ok(stopped_ids(&post_value(&format!("/tasks/{id}/stop"), serde_json::json!({}))?))
+pub fn stop(id: i64, source: &str, reason: Option<&str>) -> Result<Vec<i64>> {
+    Ok(stopped_ids(&post_value(&format!("/tasks/{id}/stop"), stop_body(source, reason))?))
 }
 
 /// Stop every running team; returns every id stopped.
-pub fn stop_all() -> Result<Vec<i64>> {
-    Ok(stopped_ids(&post_value("/stop-all", serde_json::json!({}))?))
+pub fn stop_all(source: &str) -> Result<Vec<i64>> {
+    Ok(stopped_ids(&post_value("/stop-all", stop_body(source, None))?))
 }
 
-/// Pass new instructions down to a task.
-pub fn instruct(id: i64, text: &str) -> Result<()> {
-    post(&format!("/tasks/{id}/instruct"), serde_json::json!({ "text": text }))
+/// Pass new instructions down to a task; returns the daemon's note about what happens next.
+pub fn instruct(id: i64, text: &str) -> Result<Option<String>> {
+    let v = post_value(&format!("/tasks/{id}/instruct"), serde_json::json!({ "text": text }))?;
+    Ok(v["note"].as_str().map(str::to_string))
+}
+
+/// Review landed work: verdict "ok" or "changes" (with the owner's text).
+pub fn review(id: i64, verdict: &str, text: Option<&str>) -> Result<()> {
+    post(&format!("/tasks/{id}/review"), serde_json::json!({ "verdict": verdict, "text": text }))
+}
+
+/// Drop a stuck task.
+pub fn drop_task(id: i64) -> Result<()> {
+    post(&format!("/tasks/{id}/drop"), serde_json::json!({}))
+}
+
+/// Retry a stuck task.
+pub fn retry_task(id: i64) -> Result<()> {
+    post(&format!("/tasks/{id}/retry"), serde_json::json!({}))
 }
 
 /// Fetch the files a task changed.
@@ -527,6 +582,23 @@ mod tests {
             "tools":["Read"],"skills":["fastapi"],"max_loops":6}]"#;
         let v: Vec<RoleInfo> = serde_json::from_str(j).unwrap();
         assert_eq!((v[0].code.as_str(), v[0].max_loops, v[0].skills.len()), ("BE", 6, 1));
+    }
+
+    #[test]
+    fn parses_inbox_and_states() {
+        let j = r#"[{"kind":"stuck","id":4,"task_id":null,"title":"t","reason":"r","actions":["Retry"],"created_at":"a"}]"#;
+        let v: Vec<InboxItem> = serde_json::from_str(j).unwrap();
+        assert_eq!((v[0].kind.as_str(), v[0].task_id, v[0].actions.len()), ("stuck", None, 1));
+        let s = r#"[{"task_id":2,"word":"Needs you","reason":"Asks: x","since":"a"}]"#;
+        let v: Vec<OwnerState> = serde_json::from_str(s).unwrap();
+        assert_eq!((v[0].task_id, v[0].word.as_str()), (2, "Needs you"));
+    }
+
+    #[test]
+    fn stop_body_carries_source_and_reason() {
+        let b = stop_body("Work", Some("why"));
+        assert_eq!((b["source"].as_str(), b["reason"].as_str()), (Some("Work"), Some("why")));
+        assert!(stop_body("Work", None)["reason"].is_null());
     }
 
     #[test]

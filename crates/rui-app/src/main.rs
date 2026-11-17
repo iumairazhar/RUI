@@ -2,6 +2,7 @@
 
 mod api;
 mod assets;
+mod notify;
 mod store;
 mod text_editor;
 mod text_input;
@@ -15,7 +16,7 @@ use gpui::{
     WindowBounds, WindowOptions, div, point, prelude::*, px, size, svg,
 };
 use rui_core::{Task, TaskStatus};
-use store::{Store, StoreHandle, inbox_count};
+use store::{Store, StoreHandle};
 use theme::{Theme, theme};
 use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
@@ -287,7 +288,7 @@ impl Root {
 
     fn open_questions(&self, cx: &Context<Self>) -> usize {
         let s = self.store.read(cx);
-        inbox_count(&s.questions, &s.asks)
+        s.inbox.len()
     }
 
     fn badge(&self, th: &Theme, count: usize) -> impl IntoElement + use<> {
