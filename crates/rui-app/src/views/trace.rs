@@ -319,12 +319,39 @@ fn done_check_row(time: &str, p: &Value) -> TraceRow {
     TraceRow { error: !passed, ..row(Kind::Ran, time, Some("done check".into()), text) }
 }
 
+/// "Stopped by you from Task page: why", mirroring the daemon's reason line.
+fn stopped_text(p: &Value) -> String {
+    let source = p["source"].as_str().filter(|s| !s.is_empty());
+    let mut text = match (p["by"].as_str(), source) {
+        (Some("rui"), _) => "Stopped by Rui".to_string(),
+        (Some("system"), _) => "Stopped by the system".to_string(),
+        (_, Some(s)) => format!("Stopped by you from {s}"),
+        _ => "Stopped by you".to_string(),
+    };
+    if let Some(r) = p["reason"].as_str().filter(|r| !r.trim().is_empty()) {
+        text.push_str(&format!(": {r}"));
+    }
+    text
+}
+
+fn resumed_text(p: &Value) -> String {
+    let ids: Vec<String> = p["ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).map(|i| format!("#{i}")).collect();
+    if ids.is_empty() { "Resumed".into() } else { format!("Resumed: {}", ids.join(", ")) }
+}
+
+fn reviewed_text(p: &Value) -> &'static str {
+    if p["verdict"] == "ok" { "You reviewed it: looks good" } else { "You asked for changes" }
+}
+
 fn other_row(e: &Event) -> Option<TraceRow> {
     let (p, time) = (&e.payload, hhmm(&e.created_at));
     let text = |k: &str| p[k].as_str().unwrap_or("").to_string();
     match e.kind.as_str() {
         "instruction" => Some(row(Kind::YouSaid, &time, None, text("text"))),
-        "stopped" => Some(row(Kind::Stopped, &time, None, "Stopped by you")),
+        "stopped" => Some(row(Kind::Stopped, &time, None, stopped_text(p))),
+        "resumed" => Some(row(Kind::Finished, &time, None, resumed_text(p))),
+        "reviewed" => Some(row(Kind::YouSaid, &time, None, reviewed_text(p))),
+        "dropped" => Some(row(Kind::Stopped, &time, None, "You dropped it")),
         "done_check" => Some(done_check_row(&time, p)),
         "commit" if p["committed"] == true => Some(row(Kind::Finished, &time, None, "Committed")),
         "agent_error" | "scheduler_error" => Some(errored(row(Kind::Stopped, &time, None, text("error")))),
@@ -549,6 +576,19 @@ mod tests {
             ("Stopped", "bad", true),
             ("Stopped", "Run failed", true),
         ]);
+    }
+
+    #[test]
+    fn owner_events_read_as_sentences() {
+        let text = |k: &str, p: Value| trace(&[ev(k, p)]).remove(0).text;
+        let by_owner = json!({"by":"owner","source":"Task page","reason":"wrong goal"});
+        assert_eq!(text("stopped", by_owner), "Stopped by you from Task page: wrong goal");
+        assert_eq!(text("stopped", json!({"by":"rui","reason":"changed course"})), "Stopped by Rui: changed course");
+        assert_eq!(text("stopped", json!({"by":"owner"})), "Stopped by you");
+        assert_eq!(text("resumed", json!({"ids":[3,4],"by":"owner"})), "Resumed: #3, #4");
+        assert_eq!(text("reviewed", json!({"verdict":"ok"})), "You reviewed it: looks good");
+        assert_eq!(text("reviewed", json!({"verdict":"changes"})), "You asked for changes");
+        assert_eq!(text("dropped", json!({"by":"owner"})), "You dropped it");
     }
 
     #[test]

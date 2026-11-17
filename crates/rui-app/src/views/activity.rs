@@ -1,20 +1,21 @@
-//! Threads: five live columns of agent threads plus a detail drawer.
+//! Threads: the board of agent threads, with a full task page for the open one.
 
+mod task_page;
 mod team_view;
 mod teams;
 mod timeline;
 
 use super::live::live_action;
-use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files, trace};
+use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files};
 use super::character::{char_state, character};
 use super::motion::{self, delayed, ease, spring};
-use super::roster::{Dot, Loops, member_name, pod_line, role_code};
+use super::roster::{Dot, Loops, member_name, pod_line};
 use team_view::Phase;
 use timeline::ROWS;
 use teams::can_stop;
 use super::section::{Sec, section_top};
 use super::status::{self, Word, word_of};
-use super::{chip, markdown, primary_button, role_chip, tag};
+use super::{chip, markdown, primary_button, tag};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
 use crate::store::{self, Store};
@@ -23,7 +24,7 @@ use crate::theme::{Status, Theme, theme};
 use gpui::{
     AbsoluteLength, Animation, AnimationExt, AnyElement, Context, Div, Entity, FontWeight, Hsla, ScrollHandle,
     SharedString, Stateful, StyledText, Transformation, Window, div, prelude::*, px, radians,
-    relative, svg,
+    svg,
 };
 use rui_core::{Event, QuestionStatus, Role, Task, TaskStatus};
 use serde_json::Value;
@@ -198,8 +199,6 @@ struct Thread {
     question: Option<(i64, String)>,
     /// "Backend Engineer 01", or "Builder 7" when the task has no agent.
     name: String,
-    /// Two-letter role code for the chip.
-    code: String,
     /// Pod line such as "Lead, Pod: BE FE", set on a lead parent.
     pod_line: Option<String>,
     /// The task's status word, from the daemon.
@@ -217,21 +216,19 @@ fn threads_of(s: &Store) -> Vec<Thread> {
 }
 
 fn thread_of(s: &Store, t: &Task, question: Option<(i64, String)>) -> Thread {
-    let agent = t.agent.as_deref().unwrap_or("builder");
     Thread {
         task: t.clone(),
         client: s.clients.iter().find(|c| c.id == t.client_id).map_or(String::new(), |c| c.name.clone()),
         model: s.runs.get(&t.id).and_then(|r| r.model.clone()),
         question,
         name: member_name(t, &s.tasks, &s.roles).unwrap_or_else(|| label(t)),
-        code: role_code(&s.roles, agent),
         pod_line: pod_line(t, &s.roles),
         word: word_of(&s.states, t.id),
         reason: s.states.get(&t.id).map_or(String::new(), |o| o.reason.clone()),
     }
 }
 
-/// Tab of the drawer.
+/// Tab of the task page.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Trace,
@@ -258,20 +255,22 @@ pub(super) fn border_w<E: Styled>(mut e: E, w: f32) -> E {
     e
 }
 
-/// Threads of the board, with a drawer for the open one.
+/// Threads of the board, with a task page for the open one.
 pub struct ThreadsView {
     store: Entity<Store>,
     open: Option<i64>,
     tab: Tab,
     file: Option<String>,
-    /// A done task's drawer should switch to Results once its files load.
+    /// A done task's page should switch to Results once its files load.
     auto_results: bool,
     input: Entity<TextInput>,
     scroll: ScrollHandle,
     last_len: usize,
     expanded: HashSet<usize>,
-    /// Drawer is playing its slide-out before it closes.
-    closing: bool,
+    /// The Stop button was clicked and the optional "Why?" is showing.
+    stop_open: bool,
+    /// One-line reason for a stop from the task page.
+    why: Entity<TextInput>,
     /// Last column of each thread, to spot band changes.
     bands: HashMap<i64, Word>,
     /// Threads that just changed column: the column they left and when.
@@ -292,10 +291,12 @@ impl ThreadsView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Answer it, or pass down new instructions…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
+        let why = cx.new(|cx| TextInput::new("Why? (optional)", cx));
+        cx.subscribe(&why, |this, _, _: &Submit, cx| this.stop_now(cx)).detach();
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -303,10 +304,11 @@ impl ThreadsView {
         self.seen.clear();
     }
 
-    /// Open one task's thread in the side drawer.
+    /// Open one task's page in place of the board.
     pub fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open = Some(id);
-        self.closing = false;
+        self.stop_open = false;
+        self.why.update(cx, |i, cx| i.clear(cx));
         self.set_tab(Tab::Trace);
         self.file = None;
         self.auto_results = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.status == TaskStatus::Done);
@@ -347,26 +349,13 @@ impl ThreadsView {
         self.last_len = usize::MAX;
     }
 
-    /// Slide the drawer out, then drop it.
+    /// Back to the board.
     fn close(&mut self, cx: &mut Context<Self>) {
-        if self.open.is_none() || self.closing {
+        if self.open.is_none() {
             return;
         }
-        self.closing = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(DRAWER_MS)).await;
-            this.update(cx, |v, cx| v.finish_close(cx)).ok();
-        })
-        .detach();
-    }
-
-    fn finish_close(&mut self, cx: &mut Context<Self>) {
-        if !self.closing {
-            return;
-        }
-        self.closing = false;
         self.open = None;
+        self.stop_open = false;
         self.store.update(cx, |s, cx| s.load_changes(None, cx));
         cx.notify();
     }
@@ -497,88 +486,6 @@ impl ThreadsView {
         ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
-    fn drawer(&mut self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (events, changes) = self.task_data(t.task.id, cx);
-        let results = self.store.read(cx).results.get(&t.task.id).cloned().unwrap_or_default();
-        if self.auto_results && !results.is_empty() {
-            self.auto_results = false;
-            self.set_tab(Tab::Results);
-        }
-        let rows = trace(&events);
-        let live = self.store.read(cx).live.task(t.task.id).cloned();
-        let sig = scroll_sig(rows.len(), live.as_ref());
-        if self.tab == Tab::Trace && sig != self.last_len {
-            self.last_len = sig;
-            self.scroll.scroll_to_bottom();
-        }
-        let body = match self.tab {
-            Tab::Trace => {
-                let mut items = self.trace_rows(&rows, th, cx);
-                items.extend(live.as_ref().map(|l| live_row(l, th)));
-                section("Trace", items)
-            }
-            Tab::Changes => section("What it changed", change_cards(&changes, th)),
-            Tab::Files => self.files_tab(t.task.id, &rows, &changes, th, cx),
-            Tab::Results => section("Files it produced", self.result_rows(&results, th, cx)),
-        };
-        let scroll = div()
-            .id("drawer-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .gap(px(20.))
-            .p(px(20.))
-            .child(effort_section(&t.task, th))
-            .child(body);
-        let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
-        let close = self.close_button(th, cx);
-        let color = th.client_color(t.task.client_id);
-        let state = char_state(&t.task.status, live.as_ref());
-        let face = character(state, px(58.), ("drawer-rui", t.task.id as usize), color, th);
-        div()
-            .id("threads-drawer")
-            .occlude()
-            .absolute()
-            .right(px(10.))
-            .top(px(10.))
-            .bottom(px(10.))
-            .w(relative(0.52))
-            .max_w(px(620.))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(16.))
-            .bg(th.surface)
-            .shadow(th.card_shadow())
-            .border_1()
-            .border_color(th.glass_rim)
-            .child(drawer_head(t, now, th, close, self.tabs(!results.is_empty(), th, cx), face))
-            .child(scroll)
-            .children(composer)
-            .into_any_element()
-    }
-
-    fn close_button(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let hover = th.surface_2;
-        div()
-            .id("drawer-close")
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size(px(34.))
-            .rounded(px(9.))
-            .bg(th.ctl)
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
-            .child(icon("close", 16., th.fg_2))
-            .into_any_element()
-    }
-
     fn tabs(&self, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut tabs = vec![(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")];
         if has_results {
@@ -590,7 +497,7 @@ impl ThreadsView {
             .map(|(i, (tab, name))| {
                 let on = self.tab == tab;
                 div()
-                    .id(("drawer-tab", i))
+                    .id(("task-tab", i))
                     .flex()
                     .flex_1()
                     .items_center()
@@ -612,7 +519,7 @@ impl ThreadsView {
             })
             .collect();
         div()
-            .id("drawer-tabs")
+            .id("task-tabs")
             .flex()
             .gap(px(2.))
             .p(px(3.))
@@ -717,18 +624,12 @@ impl ThreadsView {
     }
 
     fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let id = t.task.id;
         let mut chips: Vec<AnyElement> = Vec::new();
         if t.question.is_none() {
             for (i, text) in ["Narrow the scope", "Show me the diff before you continue"].into_iter().enumerate() {
                 let c = small_chip(format!("suggest-{i}"), text, cx);
                 chips.push(c.on_click(cx.listener(move |this, _, _, cx| this.fill(text, cx))).into_any_element());
             }
-            let stop = small_chip("thread-stop".to_string(), "Stop and hand it back", cx);
-            let stop = stop.on_click(cx.listener(move |this, _, _, cx| {
-                this.store.update(cx, |s, cx| s.stop_task(id, "Thread drawer", cx));
-            }));
-            chips.push(stop.into_any_element());
         }
         let send = primary_button("thread-send", "Send down", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
         let row = div().flex().items_center().gap(px(8.)).child(div().flex_1().child(self.input.clone())).child(send);
@@ -759,11 +660,7 @@ pub(super) fn muted_status(th: &Theme) -> Status {
 }
 
 fn composer_hint(t: &Thread, th: &Theme) -> Div {
-    let tail = match t.word {
-        Word::Working => "It folds this into the work it is already doing.",
-        _ => "It is holding its context, so it picks up where it stopped.",
-    };
-    let text = format!("Goes straight to {}. {tail}", t.name);
+    let text = format!("Goes to {}. If it can't run yet, RUI resumes what it waits on and tells you.", t.name);
     div().mt(px(-2.)).text_size(px(11.)).text_color(th.muted).child(text)
 }
 
@@ -781,38 +678,6 @@ fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
         .border_color(th.hairline)
         .child(title)
         .child(mono(11., th.muted, count.to_string()))
-        .into_any_element()
-}
-
-fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, face: AnyElement) -> AnyElement {
-    let st = status::style(t.word, th);
-    let color = th.client_color(t.task.client_id);
-    let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
-    let top = div()
-        .flex()
-        .items_start()
-        .justify_between()
-        .child(div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child(eyebrow))
-        .child(close);
-    let name = div().text_size(px(23.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(t.name.clone());
-    let title = div().flex().items_center().gap(px(10.)).child(role_chip(&t.code, 26., color)).child(name);
-    let model = t.model.clone().map(|m| mono(11., th.muted, m));
-    let time = mono(10.5, th.muted, elapsed(&t.task.updated_at, now));
-    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, t.word.label())).children(model).child(time);
-    let sub = div().text_size(px(12.5)).text_color(th.muted).child(t.task.title.clone());
-    let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
-    let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub).children(pod);
-    let state = div().flex().items_center().gap(px(12.)).mt(px(16.)).child(face).child(info);
-    div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .px(px(20.))
-        .pt(px(20.))
-        .child(top)
-        .child(title)
-        .child(state)
-        .child(div().mt(px(16.)).child(tabs))
         .into_any_element()
 }
 
@@ -1199,49 +1064,26 @@ impl Render for ThreadsView {
         let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
         self.seen.extend(threads.iter().map(|t| t.task.id));
         let chart = self.chart(&threads, now, &th, cx);
+        let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
+        if let Some(t) = open {
+            return self.task_page(&t, &threads, now, &th, cx);
+        }
         let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
         let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll();
         let body = body.child(timeline::view(chart, &th)).child(board);
-        let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
-        let overlay = open.map(|t| self.overlay(&t, now, &th, cx));
         let confirm = self.confirm_view(&th, cx);
         let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
         let page = div().id("threads-page").relative().flex().flex_col().size_full();
-        page.child(top.pr(px(40.))).child(body).children(overlay).children(confirm)
+        page.child(top.pr(px(40.))).child(body).children(confirm).into_any_element()
     }
 }
 
-/// How far the drawer travels when it slides; covers its 620 px max width plus gap.
+/// How far a library drawer travels when it slides; covers its 620 px max width plus gap.
 pub(super) const DRAWER_TRAVEL: f32 = 660.;
 
-/// Eased visibility of the drawer: rising when opening, falling when closing.
+/// Eased visibility of a sliding drawer: rising when opening, falling when closing.
 pub(super) fn shown(closing: bool, d: f32) -> f32 {
     if closing { 1. - ease(d) } else { ease(d) }
-}
-
-impl ThreadsView {
-    fn overlay(&mut self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let scrim = div()
-            .id("threads-scrim")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .bg(gpui::black().opacity(0.3))
-            .on_click(cx.listener(|this, _, _, cx| this.close(cx)));
-        let drawer = self.drawer(t, now, th, cx);
-        let out = self.closing;
-        let scrim = scrim.with_animation(("threads-scrim-fade", out as usize), motion::once(SCRIM_MS), move |el, d| {
-            el.opacity(shown(out, d))
-        });
-        let slide = div().absolute().top_0().bottom_0().left_0().right_0().child(drawer);
-        let slide = slide.with_animation(("threads-drawer-slide", out as usize), motion::once(DRAWER_MS), move |el, d| {
-            let off = DRAWER_TRAVEL * (1. - shown(out, d));
-            el.left(px(off)).right(px(-off))
-        });
-        div().id("threads-overlay").absolute().top_0().left_0().right_0().bottom_0().child(scrim).child(slide).into_any_element()
-    }
 }
 
 #[cfg(test)]

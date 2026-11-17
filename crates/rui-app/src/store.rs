@@ -425,8 +425,8 @@ impl Store {
     }
 
     /// Stop a task and its unfinished subtasks from `source`, toast how many stopped, then refresh.
-    pub fn stop_task(&mut self, id: i64, source: &'static str, cx: &mut Context<Self>) {
-        self.stop_call(move || api::stop(id, source, None), cx);
+    pub fn stop_task(&mut self, id: i64, source: &'static str, reason: Option<String>, cx: &mut Context<Self>) {
+        self.stop_call(move || api::stop(id, source, reason.as_deref()), cx);
     }
 
     /// Stop every running team, toast how many stopped, then refresh.

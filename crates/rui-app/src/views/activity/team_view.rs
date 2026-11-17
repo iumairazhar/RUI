@@ -95,7 +95,7 @@ impl ThreadsView {
     fn stop_group(&mut self, id: i64, cx: &mut Context<Self>) {
         let targets = stop_targets(&self.store.read(cx).tasks, id);
         self.begin_stopping(targets, cx);
-        self.store.update(cx, |s, cx| s.stop_task(id, "Work", cx));
+        self.store.update(cx, |s, cx| s.stop_task(id, "Work", None, cx));
     }
 
     pub(super) fn cancel_stop_all(&mut self, cx: &mut Context<Self>) {

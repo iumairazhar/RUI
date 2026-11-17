@@ -2,7 +2,7 @@
 
 use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
-use super::chat_tools::{ToolCall, tool_calls, tool_output, tool_row_head};
+use super::chat_tools::{ToolCall, results_by_id, tool_calls, tool_output, tool_row_head};
 use super::library::confirm_modal;
 use super::{chip, markdown, primary_button, question_card};
 use crate::api::LiveState;
@@ -127,7 +127,9 @@ impl ChatView {
     ) -> AnyElement {
         let th = theme(cx).clone();
         let open: Vec<AnyElement> = questions.iter().map(|q| self.question(q, cx)).collect();
-        let ask_cards: Vec<AnyElement> = asks.iter().map(|a| ask_card(a, &self.ask_inputs, Self::answer_ask, cx)).collect();
+        let open_asks = asks.iter().filter(|a| a.status == "open");
+        let ask_cards: Vec<AnyElement> = open_asks.map(|a| ask_card(a, &self.ask_inputs, Self::answer_ask, cx)).collect();
+        let placed = place_asks(chat, asks);
         let steps = live.or_else(|| state.map(|_| vec![]));
         let working = steps.map(|steps| working_bubble(&steps, state, &th));
         let mut list = div()
@@ -141,7 +143,7 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap(px(20.))
-            .children(chat.iter().map(|m| self.message_with_cards(m, cards, tools, &th, cx)))
+            .children(chat.iter().map(|m| self.message_with_asks(m, placed.get(&m.id), cards, tools, &th, cx)))
             .children(ask_cards)
             .children((!live_tools.is_empty()).then(|| self.tool_rows(live_tools, &th, cx)))
             .children(working)
@@ -150,6 +152,14 @@ impl ChatView {
             list = list.child(div().text_size(px(13.)).text_color(th.muted).child("Tell Rui what to set up."));
         }
         list.into_any_element()
+    }
+
+    /// A message with its cards, then the answered asks that were put to the owner right after it.
+    fn message_with_asks(&self, m: &ChatMessage, asks: Option<&Vec<ChatAsk>>, cards: &HashMap<i64, Vec<ActCard>>, tools: &HashMap<i64, Vec<ToolCall>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let el = self.message_with_cards(m, cards, tools, th, cx);
+        let Some(asks) = asks else { return el };
+        let lines: Vec<AnyElement> = asks.iter().map(|a| answered_line(a, th)).collect();
+        div().flex().flex_col().gap(px(8.)).child(el).children(lines).into_any_element()
     }
 
     fn message_with_cards(&self, m: &ChatMessage, cards: &HashMap<i64, Vec<ActCard>>, tools: &HashMap<i64, Vec<ToolCall>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -194,9 +204,11 @@ impl ChatView {
         let head = head.child(icon("term", 12., th.muted)).child(tool).child("\u{b7} tool run by Rui");
         let body = div().px(px(14.)).pt(px(10.)).text_size(px(12.5)).text_color(th.fg_2).child(a.body.clone());
         let scope = div().px(px(14.)).text_size(px(11.5)).text_color(th.muted).child(a.scope.clone());
-        let open = chip(format!("act-open-{mid}-{k}"), "Open the result", cx).h(px(26.));
-        let open = open.on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.go_to_threads(cx))));
-        let foot = div().flex().px(px(14.)).pb(px(11.)).child(open);
+        let open = a.task_id.map(|id| {
+            let chip = chip(format!("act-open-{mid}-{k}"), "Open the task", cx).h(px(26.));
+            chip.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_thread(id, cx))))
+        });
+        let foot = div().flex().px(px(14.)).pb(px(11.)).children(open);
         let card = div().id(("act-card", mid as usize * 16 + k)).max_w(px(620.)).rounded(px(12.)).bg(th.well);
         card.border_1().border_color(th.hairline).flex().flex_col().gap(px(6.)).child(head).child(body).child(scope).child(foot).into_any_element()
     }
@@ -282,6 +294,8 @@ const STAFF_TOOL: &str = "mcp__rui__staff_task";
 pub(super) struct ActCard {
     pub body: String,
     pub scope: String,
+    /// The task the call created, from the tool result.
+    pub task_id: Option<i64>,
 }
 
 /// Card text from a `staff_task` input `{project?, title, brief, pod: [..]}`.
@@ -293,17 +307,24 @@ pub(super) fn staff_card(input: &Value, roles: &[RoleInfo]) -> ActCard {
         Some(p) => p.to_string(),
         None => "General task".to_string(),
     };
-    ActCard { body, scope }
+    ActCard { body, scope, task_id: None }
 }
 
-/// `staff_task` inputs Rui called in a chat between two moments (unix seconds, inclusive).
-fn staff_inputs(events: &[Event], chat_id: i64, from: i64, to: i64) -> Vec<Value> {
+/// The `task_id` in a `staff_task` result, which is the JSON the tool returned.
+fn task_id_of(result: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(result).ok()?["task_id"].as_i64()
+}
+
+/// `staff_task` inputs Rui called in a chat between two moments (unix seconds, inclusive), with the task each created.
+fn staff_calls(events: &[Event], chat_id: i64, from: i64, to: i64) -> Vec<(Value, Option<i64>)> {
     let in_turn = |e: &&Event| {
         let at = parse_secs(&e.created_at).unwrap_or(i64::MIN);
         e.agent == "rui" && e.kind == "assistant" && e.chat_id == Some(chat_id) && (from..=to).contains(&at)
     };
     let blocks = events.iter().filter(in_turn).flat_map(|e| e.payload["message"]["content"].as_array().cloned().unwrap_or_default());
-    blocks.filter(|b| b["type"] == "tool_use" && b["name"] == STAFF_TOOL).map(|b| b["input"].clone()).collect()
+    let results = results_by_id(events, chat_id, from, to);
+    let task = |b: &Value| results.get(b["id"].as_str().unwrap_or("")).filter(|r| !r.1).and_then(|r| task_id_of(&r.0));
+    blocks.filter(|b| b["type"] == "tool_use" && b["name"] == STAFF_TOOL).map(|b| (b["input"].clone(), task(&b))).collect()
 }
 
 /// Cards per Rui message id: the staff_task calls between the previous message and that one.
@@ -311,7 +332,8 @@ fn all_cards(chat: &[ChatMessage], events: &[Event], chat_id: i64, roles: &[Role
     let mut out = HashMap::new();
     for (i, m) in chat.iter().enumerate().filter(|(i, m)| *i > 0 && m.role == ChatRole::Rui) {
         let (Some(from), Some(to)) = (parse_secs(&chat[i - 1].created_at), parse_secs(&m.created_at)) else { continue };
-        let cards: Vec<ActCard> = staff_inputs(events, chat_id, from, to).iter().map(|v| staff_card(v, roles)).collect();
+        let card = |(v, task_id): &(Value, Option<i64>)| ActCard { task_id: *task_id, ..staff_card(v, roles) };
+        let cards: Vec<ActCard> = staff_calls(events, chat_id, from, to).iter().map(card).collect();
         if !cards.is_empty() {
             out.insert(m.id, cards);
         }
@@ -401,6 +423,38 @@ fn working_bubble(steps: &[String], state: Option<&LiveState>, th: &Theme) -> An
         .text_color(th.muted)
         .children(lines);
     div().flex().flex_col().gap(px(7.)).child(meta).child(div().flex().child(bubble)).into_any_element()
+}
+
+/// Answered asks by the id of the message they sit after: the last message sent at or before the ask.
+/// An ask before the first message goes after the first one; an ask with no readable time goes last.
+fn place_asks(chat: &[ChatMessage], asks: &[ChatAsk]) -> HashMap<i64, Vec<ChatAsk>> {
+    let mut out: HashMap<i64, Vec<ChatAsk>> = HashMap::new();
+    for a in asks.iter().filter(|a| a.status == "answered") {
+        let at = parse_secs(&a.created_at);
+        let before = |m: &ChatMessage| at.is_some_and(|t| parse_secs(&m.created_at).is_some_and(|s| s <= t));
+        let idx = match at {
+            Some(_) => chat.iter().rposition(before).or(Some(0)),
+            None => chat.len().checked_sub(1),
+        };
+        if let Some(m) = idx.and_then(|i| chat.get(i)) {
+            out.entry(m.id).or_default().push(a.clone());
+        }
+    }
+    out
+}
+
+/// "✓ question — You chose: answer".
+fn answered_text(a: &ChatAsk) -> String {
+    match a.answer.as_deref().filter(|t| !t.is_empty()) {
+        Some(answer) => format!("\u{2713} {} \u{2014} You chose: {answer}", a.text),
+        None => format!("\u{2713} {}", a.text),
+    }
+}
+
+/// An answered ask as one muted line.
+fn answered_line(a: &ChatAsk, th: &Theme) -> AnyElement {
+    let line = div().id(("ask-line", a.id as usize)).max_w(px(660.)).text_size(px(12.)).text_color(th.muted);
+    line.child(answered_text(a)).into_any_element()
 }
 
 /// Asks of one chat, answered ones first, oldest first.
@@ -685,8 +739,50 @@ mod tests {
         let events = vec![ev("2026-11-15T10:00:05.000Z", STAFF_TOOL), ev("2026-11-15T10:00:06.000Z", "mcp__rui__use_repo"), ev("2026-11-15T09:00:00.000Z", STAFF_TOOL)];
         let from = parse_secs("2026-11-15 10:00:03").unwrap();
         let to = parse_secs("2026-11-15 10:00:09").unwrap();
-        assert_eq!(staff_inputs(&events, 1, from, to).len(), 1);
-        assert_eq!(staff_inputs(&events, 2, from, to).len(), 0);
+        assert_eq!(staff_calls(&events, 1, from, to).len(), 1);
+        assert_eq!(staff_calls(&events, 2, from, to).len(), 0);
+    }
+
+    #[test]
+    fn staff_call_reads_task_id_from_result() {
+        let use_ev = Event {
+            id: 1, task_id: None, chat_id: Some(1), agent: "rui".into(), kind: "assistant".into(),
+            payload: serde_json::json!({"message":{"content":[{"type":"tool_use","id":"t1","name":STAFF_TOOL,"input":{"title":"x"}}]}}),
+            created_at: "2026-11-15T10:00:05.000Z".into(),
+        };
+        let res = r#"{"project":"acme","repo_path":"/r","task_id":42,"pod":["lead"]}"#;
+        let res_ev = Event {
+            kind: "toolresult".into(),
+            payload: serde_json::json!({"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":res,"is_error":false}]}}),
+            ..use_ev.clone()
+        };
+        let (from, to) = (parse_secs("2026-11-15 10:00:00").unwrap(), parse_secs("2026-11-15 10:01:00").unwrap());
+        assert_eq!(staff_calls(&[use_ev.clone(), res_ev], 1, from, to)[0].1, Some(42));
+        assert_eq!(staff_calls(&[use_ev], 1, from, to)[0].1, None);
+        assert_eq!(task_id_of("Held for the owner's OK"), None);
+    }
+
+    fn placed_ask(id: i64, at: &str) -> ChatAsk {
+        ChatAsk { id, chat_id: 1, chat_title: "t".into(), text: "Which?".into(), options: vec![], answer: Some("A".into()), status: "answered".into(), created_at: at.into() }
+    }
+
+    #[test]
+    fn asks_sit_after_the_message_they_followed() {
+        let msg = |id: i64, at: &str| ChatMessage { id, role: ChatRole::Rui, content: "x".into(), chat_id: 1, created_at: at.into() };
+        let chat = [msg(1, "2026-11-15 10:00:10"), msg(2, "2026-11-15 10:00:20"), msg(3, "2026-11-15 10:00:20")];
+        let asks = [placed_ask(1, "2026-11-15 10:00:05"), placed_ask(2, "2026-11-15 10:00:15"), placed_ask(3, "2026-11-15 10:00:20"), placed_ask(4, "2026-11-15 10:09:00")];
+        let got = place_asks(&chat, &asks);
+        let ids = |m: i64| got.get(&m).map(|v| v.iter().map(|a| a.id).collect::<Vec<_>>());
+        assert_eq!(ids(1), Some(vec![1, 2]));
+        assert_eq!(ids(2), None);
+        assert_eq!(ids(3), Some(vec![3, 4]));
+        let open = ChatAsk { status: "open".into(), ..placed_ask(9, "2026-11-15 10:00:12") };
+        assert!(place_asks(&chat, &[open]).is_empty());
+    }
+
+    #[test]
+    fn answered_line_text() {
+        assert_eq!(answered_text(&placed_ask(1, "a")), "\u{2713} Which? \u{2014} You chose: A");
     }
 
     #[test]

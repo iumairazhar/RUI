@@ -101,7 +101,7 @@ fn blocks_of(events: &[Event], chat_id: i64, from: i64, to: i64, kind: &str) -> 
 }
 
 /// Results by tool_use id: the text and whether it was an error.
-fn results_by_id(events: &[Event], chat_id: i64, from: i64, to: i64) -> HashMap<String, (String, bool)> {
+pub(super) fn results_by_id(events: &[Event], chat_id: i64, from: i64, to: i64) -> HashMap<String, (String, bool)> {
     let blocks = blocks_of(events, chat_id, from, to, "toolresult");
     let results = blocks.iter().filter(|b| b["type"] == "tool_result");
     let pair = |b: &Value| (b["tool_use_id"].as_str().unwrap_or("").to_string(), (result_text(&b["content"]), b["is_error"] == true));
