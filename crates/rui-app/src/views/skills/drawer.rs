@@ -2,15 +2,16 @@
 
 use super::table::{attached_label, author_label};
 use super::{SkillsView, Tab};
-use crate::api::{RoleInfo, SkillInfo};
+use crate::api::{RoleInfo, SkillFile, SkillInfo};
 use crate::theme::Theme;
 use crate::views::activity::{icon, section};
 use crate::views::library::{self as lib, EditActs, SKILL_TOOLS};
-use crate::views::{chip, primary_button};
+use crate::views::{chip, markdown, primary_button, tag};
 use gpui::{AnyElement, App, ClickEvent, Context, FontWeight, Window, div, prelude::*, px};
 
-const TABS: [(Tab, &str); 5] =
-    [(Tab::Overview, "Overview"), (Tab::Edit, "Edit"), (Tab::Attach, "Attach"), (Tab::Tools, "Tools"), (Tab::History, "History")];
+const TABS: [(Tab, &str); 6] =
+    [(Tab::Review, "Review"), (Tab::Overview, "Overview"), (Tab::Edit, "Edit"), (Tab::Attach, "Attach"), (Tab::Tools, "Tools"), (Tab::History, "History")];
+const MAX_LINES: usize = 200;
 const EDIT_HINT: &str = "Name and description are required. The description tells agents when to use the skill.";
 const REVIEW_TEXT: &str =
     "Imported skills can include instructions and scripts you didn\u{2019}t write. Read them before your agents use them.";
@@ -22,9 +23,48 @@ fn text(s: String, th: &Theme) -> AnyElement {
 fn review_bar(cx: &mut Context<SkillsView>, th: &Theme) -> AnyElement {
     let head = div().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(th.wait.fg).child("Review before turning on");
     let body = div().text_size(px(12.5)).text_color(th.fg_2).line_height(px(18.)).child(REVIEW_TEXT);
-    let read = chip("skill-read", "Read the SKILL.md", cx).on_click(cx.listener(|this, _, _, cx| this.set_tab(Tab::Edit, cx)));
+    let read = chip("skill-read", "Read the SKILL.md", cx).on_click(cx.listener(|this, _, _, cx| this.set_tab(Tab::Review, cx)));
     let bar = div().id("skill-review-bar").flex().flex_col().gap(px(8.)).p(px(16.)).rounded(px(10.));
     bar.bg(th.wait.dim).border_1().border_color(th.wait.rim).child(head).child(body).child(div().flex().child(read)).into_any_element()
+}
+
+/// "512 B", "2.1 KB", "1.5 MB".
+fn human_size(n: u64) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.1} KB", n as f64 / 1024.),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.),
+    }
+}
+
+/// First `max` lines of `s`, and how many lines were cut.
+fn cap_lines(s: &str, max: usize) -> (String, usize) {
+    let total = s.lines().count();
+    let kept: Vec<&str> = s.lines().take(max).collect();
+    (kept.join("\n"), total.saturating_sub(max))
+}
+
+/// Files under scripts/ can run code.
+fn runs_code(path: &str) -> bool {
+    path.starts_with("scripts/")
+}
+
+fn mono(s: String, th: &Theme) -> AnyElement {
+    div().font_family("Menlo").text_size(px(11.5)).text_color(th.fg_2).child(s).into_any_element()
+}
+
+fn unlocks(d: &SkillInfo, th: &Theme) -> Vec<AnyElement> {
+    let bash = d.bash.iter().map(|b| format!("Bash: {b}"));
+    let lines: Vec<AnyElement> = bash.chain(d.tools.iter().cloned()).map(|l| mono(l, th)).collect();
+    if lines.is_empty() { vec![text("No extra permissions.".into(), th)] } else { lines }
+}
+
+fn file_body(f: &SkillFile, th: &Theme) -> AnyElement {
+    let Some(t) = &f.text else { return lib::note("Binary or too large, not shown.", th).into_any_element() };
+    let (shown, hidden) = cap_lines(t, MAX_LINES);
+    let more = (hidden > 0).then(|| mono(format!("\u{2026} {hidden} more lines"), th));
+    let body = div().flex().flex_col().gap(px(4.)).p(px(10.)).rounded(px(8.)).bg(th.well);
+    body.child(mono(shown, th)).children(more).into_any_element()
 }
 
 fn used_line(n: i64, th: &Theme) -> AnyElement {
@@ -48,6 +88,7 @@ impl SkillsView {
 
     fn tab_body(&mut self, d: &SkillInfo, attached: &str, roles: &[RoleInfo], th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         match self.tab {
+            Tab::Review => self.review(d, th, cx),
             Tab::Overview => self.overview(d, attached, th, cx),
             Tab::Edit => {
                 let acts = EditActs { save: Self::save, preview: Self::toggle_preview, discard: Self::discard };
@@ -57,6 +98,31 @@ impl SkillsView {
             Tab::Tools => self.tools_tab(d, th, cx),
             Tab::History => lib::history_tab(&d.hist, &d.versions, Self::ask_restore, th, cx),
         }
+    }
+
+    fn review(&mut self, d: &SkillInfo, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let body = markdown::render(&d.body, th.fg_2, 12.5, th);
+        vec![
+            section("What it unlocks", unlocks(d, th)),
+            section("Instructions", vec![body]),
+            section("Files", self.file_rows(th, cx)),
+        ]
+    }
+
+    fn file_rows(&mut self, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(files) = self.files.clone() else { return vec![text("Loading files\u{2026}".into(), th)] };
+        files.iter().enumerate().map(|(i, f)| self.file_row(i, f, th, cx)).collect()
+    }
+
+    fn file_row(&self, i: usize, f: &SkillFile, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let path = f.path.clone();
+        let name = div().font_family("Menlo").text_size(px(12.)).text_color(th.fg).child(f.path.clone());
+        let size = div().text_size(px(11.)).text_color(th.muted).child(human_size(f.size));
+        let code = runs_code(&f.path).then(|| tag(&th.wait, "runs code"));
+        let head = div().flex().items_center().gap(px(8.)).child(name).child(size).children(code);
+        let row = div().id(("skill-file", i)).flex().flex_col().gap(px(6.)).py(px(4.)).cursor_pointer();
+        let row = row.on_click(cx.listener(move |this, _, _, cx| this.toggle_file(path.clone(), cx)));
+        row.child(head).children(self.open_files.contains(&f.path).then(|| file_body(f, th))).into_any_element()
     }
 
     fn overview(&self, d: &SkillInfo, attached: &str, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -133,5 +199,29 @@ impl SkillsView {
         btns.push(del.on_click(cx.listener(|this, _, _, cx| this.ask_delete(cx))).into_any_element());
         let hint = (d.status == "review").then_some("Nothing reads it until you turn it on.");
         lib::drawer_foot(btns, hint, th)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_picks_units() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2150), "2.1 KB");
+        assert_eq!(human_size(1_572_864), "1.5 MB");
+    }
+
+    #[test]
+    fn cap_lines_reports_hidden() {
+        assert_eq!(cap_lines("a\nb\nc", 2), ("a\nb".to_string(), 1));
+        assert_eq!(cap_lines("a\nb", 5), ("a\nb".to_string(), 0));
+    }
+
+    #[test]
+    fn runs_code_checks_scripts_dir() {
+        assert!(runs_code("scripts/run.sh"));
+        assert!(!runs_code("SKILL.md"));
     }
 }

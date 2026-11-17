@@ -563,7 +563,7 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
         chats.iter().map(|c| chat_row(c, current == Some(c.id), today, &th, cx)).collect();
     let eyebrow = div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child("TALK TO THE SYSTEM");
     let name = div().text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg).child("Rui");
-    let top = div().id("chats-title").px(px(14.)).pt(px(56.)).pb(px(12.)).flex().flex_col().gap(px(4.)).child(eyebrow).child(name);
+    let top = div().id("chats-title").px(px(14.)).pt(px(12.)).pb(px(12.)).flex().flex_col().gap(px(4.)).child(eyebrow).child(name);
     let head = div().id("chats-head").px(px(12.)).pb(px(10.)).child(new_chat_button(&th, cx));
     let scroll = div()
         .id("chats-scroll")
@@ -622,7 +622,7 @@ impl Render for ChatView {
             .min_w_0()
             .h_full()
             .pl(px(20.))
-            .pt(px(56.))
+            .pt(px(12.))
             .flex()
             .flex_col()
             .child(list)

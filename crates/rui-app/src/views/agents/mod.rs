@@ -13,7 +13,7 @@ use crate::api::{self, RoleInfo, SkillInfo};
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, Context, Div, Entity, FontWeight, Window, div, prelude::*, px};
-use rui_core::{Role, Task, TaskStatus};
+use rui_core::{Client, Role, Task, TaskStatus};
 use serde_json::{Value, json};
 
 /// Loop limits offered in the drawer.
@@ -72,6 +72,24 @@ fn pods_in_flight(tasks: &[Task]) -> Vec<&Task> {
 /// "2 pods holding 5 agents, ..." counts: (pods, agents).
 fn counts(pods: &[&Task]) -> (usize, usize) {
     (pods.len(), pods.iter().map(|p| p.pod.len()).sum())
+}
+
+/// "1 pod holding 3 agents, ..." lead sentence with proper plurals.
+fn lead_text(pods: usize, agents: usize) -> String {
+    let (p, a) = (if pods == 1 { "pod" } else { "pods" }, if agents == 1 { "agent" } else { "agents" });
+    format!("{pods} {p} holding {agents} {a}, each built from the specialists below. A pod takes only the roles its work needs.")
+}
+
+/// Pod groups by client in store order, then "Other" for pods whose client is unknown.
+fn group_pods<'a>(clients: &[Client], pods: &[&'a Task]) -> Vec<(String, Vec<&'a Task>)> {
+    let mut groups: Vec<(String, Vec<&Task>)> = clients
+        .iter()
+        .map(|c| (c.name.clone(), pods.iter().copied().filter(|p| p.client_id == c.id).collect()))
+        .collect();
+    let other = pods.iter().copied().filter(|p| !clients.iter().any(|c| c.id == p.client_id)).collect();
+    groups.push(("Other".to_string(), other));
+    groups.retain(|(_, v)| !v.is_empty());
+    groups
 }
 
 /// Pods in flight that include the role.
@@ -381,15 +399,27 @@ impl AgentsView {
     fn pod_card(&self, pod: &Task, cx: &Context<Self>) -> AnyElement {
         let th = theme(cx);
         let s = self.store.read(cx);
-        let project = s.clients.iter().find(|c| c.id == pod.client_id).map(|c| c.name.clone()).unwrap_or_default();
         let color = th.client_color(pod.client_id);
         let roles: Vec<AnyElement> = pod.pod.iter().enumerate().map(|(i, a)| self.pod_role(pod, i, a, color, cx)).collect();
+        let running = |t: &Task| s.live.task(t.id).is_some() || matches!(t.status, TaskStatus::InProgress | TaskStatus::Clarifying);
+        let live = pod.pod.iter().filter(|a| is_live(pod, a, &s.tasks, &running)).count();
+        let dot = div().flex_none().size(px(8.)).rounded_full().bg(color);
         let title = div().text_size(px(14.)).font_weight(FontWeight::BOLD).child(pod.title.clone());
-        let proj = div().text_size(px(11.5)).text_color(th.muted).child(project);
-        let max = div().ml_auto().text_size(px(11.5)).text_color(th.muted).child(format!("max loops {}", pod.max_loops));
-        let head = div().flex().items_center().gap(px(8.)).mb(px(12.)).child(title).child(proj).child(max);
+        let meta = format!("{} roles \u{b7} {live} in flight \u{b7} max loops {}", pod.pod.len(), pod.max_loops);
+        let max = div().ml_auto().text_size(px(11.5)).text_color(th.muted).child(meta);
+        let head = div().flex().items_center().gap(px(8.)).mb(px(12.)).child(dot).child(title).child(max);
         let roles = div().flex().flex_wrap().gap(px(8.)).children(roles);
         card(cx).id(("pod", pod.id as usize)).p(px(14.)).max_w(px(1040.)).child(head).child(roles).into_any_element()
+    }
+
+    /// One heading plus its pod cards for each client group.
+    fn pod_groups(&self, groups: &[(String, Vec<&Task>)], th: &Theme, cx: &Context<Self>) -> Vec<AnyElement> {
+        let one = |(name, pods): &(String, Vec<&Task>)| {
+            let cards: Vec<AnyElement> = pods.iter().map(|p| self.pod_card(p, cx)).collect();
+            let list = div().flex().flex_col().gap(px(8.)).children(cards);
+            div().flex().flex_col().child(heading(name, th)).child(list).into_any_element()
+        };
+        groups.iter().map(one).collect()
     }
 
     fn table_head(&self, th: &Theme) -> Div {
@@ -462,22 +492,20 @@ impl AgentsView {
 impl Render for AgentsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let (tasks, roles) = {
+        let (tasks, roles, clients) = {
             let s = self.store.read(cx);
-            (s.tasks.clone(), s.roles.clone())
+            (s.tasks.clone(), s.roles.clone(), s.clients.clone())
         };
         let pods = pods_in_flight(&tasks);
         let (n, m) = counts(&pods);
-        let lead = format!("{n} pods holding {m} agents, each built from the specialists below. A pod takes only the roles its work needs.");
-        let lead = div().id("agents-lead").text_size(px(14.)).text_color(th.fg_2).child(lead);
-        let cards: Vec<AnyElement> = pods.iter().map(|p| self.pod_card(p, cx)).collect();
+        let lead = div().id("agents-lead").text_size(px(14.)).text_color(th.fg_2).child(lead_text(n, m));
+        let groups = self.pod_groups(&group_pods(&clients, &pods), &th, cx);
         let rows: Vec<AnyElement> = roles.iter().enumerate().map(|(i, r)| self.role_row(i, r, cx)).collect();
-        let note = "No agent may edit the checks that judge its own output.";
-        let note = div().mt(px(10.)).text_size(px(11.5)).text_color(th.muted).child(note);
+        let note = "Tester and Evaluator own the checks that judge the work, and no agent may edit the checks that judge its own output. That is structural, not a setting.";
+        let note = div().id("agents-note").mt(px(12.)).max_w(px(620.)).text_size(px(11.5)).text_color(th.muted).child(note);
         let page = div().id("agents-scroll").flex().flex_col().size_full().overflow_y_scroll().pr(px(40.)).pb(px(28.));
         let top = section_top(Sec::Clients, Some(lead.into_any_element()), None, cx);
-        let page = page.child(top).child(heading("Pods in flight", &th));
-        let page = page.child(div().flex().flex_col().gap(px(8.)).children(cards)).child(self.specialists_head(&th, cx));
+        let page = page.child(top).children(groups).child(self.specialists_head(&th, cx));
         let table = div().flex().flex_col().gap(px(6.)).child(self.table_head(&th)).children(rows);
         let page = page.child(table).child(note);
         let (overlay, confirm) = (self.overlay(&th, cx), self.confirm_view(&th, cx));
@@ -520,6 +548,27 @@ mod tests {
         assert_eq!(counts(&pods), (1, 2));
         assert_eq!(pods_with("backend", &tasks).len(), 1);
         assert!(pods_with("tester", &tasks).is_empty());
+    }
+
+    #[test]
+    fn lead_pluralises() {
+        assert!(lead_text(1, 3).starts_with("1 pod holding 3 agents, "));
+        assert!(lead_text(2, 1).starts_with("2 pods holding 1 agent, "));
+    }
+
+    #[test]
+    fn pods_group_by_client_then_other() {
+        let pod = ["lead"];
+        let mut other = task(2, None, "lead", "lead", "split", &pod);
+        other.client_id = 9;
+        let tasks = vec![task(1, None, "lead", "lead", "split", &pod), other];
+        let pods = pods_in_flight(&tasks);
+        let clients: Vec<Client> = serde_json::from_value(json!([
+            {"id":1,"name":"Acme","repo_path":"/a","test_command":null,"allowed_commands":[],"created_at":"x"},
+            {"id":3,"name":"Empty","repo_path":"/b","test_command":null,"allowed_commands":[],"created_at":"x"}]))
+        .unwrap();
+        let names: Vec<String> = group_pods(&clients, &pods).into_iter().map(|g| g.0).collect();
+        assert_eq!(names, ["Acme", "Other"]);
     }
 
     #[test]

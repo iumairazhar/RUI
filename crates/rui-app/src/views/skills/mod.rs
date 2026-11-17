@@ -15,10 +15,12 @@ use gpui::{
     AnyElement, Context, Div, Entity, FontWeight, PathPromptOptions, Stateful, Window, deferred, div, prelude::*, px,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 /// Tab of the skill drawer.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
+    Review,
     Overview,
     Edit,
     Attach,
@@ -58,6 +60,9 @@ pub struct SkillsView {
     sel_roles: Vec<String>,
     sel_clients: Vec<String>,
     confirm: Option<Confirm>,
+    /// Files of the open skill; None while loading.
+    files: Option<Vec<api::SkillFile>>,
+    open_files: HashSet<String>,
 }
 
 impl SkillsView {
@@ -85,6 +90,8 @@ impl SkillsView {
             sel_roles: vec![],
             sel_clients: vec![],
             confirm: None,
+            files: None,
+            open_files: HashSet::new(),
         }
     }
 
@@ -92,7 +99,7 @@ impl SkillsView {
 
     fn open_skill(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(info) = self.store.read(cx).skills.iter().find(|s| s.name == name).cloned() else { return };
-        self.open_with(info, Tab::Overview, cx);
+        self.open_with(info, Tab::Review, cx);
         self.fetch(true, cx);
     }
 
@@ -102,6 +109,27 @@ impl SkillsView {
         (self.closing, self.tab, self.confirm) = (false, tab, None);
         self.detail = Some(info);
         self.reset_selection();
+        self.fetch_files(cx);
+        cx.notify();
+    }
+
+    fn fetch_files(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.open.clone() else { return };
+        (self.files, self.open_files) = (None, HashSet::new());
+        let want = name.clone();
+        run(cx, move || api::skill_files(&name), move |v, res, cx| {
+            if v.open.as_deref() != Some(want.as_str()) {
+                return;
+            }
+            v.files = res.ok().and_then(|val| serde_json::from_value(val).ok()).or(Some(vec![]));
+            cx.notify();
+        });
+    }
+
+    fn toggle_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.open_files.remove(&path) {
+            self.open_files.insert(path);
+        }
         cx.notify();
     }
 
@@ -119,6 +147,7 @@ impl SkillsView {
             return;
         }
         (self.closing, self.open, self.detail, self.confirm) = (false, None, None, None);
+        (self.files, self.open_files) = (None, HashSet::new());
         cx.notify();
     }
 

@@ -11,7 +11,7 @@ mod views;
 use assets::Assets;
 use gpui::AnimationExt;
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, SharedString, TitlebarOptions, Window,
+    AnyElement, App, Application, Bounds, Context, Entity, FontWeight, PathPromptOptions, SharedString, TitlebarOptions, Window,
     WindowBounds, WindowOptions, div, point, prelude::*, px, size, svg,
 };
 use rui_core::{Task, TaskStatus};
@@ -21,7 +21,7 @@ use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
     activity::ThreadsView, agents::AgentsView, apps::AppsView, board::BoardView, chat::ChatView, clients,
-    library::Tooltip, questions::QuestionsView, results::ResultsView, seat::SeatView, skills::SkillsView,
+    library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -108,6 +108,8 @@ const RAIL_STEP: f32 = 47.;
 /// Brand tile with its gap, then a divider block (margins plus the hairline).
 const RAIL_TILE: f32 = 51.;
 const RAIL_DIVIDER: f32 = 17.5;
+/// Pages start below the title bar so scrolled content never slides under the header.
+const CONTENT_TOP: f32 = 44.;
 
 /// Top of a rail item inside the rail's padding box.
 fn rail_y(nav: Nav) -> f32 {
@@ -125,12 +127,6 @@ fn summary_text(clients: usize, threads: usize, free: usize) -> String {
 /// Top-level tasks that are not done.
 fn open_threads(tasks: &[Task]) -> usize {
     tasks.iter().filter(|t| t.parent_id.is_none() && t.status != TaskStatus::Done).count()
-}
-
-/// One seat for now: taken while any agent runs.
-fn seats_free(s: &Store) -> usize {
-    let running = s.tasks.iter().any(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Clarifying));
-    usize::from(!running && s.live.tasks.is_empty())
 }
 
 struct Root {
@@ -193,7 +189,7 @@ impl Root {
     }
 
     /// The page for the selected rail section and its sub-tab.
-    fn page(&self, cx: &App) -> AnyElement {
+    fn page(&self, cx: &mut Context<Self>) -> AnyElement {
         let tab = |sec| active_tab(sec, cx);
         match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
@@ -204,12 +200,12 @@ impl Root {
                 _ => self.apps.clone().into_any_element(),
             },
             Nav::Clients => match tab(Sec::Clients) {
-                0 => clients::page(cx),
+                0 => clients::page(self.add_client_button(cx), cx),
                 _ => self.agents.clone().into_any_element(),
             },
             Nav::Knowledge => match tab(Sec::Knowledge) {
                 0 => self.skills.clone().into_any_element(),
-                _ => empty_page(Sec::Knowledge, "Lessons land here when you answer the Inbox with a reason.", cx),
+                _ => playbook::page(cx),
             },
             Nav::Cost => match tab(Sec::Cost) {
                 0 => empty_page(Sec::Cost, "Cost tracking comes later.", cx),
@@ -220,22 +216,52 @@ impl Root {
         }
     }
 
-    fn content(&self, cx: &App) -> AnyElement {
+    fn content(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("content")
             .absolute()
-            .top_0()
+            .top(px(CONTENT_TOP))
             .left_0()
             .right_0()
             .bottom_0()
+            .overflow_hidden()
             .pl(px(96.))
             .child(div().id("content-page").size_full().child(self.page(cx)))
             .into_any_element()
     }
 
+    fn add_client_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let btn = views::primary_button("clients-add", "+  Add client", cx);
+        btn.on_click(cx.listener(|this, _, _, cx| this.pick_client_folder(cx))).into_any_element()
+    }
+
+    /// Pick a repo folder, then create a client named after it.
+    fn pick_client_folder(&mut self, cx: &mut Context<Self>) {
+        let options = PathPromptOptions { files: false, directories: true, multiple: false, prompt: None };
+        let picked = cx.prompt_for_paths(options);
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.first().map(|p| p.to_string_lossy().to_string()) else { return };
+            this.update(cx, |v, cx| v.add_client(path, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn add_client(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(name) = clients::folder_name(&path) else { return };
+        let call_name = name.clone();
+        views::library::run(cx, move || api::create_client(&call_name, &path), move |v, res, cx| match res {
+            Ok(_) => {
+                v.store.update(cx, |s, cx| s.refresh(cx));
+                views::library::toast(&v.store, &format!("Added {name}"), "", cx);
+            }
+            Err(e) => views::library::toast(&v.store, "Could not add client", &e, cx),
+        });
+    }
+
     fn summary(&self, cx: &Context<Self>) -> String {
         let s = self.store.read(cx);
-        summary_text(s.clients.len(), open_threads(&s.tasks), seats_free(s))
+        summary_text(s.clients.len(), open_threads(&s.tasks), seat::seats_free(s))
     }
 
     fn header(&self, th: &Theme, cx: &Context<Self>) -> impl IntoElement + use<> {

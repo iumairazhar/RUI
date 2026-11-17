@@ -351,6 +351,24 @@ pub fn library(method: &str, path: &str, body: Option<serde_json::Value>) -> Res
     Err(anyhow::anyhow!(error_text(status.as_u16(), &json)))
 }
 
+/// One file inside a skill folder. `text` is null for binary or oversized files.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SkillFile {
+    pub path: String,
+    pub size: u64,
+    pub text: Option<String>,
+}
+
+/// Fetch the files of a skill (SKILL.md first).
+pub fn skill_files(name: &str) -> Result<serde_json::Value> {
+    library("GET", &format!("/skills/{}/files", encode_path(name)), None)
+}
+
+/// Create a client from a repo folder. Errors carry the daemon's `{error}` text.
+pub fn create_client(name: &str, repo_path: &str) -> Result<serde_json::Value> {
+    library("POST", "/clients", Some(serde_json::json!({ "name": name, "repo_path": repo_path })))
+}
+
 /// Restart a project's apps.
 pub fn restart_apps(project: &str) -> Result<()> {
     post(&format!("/apps/{}/restart", encode_path(project)), serde_json::json!({}))

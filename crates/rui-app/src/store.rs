@@ -425,7 +425,7 @@ impl Store {
         self.act(move || api::stop_apps(&project), cx);
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let (after, wanted) = this.read_with(cx, |s, _| (s.last_event_id, s.current_chat)).unwrap_or_default();
             let snap = cx.background_executor().spawn(async move { fetch_all(after, wanted) }).await;
