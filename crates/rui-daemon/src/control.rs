@@ -77,7 +77,10 @@ pub fn stop_tree(db: &Db, runs: &Runs, id: i64, by: &str, source: Option<&str>, 
 /// Drops a task: stops it with its team, then records that the owner dropped it.
 pub fn drop_task(db: &Db, runs: &Runs, id: i64) -> Res<Vec<i64>> {
     let ids = stop_tree(db, runs, id, "owner", Some("Inbox"), Some("dropped"))?;
-    db.add_event(Some(id), "owner", "dropped", &json!({"by": "owner"}))?;
+    // Every teammate is dropped too, so none of them lingers as "Stopped".
+    for i in &ids {
+        db.add_event(Some(*i), "owner", "dropped", &json!({"by": "owner"}))?;
+    }
     Ok(ids)
 }
 
@@ -283,6 +286,17 @@ mod tests {
         assert_eq!(note.unwrap(), "Resuming Pod Lead and Researcher 01 so Technical Writer 01 can continue.");
         let ev = db.events_of_kinds(&["resumed"]).unwrap();
         assert_eq!((ev.len(), ev[0].task_id, ev[0].payload["ids"].clone()), (1, Some(writer.id), json!([lead.id, research.id])));
+    }
+
+    #[test]
+    fn drop_marks_the_whole_team_dropped() {
+        let (db, runs) = (Db::open_test(), Runs::default());
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let lead = titled(&db, c.id, None, Role::Lead, TaskStatus::Stuck, "Pod Lead");
+        let research = titled(&db, c.id, Some(lead.id), Role::Builder, TaskStatus::Stuck, "Researcher 01");
+        drop_task(&db, &runs, lead.id).unwrap();
+        let dropped: Vec<Option<i64>> = db.events_of_kinds(&["dropped"]).unwrap().iter().map(|e| e.task_id).collect();
+        assert_eq!(dropped, vec![Some(lead.id), Some(research.id)]);
     }
 
     #[test]
