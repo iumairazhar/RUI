@@ -29,7 +29,8 @@ pub(super) struct Band {
 
 /// Ids of tasks that have a `stopped` event.
 pub(super) fn stopped_ids(s: &Store) -> HashSet<i64> {
-    s.events.iter().filter(|e| e.kind == "stopped").filter_map(|e| e.task_id).collect()
+    let recent = s.events.iter().filter(|e| e.kind == "stopped").filter_map(|e| e.task_id);
+    recent.chain(s.stopped.iter().copied()).collect()
 }
 
 fn find(tasks: &[Task], id: i64) -> Option<&Task> {

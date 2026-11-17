@@ -174,6 +174,11 @@ fn state_word(s: &TaskStatus, owner_asked: bool) -> &'static str {
     }
 }
 
+/// State word for a thread: one the owner stopped says so, instead of "Needs you".
+fn thread_word(t: &Thread) -> &'static str {
+    if t.stopped { "Stopped" } else { state_word(&t.task.status, t.owner_asked) }
+}
+
 fn role_name(r: &Role) -> &'static str {
     match r {
         Role::Lead => "Lead",
@@ -471,7 +476,7 @@ impl ThreadsView {
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
         let live = self.store.read(cx).live.task(id).cloned();
         let state = char_state(&t.task.status, live.as_ref());
-        let word = live.as_ref().map_or_else(|| state_word(&t.task.status, t.owner_asked).to_string(), live_sub);
+        let word = live.as_ref().map_or_else(|| thread_word(t).to_string(), live_sub);
         let parts = [t.client.clone(), word, elapsed(&t.task.updated_at, now)];
         let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
         let title = format!("{} \u{b7} {}", t.name, t.task.title);
@@ -823,7 +828,8 @@ fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
 }
 
 fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, face: AnyElement) -> AnyElement {
-    let st = task_status(&t.task.status, th);
+    let shown = if t.stopped { TaskStatus::Open } else { t.task.status };
+    let st = task_status(&shown, th);
     let color = th.client_color(t.task.client_id);
     let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
     let top = div()
@@ -836,7 +842,7 @@ fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyEle
     let title = div().flex().items_center().gap(px(10.)).child(role_chip(&t.code, 26., color)).child(name);
     let model = t.model.clone().map(|m| mono(11., th.muted, m));
     let time = mono(10.5, th.muted, elapsed(&t.task.updated_at, now));
-    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, state_word(&t.task.status, t.owner_asked))).children(model).child(time);
+    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, thread_word(t))).children(model).child(time);
     let sub = div().text_size(px(12.5)).text_color(th.muted).child(t.task.title.clone());
     let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
     let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub).children(pod);

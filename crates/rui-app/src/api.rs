@@ -73,6 +73,11 @@ pub fn get_seat() -> Result<SeatInfo> {
     Ok(serde_json::from_value(get("/seat")?)?)
 }
 
+/// Ids of stuck tasks that were stopped rather than stuck on their own.
+pub fn get_stopped() -> Result<Vec<i64>> {
+    Ok(serde_json::from_value(get("/tasks/stopped")?)?)
+}
+
 /// Fetch the latest run (model and seat) per task.
 pub fn get_task_runs() -> Result<Vec<TaskRun>> {
     Ok(serde_json::from_value(get("/tasks/runs")?)?)

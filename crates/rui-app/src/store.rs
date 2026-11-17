@@ -47,6 +47,8 @@ pub struct Store {
     pub seat: Option<SeatInfo>,
     /// Latest run per task id.
     pub runs: HashMap<i64, TaskRun>,
+    /// Stuck tasks that were stopped, from the daemon; older than the loaded events window.
+    pub stopped: std::collections::HashSet<i64>,
     /// Newest events, oldest first (at most 300).
     pub events: Vec<Event>,
     /// Highest event id seen so far.
@@ -89,6 +91,7 @@ pub struct Store {
 struct Extras {
     seat: Option<SeatInfo>,
     runs: Option<Vec<TaskRun>>,
+    stopped: Option<Vec<i64>>,
     events: Option<Vec<Event>>,
     apps: Option<Vec<AppInfo>>,
     asks: Option<Vec<ChatAsk>>,
@@ -100,6 +103,7 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
     Extras {
         seat: api::get_seat().ok(),
         runs: api::get_task_runs().ok(),
+        stopped: api::get_stopped().ok(),
         events: api::get_events_after(after_id, limit).ok(),
         apps: api::get_apps().ok(),
         asks: api::get_asks_open().ok(),
@@ -173,6 +177,7 @@ impl Store {
             action_error: None,
             seat: None,
             runs: HashMap::new(),
+            stopped: Default::default(),
             events: vec![],
             last_event_id: None,
             changes: HashMap::new(),
@@ -269,6 +274,9 @@ impl Store {
         }
         if let Some(runs) = extras.runs {
             self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();
+        }
+        if let Some(ids) = extras.stopped {
+            self.stopped = ids.into_iter().collect();
         }
         let Some(new) = extras.events else { return };
         self.events.extend(new);
