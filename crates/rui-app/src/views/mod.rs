@@ -7,6 +7,7 @@ pub mod asks;
 pub mod board;
 pub mod character;
 pub mod chat;
+mod chat_tools;
 pub mod clients;
 pub mod library;
 pub mod live;

@@ -2,6 +2,7 @@
 
 use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
+use super::chat_tools::{ToolCall, tool_calls, tool_output, tool_row_head};
 use super::library::confirm_modal;
 use super::{chip, markdown, primary_button, question_card};
 use crate::api::LiveState;
@@ -16,7 +17,7 @@ use super::roster::role_title;
 use crate::api::RoleInfo;
 use serde_json::Value;
 use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Chat list, messages of the selected chat, open questions and a composer.
 pub struct ChatView {
@@ -28,6 +29,7 @@ pub struct ChatView {
     last_len: usize,
     last_chat: Option<i64>,
     confirm_delete: Option<(i64, String)>,
+    open_tools: HashSet<String>,
 }
 
 impl ChatView {
@@ -36,7 +38,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None }
+        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new() }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -117,6 +119,8 @@ impl ChatView {
         questions: &[Question],
         asks: &[ChatAsk],
         cards: &HashMap<i64, Vec<ActCard>>,
+        tools: &HashMap<i64, Vec<ToolCall>>,
+        live_tools: &[ToolCall],
         live: Option<Vec<String>>,
         state: Option<&LiveState>,
         cx: &mut Context<Self>,
@@ -137,8 +141,9 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap(px(20.))
-            .children(chat.iter().map(|m| self.message_with_cards(m, cards, &th, cx)))
+            .children(chat.iter().map(|m| self.message_with_cards(m, cards, tools, &th, cx)))
             .children(ask_cards)
+            .children((!live_tools.is_empty()).then(|| self.tool_rows(live_tools, &th, cx)))
             .children(working)
             .children(open);
         if chat.is_empty() && questions.is_empty() {
@@ -147,13 +152,39 @@ impl ChatView {
         list.into_any_element()
     }
 
-    fn message_with_cards(&self, m: &ChatMessage, cards: &HashMap<i64, Vec<ActCard>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn message_with_cards(&self, m: &ChatMessage, cards: &HashMap<i64, Vec<ActCard>>, tools: &HashMap<i64, Vec<ToolCall>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let acts = cards.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]);
-        if acts.is_empty() {
+        let calls = tools.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        if acts.is_empty() && calls.is_empty() {
             return message(m, th);
         }
+        let rows = (!calls.is_empty()).then(|| div().mb(px(8.)).child(self.tool_rows(calls, th, cx)));
         let els: Vec<AnyElement> = acts.iter().enumerate().map(|(k, a)| self.act_card(m.id, k, a, th, cx)).collect();
-        div().flex().flex_col().child(message(m, th)).child(div().flex().flex_col().gap(px(8.)).mt(px(8.)).children(els)).into_any_element()
+        let cards = (!els.is_empty()).then(|| div().flex().flex_col().gap(px(8.)).mt(px(8.)).children(els));
+        div().flex().flex_col().children(rows).child(message(m, th)).children(cards).into_any_element()
+    }
+
+    /// Show or hide the output of one tool call.
+    fn toggle_tool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.open_tools.remove(id) {
+            self.open_tools.insert(id.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Compact rows for a turn's tool calls, each expandable to its output.
+    fn tool_rows(&self, calls: &[ToolCall], th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows: Vec<AnyElement> = calls.iter().map(|c| self.tool_row(c, th, cx)).collect();
+        div().max_w(px(620.)).flex().flex_col().gap(px(4.)).children(rows).into_any_element()
+    }
+
+    /// One tool call row, with its output below when expanded.
+    fn tool_row(&self, c: &ToolCall, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = c.id.clone();
+        let head = tool_row_head(format!("tool-row-{id}"), c, th);
+        let head = head.on_click(cx.listener(move |this, _, _, cx| this.toggle_tool(&id, cx)));
+        let out = self.open_tools.contains(&c.id).then(|| tool_output(format!("tool-out-{}", c.id), c, th));
+        div().flex().flex_col().gap(px(2.)).child(head).children(out).into_any_element()
     }
 
     fn act_card(&self, mid: i64, k: usize, a: &ActCard, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -288,6 +319,26 @@ fn all_cards(chat: &[ChatMessage], events: &[Event], chat_id: i64, roles: &[Role
     out
 }
 
+/// Tool calls per Rui message id: the calls between the previous message and that one.
+fn all_tools(chat: &[ChatMessage], events: &[Event], chat_id: i64) -> HashMap<i64, Vec<ToolCall>> {
+    let mut out = HashMap::new();
+    for (i, m) in chat.iter().enumerate().filter(|(i, m)| *i > 0 && m.role == ChatRole::Rui) {
+        let (Some(from), Some(to)) = (parse_secs(&chat[i - 1].created_at), parse_secs(&m.created_at)) else { continue };
+        let calls = tool_calls(events, chat_id, from, to);
+        if !calls.is_empty() {
+            out.insert(m.id, calls);
+        }
+    }
+    out
+}
+
+/// Tool calls of the in-progress turn: since the owner's last message, while it has no reply.
+fn live_tools(chat: &[ChatMessage], events: &[Event], chat_id: i64) -> Vec<ToolCall> {
+    let Some(last) = chat.last().filter(|m| m.role == ChatRole::User) else { return vec![] };
+    let Some(from) = parse_secs(&last.created_at) else { return vec![] };
+    tool_calls(events, chat_id, from, i64::MAX)
+}
+
 /// Rui's steps in one chat since the owner's last message, while that message has no reply yet.
 fn live_steps(chat: &[ChatMessage], events: &[Event], chat_id: i64) -> Option<Vec<String>> {
     let last = chat.last().filter(|m| m.role == ChatRole::User)?;
@@ -329,10 +380,11 @@ fn working_bubble(steps: &[String], state: Option<&LiveState>, th: &Theme) -> An
         .gap(px(8.))
         .child(div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Rui"))
         .child(div().text_size(px(11.)).text_color(th.think.fg).child("working…"));
+    // Tool calls already show as rows above the bubble, so raw step names are not repeated here.
     let lines: Vec<AnyElement> = match (state, steps.is_empty()) {
         (Some(l), _) => live_lines(l, th),
         (None, true) => vec![div().child("Thinking…").into_any_element()],
-        (None, false) => steps.iter().map(|s| div().child(s.clone()).into_any_element()).collect(),
+        (None, false) => vec![div().child("Working…").into_any_element()],
     };
     let bubble = div()
         .max_w(px(620.))
@@ -539,13 +591,15 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (chat, chats, current, questions, live, state, cards, asks) = {
+        let (chat, chats, current, questions, live, state, cards, asks, tools, live_calls) = {
             let s = self.store.read(cx);
             let live = s.current_chat.and_then(|id| live_steps(&s.chat, &s.events, id));
             let state = s.current_chat.and_then(|id| s.live.chat(id)).cloned();
             let cards = s.current_chat.map(|id| all_cards(&s.chat, &s.events, id, &s.roles)).unwrap_or_default();
             let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
-            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks)
+            let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
+            let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
+            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks, tools, live_calls)
         };
         self.sync_inputs(&questions, cx);
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
@@ -555,12 +609,12 @@ impl Render for ChatView {
             self.last_len = 0;
         }
         let text_len = state.as_ref().map_or(0, |l| l.text.len() + 1);
-        let len = chat.len() * (1 << 20) + open_asks.len() * (1 << 10) + live.as_ref().map_or(0, |l| l.len() + 1) + text_len;
+        let len = chat.len() * (1 << 20) + open_asks.len() * (1 << 10) + live.as_ref().map_or(0, |l| l.len() + 1) + text_len + live_calls.len();
         if len != self.last_len {
             self.last_len = len;
             self.scroll.scroll_to_bottom();
         }
-        let list = self.message_list(&chat, &questions, &asks, &cards, live, state.as_ref(), cx);
+        let list = self.message_list(&chat, &questions, &asks, &cards, &tools, &live_calls, live, state.as_ref(), cx);
         let composer = self.composer(cx);
         let main = div()
             .id("chat-main")
