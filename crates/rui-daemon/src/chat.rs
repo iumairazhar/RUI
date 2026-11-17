@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__staff_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__create_client,mcp__rui__set_up_pod,mcp__rui__create_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
 
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
