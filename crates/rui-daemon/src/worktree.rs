@@ -31,6 +31,44 @@ fn is_worktree(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
+/// Branch that collects all subtask work of a top-level task.
+pub fn task_branch_name(parent_id: i64) -> String {
+    format!("rui/task-{parent_id}")
+}
+
+/// The repo's base branch: `main` if it exists, else `master`.
+pub fn base_branch(repo: &Path) -> anyhow::Result<String> {
+    ["main", "master"]
+        .into_iter()
+        .find(|b| git(repo, &["rev-parse", "--verify", "--quiet", b]).is_ok_and(|o| o.status.success()))
+        .map(String::from)
+        .context("no main or master branch")
+}
+
+/// True when the repo has at least one git remote.
+pub fn has_remote(repo: &Path) -> bool {
+    git_stdout(repo, &["remote"]).is_ok_and(|out| !out.trim().is_empty())
+}
+
+/// Adds a worktree at `path` on `branch` (new, from `base`, or the existing branch).
+fn add_worktree(repo: &Path, worktrees_dir: &Path, path: &Path, branch: &str, base: Option<&str>) -> anyhow::Result<()> {
+    if path.exists() && is_worktree(path) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(worktrees_dir).context("create worktrees dir")?;
+    let p = path.to_string_lossy().into_owned();
+    let mut args = vec!["worktree", "add", &p, "-b", branch];
+    args.extend(base);
+    let first = git(repo, &args)?;
+    if first.status.success() {
+        return Ok(());
+    }
+    if git(repo, &["worktree", "add", &p, branch])?.status.success() {
+        return Ok(());
+    }
+    bail!("git worktree add failed: {}", String::from_utf8_lossy(&first.stderr));
+}
+
 /// Creates (or reuses) the worktree for a task; returns its path and branch.
 pub fn create_worktree(
     repo: &Path,
@@ -40,22 +78,20 @@ pub fn create_worktree(
 ) -> anyhow::Result<(PathBuf, String)> {
     let path = worktrees_dir.join(task_id.to_string());
     let branch = branch_name(task_id);
+    add_worktree(repo, worktrees_dir, &path, &branch, base)?;
+    Ok((path, branch))
+}
+
+/// Creates (or reuses) the worktree of a top-level task's branch, cut from the base branch.
+pub fn ensure_task_worktree(repo: &Path, worktrees_dir: &Path, parent_id: i64) -> anyhow::Result<(PathBuf, String)> {
+    let path = worktrees_dir.join(format!("task-{parent_id}"));
+    let branch = task_branch_name(parent_id);
     if path.exists() && is_worktree(&path) {
         return Ok((path, branch));
     }
-    std::fs::create_dir_all(worktrees_dir).context("create worktrees dir")?;
-    let p = path.to_string_lossy().into_owned();
-    let mut args = vec!["worktree", "add", &p, "-b", &branch];
-    args.extend(base);
-    let first = git(repo, &args)?;
-    if first.status.success() {
-        return Ok((path, branch));
-    }
-    let second = git(repo, &["worktree", "add", &p, &branch])?;
-    if second.status.success() {
-        return Ok((path, branch));
-    }
-    bail!("git worktree add failed: {}", String::from_utf8_lossy(&first.stderr));
+    let base = base_branch(repo)?;
+    add_worktree(repo, worktrees_dir, &path, &branch, Some(&base))?;
+    Ok((path, branch))
 }
 
 /// Stages everything in the worktree and commits it; Ok(false) if nothing changed.
@@ -105,6 +141,16 @@ pub fn land(repo: &Path, branch: &str, message: &str) -> anyhow::Result<LandResu
     merge_failure(repo)
 }
 
+/// Merges `branch` into whatever branch worktree `wt` has checked out, with a merge commit.
+pub fn merge_into(wt: &Path, branch: &str, message: &str) -> anyhow::Result<LandResult> {
+    let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
+    if git(wt, &args)?.status.success() {
+        return Ok(LandResult::Merged);
+    }
+    merge_failure(wt)
+}
+
 /// Files touched by the tip commit of `branch` (works after the branch is merged).
 pub fn branch_files(repo: &Path, branch: &str) -> anyhow::Result<Vec<String>> {
     let args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", branch];
@@ -116,10 +162,7 @@ const MAX_DIFF_BYTES: usize = 60 * 1024;
 
 /// What the branch in `wt` changed relative to main (or master), capped at 60 KB.
 pub fn diff_vs_main(wt: &Path) -> anyhow::Result<String> {
-    let base = ["main", "master"]
-        .into_iter()
-        .find(|b| git(wt, &["rev-parse", "--verify", "--quiet", b]).is_ok_and(|o| o.status.success()))
-        .context("no main or master branch")?;
+    let base = base_branch(wt)?;
     let diff = git_stdout(wt, &["diff", &format!("{base}...HEAD")])?;
     if diff.len() <= MAX_DIFF_BYTES {
         return Ok(diff);
@@ -376,5 +419,58 @@ mod tests {
         let b = branch_with(repo.path(), wts.path(), 1, "x.txt", "x");
         git(repo.path(), &["checkout", "-b", "feature"]).unwrap();
         assert!(land(repo.path(), &b, "m").is_err());
+    }
+
+    fn head_of(repo: &Path, rev: &str) -> String {
+        git_stdout(repo, &["rev-parse", rev]).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn ensure_task_worktree_creates_from_base_and_is_idempotent() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let (p, b) = ensure_task_worktree(repo.path(), wts.path(), 9).unwrap();
+        assert_eq!(b, "rui/task-9");
+        assert!(p.join("a.txt").exists());
+        let base = base_branch(repo.path()).unwrap();
+        assert_eq!(head_of(repo.path(), &b), head_of(repo.path(), &base));
+        let (p2, b2) = ensure_task_worktree(repo.path(), wts.path(), 9).unwrap();
+        assert_eq!((p, b), (p2, b2));
+    }
+
+    #[test]
+    fn merge_into_task_branch_leaves_base_untouched() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let base = base_branch(repo.path()).unwrap();
+        let before = head_of(repo.path(), &base);
+        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (sub, sub_branch) = create_worktree(repo.path(), wts.path(), 5, Some(&task_branch)).unwrap();
+        std::fs::write(sub.join("new.txt"), "n").unwrap();
+        assert!(commit_all(&sub, "work").unwrap());
+        assert_eq!(merge_into(&task_wt, &sub_branch, "m").unwrap(), LandResult::Merged);
+        assert!(task_wt.join("new.txt").exists());
+        assert_eq!(head_of(repo.path(), &base), before);
+    }
+
+    #[test]
+    fn merge_into_conflict_leaves_task_worktree_clean() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let mut branches = Vec::new();
+        for (id, text) in [(5, "one"), (6, "two")] {
+            let (sub, b) = create_worktree(repo.path(), wts.path(), id, Some(&task_branch)).unwrap();
+            std::fs::write(sub.join("a.txt"), text).unwrap();
+            assert!(commit_all(&sub, "work").unwrap());
+            branches.push(b);
+        }
+        assert_eq!(merge_into(&task_wt, &branches[0], "m1").unwrap(), LandResult::Merged);
+        let got = merge_into(&task_wt, &branches[1], "m2").unwrap();
+        assert_eq!(got, LandResult::Conflict(vec!["a.txt".into()]));
+        assert!(git_stdout(&task_wt, &["status", "--porcelain"]).unwrap().is_empty());
     }
 }

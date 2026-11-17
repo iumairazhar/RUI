@@ -91,6 +91,7 @@ pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) 
         return Err(ControlError::Conflict("only finished top-level tasks can be reviewed".into()));
     }
     if verdict == "ok" {
+        land_approved(db, &task)?;
         db.add_event(Some(id), "owner", "reviewed", &json!({"verdict": "ok", "by": "owner"}))?;
         return load(db, id);
     }
@@ -99,6 +100,28 @@ pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) 
     db.add_event(Some(id), "owner", "reviewed", &json!({"verdict": "changes"}))?;
     queue_instruction(db, runs, &task, text, "owner")?;
     load(db, id)
+}
+
+/// Merges an approved task's branch into the base branch, for repos with no remote.
+fn land_approved(db: &Db, task: &Task) -> Res<()> {
+    let Some(branch) = task.branch.as_deref() else { return Ok(()) };
+    let client = db.get_client(task.client_id)?.ok_or_else(|| ControlError::NotFound("client not found".into()))?;
+    let repo = crate::scheduler::expand_home(&client.repo_path);
+    if crate::worktree::has_remote(&repo) {
+        return Ok(());
+    }
+    let message = format!("rui: task {}: {}", task.id, task.title);
+    match crate::worktree::land(&repo, branch, &message) {
+        Err(e) => Err(ControlError::Conflict(format!("could not merge: {e:#}"))),
+        Ok(crate::worktree::LandResult::Merged) => {
+            db.add_event(Some(task.id), "owner", "landed", &json!({"branch": branch}))?;
+            Ok(())
+        }
+        Ok(crate::worktree::LandResult::Conflict(files)) => {
+            db.add_event(Some(task.id), "owner", "land_failed", &json!({"files": files}))?;
+            Err(ControlError::Conflict(format!("could not merge: conflict in {}", files.join(", "))))
+        }
+    }
 }
 
 /// Pushes one task into `todo`, if it is stuck, and remembers it in `changed`.
@@ -315,5 +338,31 @@ mod tests {
         let ids = drop_task(&db, &runs, subs[0].id).unwrap();
         assert_eq!(ids, [subs[0].id]);
         assert_eq!(db.events_of_kinds(&["dropped"]).unwrap().len(), 1);
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn approving_lands_task_branch_in_local_repo() {
+        let (db, runs) = (Db::open_test(), Runs::default());
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        git_ok(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let c = db.create_client("c", &repo.path().to_string_lossy(), None, &[]).unwrap();
+        let t = task(&db, c.id, None, Role::Lead, TaskStatus::Done);
+        let (wt, branch) = crate::worktree::ensure_task_worktree(repo.path(), wts.path(), t.id).unwrap();
+        std::fs::write(wt.join("feature.txt"), "f").unwrap();
+        assert!(crate::worktree::commit_all(&wt, "work").unwrap());
+        db.set_task_branch(t.id, &branch).unwrap();
+        assert!(!repo.path().join("feature.txt").exists());
+        review(&db, &runs, t.id, "ok", None).unwrap();
+        assert!(repo.path().join("feature.txt").exists());
+        assert_eq!(db.events_of_kinds(&["landed"]).unwrap().len(), 1);
     }
 }

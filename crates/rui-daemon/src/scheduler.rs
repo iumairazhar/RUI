@@ -8,7 +8,7 @@ use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
 use crate::roster;
 use crate::skills::{self, Skill};
-use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, diff_vs_main, land, run_done_command};
+use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, diff_vs_main, ensure_task_worktree, merge_into, run_done_command};
 use anyhow::{Context, Result};
 use rui_core::{ChatRole, Client, Question, QuestionStatus, Role, Rung, SourceKind, Task, TaskStatus};
 use serde_json::{Value, json};
@@ -875,7 +875,11 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
     let done_command = task.done_command.clone().context("subtask has no done_command")?;
     let client = client_for(db, &task)?;
     let repo = expand_home(&client.repo_path);
-    let (wt, branch) = create_worktree(&repo, &cfg.data_dir.join("worktrees"), task_id, None)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let worktrees = cfg.data_dir.join("worktrees");
+    let (_, task_branch) = ensure_task_worktree(&repo, &worktrees, parent_id)?;
+    record_parent_branch(db, parent_id, &task_branch)?;
+    let (wt, branch) = create_worktree(&repo, &worktrees, task_id, Some(&task_branch))?;
     db.set_task_branch(task_id, &branch)?;
     let last = last_done_output(db, task_id)?;
     let block = take_instructions(db, task_id)?;
@@ -909,6 +913,15 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
     finish_builder(db, cfg, live, &task, &wt, &done_command).await
 }
 
+/// Remembers the per-task branch on the parent, once.
+fn record_parent_branch(db: &Db, parent_id: i64, branch: &str) -> Result<()> {
+    let parent = db.get_task(parent_id)?.context("parent task not found")?;
+    if parent.branch.is_none() {
+        db.set_task_branch(parent_id, branch)?;
+    }
+    Ok(())
+}
+
 async fn finish_builder(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
     let current = db.get_task(task.id)?.context("task not found")?;
     if matches!(current.status, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
@@ -923,7 +936,7 @@ async fn finish_builder(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Pa
         return Ok(());
     }
     if commit_task(db, task, wt)? {
-        land_branch(db, task)?;
+        merge_subtask(db, cfg, task)?;
     }
     Ok(())
 }
@@ -950,7 +963,7 @@ async fn commit_evaluate_land(db: &Db, cfg: &Config, live: &Live, task: &Task, w
     let text = evaluator_review(db, cfg, live, task, wt, done).await?;
     if parse_verdict(&text) == Some(Verdict::Pass) {
         db.set_task_status(task.id, TaskStatus::Done)?;
-        return land_branch(db, task);
+        return merge_subtask(db, cfg, task);
     }
     let findings = if parse_verdict(&text).is_some() { text } else { format!("No verdict was given.\n{text}") };
     send_back(db, &cfg.data_dir, task.id, &findings)?;
@@ -1031,14 +1044,18 @@ pub fn send_back(db: &Db, data_dir: &Path, task_id: i64, findings: &str) -> Resu
     Ok(next)
 }
 
-/// Merges the task branch into main; a conflict turns the finished task Stuck.
-fn land_branch(db: &Db, task: &Task) -> Result<()> {
+/// Merges a finished subtask branch into its parent's task branch; a conflict turns it Stuck.
+fn merge_subtask(db: &Db, cfg: &Config, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let repo = expand_home(&client.repo_path);
+    let (task_wt, task_branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), parent_id)?;
     let branch = crate::worktree::branch_name(task.id);
     let message = format!("rui: task {}: {}", task.id, task.title);
-    match land(&expand_home(&client.repo_path), &branch, &message)? {
+    match merge_into(&task_wt, &branch, &message)? {
         LandResult::Merged => {
-            db.add_event(Some(task.id), "scheduler", "landed", &json!({"branch": branch}))?;
+            let payload = json!({"branch": branch, "into": task_branch});
+            db.add_event(Some(task.id), "scheduler", "merged_to_task_branch", &payload)?;
         }
         LandResult::Conflict(files) => {
             db.add_event(Some(task.id), "scheduler", "land_failed", &json!({"files": files}))?;
