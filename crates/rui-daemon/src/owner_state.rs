@@ -83,6 +83,9 @@ fn decide(t: &Task, facts: &Facts, all: &[Task]) -> (&'static str, String) {
     if let Some(q) = facts.questions.get(&t.id) {
         return ("Needs you", first_line(&q.text));
     }
+    if parent_dropped(t, facts) {
+        return ("Done", "Dropped by you".into());
+    }
     let ev = facts.events_of(t.id);
     match t.status {
         TaskStatus::Stuck => stuck_state(t, facts, all),
@@ -92,6 +95,13 @@ fn decide(t: &Task, facts: &Facts, all: &[Task]) -> (&'static str, String) {
         TaskStatus::Split => split_state(t, facts, all),
         TaskStatus::New | TaskStatus::Open => blocked_state(t, facts, all),
     }
+}
+
+/// A teammate of a dropped task is dropped too, unless its Lead was resumed afterwards.
+fn parent_dropped(t: &Task, facts: &Facts) -> bool {
+    let Some(pid) = t.parent_id else { return false };
+    let ev = facts.events_of(pid);
+    latest_id(ev, "dropped") > latest_id(ev, "resumed")
 }
 
 /// Who is doing the work, in words.
@@ -363,6 +373,19 @@ mod tests {
         assert_eq!(word(&t, &[], &all), ("Waiting", "Waiting on T2 (Working)".into()));
         all[1].status = TaskStatus::Done;
         assert_eq!(word(&t, &[], &all), ("Waiting", "Ready, waiting for a free seat".into()));
+    }
+
+    #[test]
+    fn teammates_of_a_dropped_task_are_dropped() {
+        let lead = task(1, None, TaskStatus::Done, NEW);
+        let member = task(2, Some(1), TaskStatus::Stuck, NEW);
+        let all = [lead, member.clone()];
+        let mut facts = Facts::default();
+        facts.events.insert(1, vec![ev(5, 1, "dropped", json!({"by": "owner"}))]);
+        facts.events.insert(2, vec![ev(4, 2, "stopped", json!({"by": "owner"}))]);
+        assert_eq!(decide(&member, &facts, &all), ("Done", "Dropped by you".into()));
+        facts.events.get_mut(&1).unwrap().push(ev(6, 1, "resumed", json!({"ids": [1]})));
+        assert_eq!(decide(&member, &facts, &all).0, "Stopped");
     }
 
     #[test]
