@@ -952,8 +952,8 @@ fn detail_block(i: usize, d: &Detail, th: &Theme) -> AnyElement {
             .child(diff_block(lines, th))
             .into_any_element(),
         Detail::Output { stdout, stderr } => {
-            let mut rows = text_lines(stdout, th.fg_2);
-            rows.extend(text_lines(stderr, th.block.fg));
+            let mut rows = code_lines(stdout, th.fg_2);
+            rows.extend(code_lines(stderr, th.block.fg));
             mono_block(i, rows, th)
         }
         Detail::Preview(text) => mono_block(i, text_lines(text, th.fg_2), th),
@@ -964,6 +964,15 @@ pub(super) fn text_lines(text: &str, color: Hsla) -> Vec<AnyElement> {
     let line = |l: &str| {
         let shown = if l.is_empty() { " " } else { l };
         div().min_w_0().text_color(color).child(shown.to_string()).into_any_element()
+    };
+    text.lines().map(line).collect()
+}
+
+/// Command output: one row per line, cut with "…" instead of wrapping into a wall of text.
+fn code_lines(text: &str, color: Hsla) -> Vec<AnyElement> {
+    let line = |l: &str| {
+        let shown = if l.is_empty() { " " } else { l };
+        div().min_w_0().truncate().text_color(color).child(shown.to_string()).into_any_element()
     };
     text.lines().map(line).collect()
 }

@@ -109,7 +109,7 @@ fn errored(mut r: TraceRow) -> TraceRow {
     r
 }
 
-const MAX_OUTPUT_LINES: usize = 400;
+const MAX_OUTPUT_LINES: usize = 40;
 const MAX_PREVIEW_LINES: usize = 60;
 
 /// First `max` lines, with a "… N more lines" tail when cut.
@@ -579,8 +579,8 @@ mod tests {
         let long = "x\n".repeat(405);
         let rows = trace(&[use_ev("c", "Bash", json!({"command":"ls"})), res_ev("c", json!(long), false, json!(null))]);
         let Some(Detail::Output { stdout, .. }) = &rows[0].detail else { panic!("no output") };
-        assert!(stdout.ends_with("\u{2026} 5 more lines"));
-        assert_eq!(stdout.lines().count(), 401);
+        assert!(stdout.ends_with("\u{2026} 365 more lines"));
+        assert_eq!(stdout.lines().count(), 41);
     }
 
     #[test]
