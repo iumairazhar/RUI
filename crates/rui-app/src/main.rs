@@ -53,6 +53,12 @@ impl Nav {
         }
     }
 
+    /// Page to open at launch: `RUI_NAV=work` (any label, any case) for screenshots; Rui otherwise.
+    fn from_env() -> Nav {
+        let want = std::env::var("RUI_NAV").unwrap_or_default().to_lowercase();
+        Nav::ALL.into_iter().find(|n| n.label().to_lowercase() == want).unwrap_or(Nav::Rui)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Nav::Rui => "Rui",
@@ -152,8 +158,8 @@ impl Root {
         })
         .detach();
         Self {
-            nav: Nav::Rui,
-            pill_from: Nav::Rui,
+            nav: Nav::from_env(),
+            pill_from: Nav::from_env(),
             pill_seq: 0,
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
             board: cx.new(|cx| BoardView::new(store.clone(), cx)),

@@ -108,7 +108,7 @@ fn cell(text: String, width: f32, color: gpui::Hsla) -> Div {
 pub fn row(i: usize, s: &SkillInfo, roles: &[RoleInfo], selected: bool, th: &Theme, cx: &mut Context<SkillsView>) -> AnyElement {
     let name = s.name.clone();
     let title = div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(s.name.clone());
-    let desc = div().text_size(px(11.5)).text_color(th.muted).line_height(px(16.)).child(s.description.clone());
+    let desc = div().text_size(px(11.5)).text_color(th.muted).line_height(px(16.)).line_clamp(2).text_ellipsis().child(s.description.clone());
     let first = div().flex().flex_col().flex_1().min_w(px(180.)).gap(px(3.)).child(title).child(desc);
     let attached = attached_label(&s.attach.roles, &s.attach.clients, roles);
     let (when, who) = last_change(s);
@@ -121,7 +121,7 @@ pub fn row(i: usize, s: &SkillInfo, roles: &[RoleInfo], selected: bool, th: &The
     let el = if selected { el.bg(th.surface_2) } else { el };
     el.on_click(cx.listener(move |this, _, _, cx| this.open_skill(&name, cx)))
         .child(first)
-        .child(cell(attached, ATTACHED_W, th.fg_2))
+        .child(cell(attached, ATTACHED_W, th.fg_2).line_clamp(2).text_ellipsis())
         .child(cell(tools, TOOLS_W, th.muted).font_family("Menlo").text_size(px(11.)))
         .child(cell(author_label(&s.author), AUTHOR_W, th.fg_2))
         .child(last)

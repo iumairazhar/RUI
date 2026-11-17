@@ -383,13 +383,14 @@ impl SkillsView {
 
 // ---- rendering ----
 
+/// One segment of the status filter (mock `.seg`): green when on, plain text otherwise.
 fn filter_chip(i: usize, f: Filter, n: usize, on: bool, th: &Theme, cx: &mut Context<SkillsView>) -> AnyElement {
-    let (bg, fg) = if on { (th.accent_fill, th.on_accent) } else { (th.ctl, th.fg_2) };
+    let (bg, fg) = if on { (th.accent_fill, th.on_accent) } else { (gpui::transparent_black(), th.fg_2) };
     let hover = th.surface_2;
-    let el = div().id(("skills-filter", i)).flex().items_center().gap(px(6.)).h(px(30.)).px(px(12.)).rounded(px(15.));
-    let el = el.bg(bg).text_color(fg).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).cursor_pointer();
+    let el = div().id(("skills-filter", i)).flex().items_center().gap(px(5.)).h(px(24.)).px(px(10.)).rounded(px(6.));
+    let el = el.bg(bg).text_color(fg).text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).cursor_pointer();
     let el = if on { el } else { el.hover(move |s| s.bg(hover)) };
-    let count = div().font_family("Menlo").text_size(px(11.)).opacity(0.75).child(n.to_string());
+    let count = div().font_family("Menlo").text_size(px(10.5)).opacity(0.7).child(n.to_string());
     el.on_click(cx.listener(move |this, _, _, cx| {
         this.filter = f;
         cx.notify();
@@ -421,16 +422,18 @@ impl SkillsView {
     }
 
     fn toolbar(&self, skills: &[SkillInfo], th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let field = div().w(px(240.)).px(px(12.)).py(px(5.)).rounded(px(9.)).bg(th.surface).shadow(th.card_shadow());
+        let field = div().w(px(300.)).px(px(10.)).rounded(px(8.)).bg(th.surface).border_1().border_color(th.hairline);
         let field = field.child(self.search.clone());
         let n = counts(skills);
         let chips: Vec<AnyElement> =
             Filter::ALL.iter().enumerate().map(|(i, f)| filter_chip(i, *f, n[i], self.filter == *f, th, cx)).collect();
-        let chips = div().flex().flex_wrap().gap(px(6.)).children(chips);
-        let add = primary_button("skills-add", "Add skill", cx).on_click(cx.listener(|this, _, _, cx| this.toggle_menu(cx)));
+        let ov = if th.dark { gpui::white() } else { gpui::black() };
+        let seg = div().flex().gap(px(2.)).p(px(3.)).rounded(px(8.)).bg(ov.opacity(0.06)).border_1().border_color(th.hairline);
+        let add = primary_button("skills-add", "+  Add skill", cx).on_click(cx.listener(|this, _, _, cx| this.toggle_menu(cx)));
         let add = div().relative().child(add).children(self.menu.then(|| self.add_menu(th, cx)));
-        let bar = div().id("skills-toolbar").flex().flex_wrap().items_center().gap(px(12.)).pb(px(14.));
-        bar.child(field).child(chips).child(div().flex_1()).child(add).into_any_element()
+        let top = div().flex().items_center().gap(px(12.)).child(field).child(div().flex_1()).child(add);
+        let bar = div().id("skills-toolbar").flex().flex_col().gap(px(10.)).pb(px(14.));
+        bar.child(top).child(div().flex().child(seg.children(chips))).into_any_element()
     }
 
     fn add_bar(&self, mode: AddMode, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -494,7 +497,8 @@ impl Render for SkillsView {
         };
         let add = self.add.map(|m| self.add_bar(m, &th, cx));
         let page = div().id("skills-scroll").flex().flex_col().size_full().overflow_y_scroll().pr(px(40.)).pb(px(28.));
-        let page = page.child(section_top(Sec::Knowledge, None, None, cx)).child(self.toolbar(&skills, &th, cx)).children(add).child(body);
+        let lead = div().text_size(px(13.)).text_color(th.fg_2).child("Teach your agents how to work. Every agent in a pod reads the skills attached to its role.");
+        let page = page.child(section_top(Sec::Knowledge, Some(lead.into_any_element()), None, cx)).child(self.toolbar(&skills, &th, cx)).children(add).child(body);
         let (overlay, confirm) = (self.overlay(&th, cx), self.confirm_view(&th, cx));
         div().id("skills-page").relative().size_full().child(page).children(overlay).children(confirm)
     }
