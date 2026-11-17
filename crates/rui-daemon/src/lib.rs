@@ -18,6 +18,7 @@ pub mod roster;
 pub mod runner;
 pub mod scheduler;
 pub mod seat;
+pub mod prompts;
 pub mod shell;
 pub mod skills;
 pub mod state;

@@ -35,9 +35,9 @@ fn load_message(db: &Db, id: i64) -> Result<ChatMessage> {
     db.get_chat_message(id)?.context("chat message not found")
 }
 
-/// Rui's prompt plus the catalog of roles it can staff.
+/// Rui's prompt with the catalog of roles it can staff filled in.
 fn system_prompt(data_dir: &Path) -> String {
-    format!("{RUI_PROMPT}\n\n# Roles you can staff\n{}", roster::catalog(data_dir))
+    crate::prompts::fill(RUI_PROMPT, &[("role_catalog", roster::catalog(data_dir))])
 }
 
 /// Tools Rui may use without asking: its MCP tools plus read-only built-ins (not Bash).
