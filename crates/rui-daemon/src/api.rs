@@ -69,7 +69,7 @@ fn require_text(s: &str, field: &str) -> ApiResult<()> {
 /// Build the router with all JSON routes.
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/clients", get(list_clients))
+        .route("/clients", get(list_clients).post(create_client_http))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
@@ -128,6 +128,21 @@ async fn get_live(State(s): State<ApiState>) -> Json<serde_json::Value> {
 
 async fn list_clients(State(s): State<ApiState>) -> ApiResult<Json<Vec<Client>>> {
     Ok(Json(s.db.list_clients()?))
+}
+
+#[derive(Deserialize)]
+struct NewClient {
+    name: String,
+    repo_path: String,
+}
+
+async fn create_client_http(State(s): State<ApiState>, Json(b): Json<NewClient>) -> ApiResult<(StatusCode, Json<Client>)> {
+    let name = b.name.trim();
+    if !name.is_empty() && s.db.get_client_by_name(name)?.is_some() {
+        return Err(conflict(&format!("client '{name}' already exists")));
+    }
+    let client = crate::mcp::logic::register_client(&s.db, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(client)))
 }
 
 async fn list_tasks(State(s): State<ApiState>) -> ApiResult<Json<Vec<Task>>> {
@@ -653,6 +668,25 @@ mod tests {
         assert_eq!((st, v[0]["name"].as_str()), (StatusCode::OK, Some("acme")));
         let (st, v) = call(&app, "GET", "/tasks", None).await;
         assert_eq!((st, v[0]["status"].as_str()), (StatusCode::OK, Some("new")));
+    }
+
+    #[tokio::test]
+    async fn post_clients_validates_and_conflicts() {
+        let (app, _db, _rx) = setup();
+        let repo = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git").arg("-C").arg(repo.path()).arg("init").output().unwrap();
+        assert!(ok.status.success());
+        let body = json!({"name": "newco", "repo_path": repo.path().to_string_lossy()});
+        let (st, v) = call(&app, "POST", "/clients", Some(body.clone())).await;
+        assert_eq!((st, v["name"].as_str()), (StatusCode::CREATED, Some("newco")));
+        let (_, list) = call(&app, "GET", "/clients", None).await;
+        assert_eq!(list[0]["name"].as_str(), Some("newco"));
+        assert_eq!(call(&app, "POST", "/clients", Some(body)).await.0, StatusCode::CONFLICT);
+        let plain = tempfile::tempdir().unwrap();
+        let bad = json!({"name": "other", "repo_path": plain.path().to_string_lossy()});
+        assert_eq!(call(&app, "POST", "/clients", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let empty = json!({"name": " ", "repo_path": repo.path().to_string_lossy()});
+        assert_eq!(call(&app, "POST", "/clients", Some(empty)).await.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

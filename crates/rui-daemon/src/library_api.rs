@@ -33,6 +33,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/skills/import", post(import_skill))
         .route("/skills/upload", post(upload_skill))
         .route("/skills/{name}", get(get_skill).put(edit_skill).delete(delete_skill))
+        .route("/skills/{name}/files", get(skill_files))
         .route("/skills/{name}/status", post(skill_status))
         .route("/skills/{name}/attach", post(attach_skill))
         .route("/skills/{name}/tools", post(skill_tools))
@@ -102,6 +103,10 @@ async fn list_skills(State(s): State<ApiState>) -> Reply {
 
 async fn get_skill(State(s): State<ApiState>, Path(name): Path<String>) -> Reply {
     Ok(Json(skills::get(&s.data_dir, &name, &used_7d(&s)?)?))
+}
+
+async fn skill_files(State(s): State<ApiState>, Path(name): Path<String>) -> Reply {
+    Ok(Json(json!(skills::files(&s.data_dir, &name)?)))
 }
 
 async fn skill_reply(s: &ApiState, name: &str) -> Reply {

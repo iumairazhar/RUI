@@ -298,20 +298,25 @@ pub mod logic {
         Ok(())
     }
 
-    /// Registers a client after validating its repo path and name.
-    pub fn create_client(db: &Db, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
-        let name = a.name.trim();
+    /// Validates and registers a client; no audit record.
+    pub fn register_client(db: &Db, name: &str, repo_path: &str, test_command: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
+        let name = name.trim();
         if name.is_empty() {
             anyhow::bail!("name must not be empty");
         }
-        let path = expand_home(&a.repo_path);
+        let path = expand_home(repo_path);
         check_git_repo(&path)?;
         if db.get_client_by_name(name)?.is_some() {
             anyhow::bail!("client '{name}' already exists");
         }
-        let cmds = a.allowed_commands.clone().unwrap_or_default();
         let repo = path.to_string_lossy().into_owned();
-        let client = db.create_client(name, &repo, a.test_command.as_deref(), &cmds)?;
+        Ok(db.create_client(name, &repo, test_command, allowed)?)
+    }
+
+    /// Registers a client after validating its repo path and name.
+    pub fn create_client(db: &Db, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
+        let cmds = a.allowed_commands.clone().unwrap_or_default();
+        let client = register_client(db, &a.name, &a.repo_path, a.test_command.as_deref(), &cmds)?;
         record(db, ctx, Role::Rui, "use_repo", &a)?;
         Ok(serde_json::to_value(client)?)
     }

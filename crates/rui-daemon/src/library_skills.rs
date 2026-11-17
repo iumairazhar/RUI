@@ -238,6 +238,48 @@ pub fn delete(data: &Path, name: &str) -> LibResult<()> {
     Ok(())
 }
 
+/// Largest file whose text is returned inline.
+const TEXT_LIMIT: u64 = 64 * 1024;
+
+/// Reads a file's text when it is small and valid UTF-8.
+fn text_of(path: &Path, size: u64) -> Option<String> {
+    if size > TEXT_LIMIT {
+        return None;
+    }
+    String::from_utf8(std::fs::read(path).ok()?).ok()
+}
+
+/// Collects regular files under `dir`, skipping symlinks, `.rui.json` and `.history`.
+fn walk(root: &Path, dir: &Path, out: &mut Vec<Value>) -> LibResult<()> {
+    for entry in std::fs::read_dir(dir).map_err(anyhow::Error::from)? {
+        let path = entry.map_err(anyhow::Error::from)?.path();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let meta = std::fs::symlink_metadata(&path).map_err(anyhow::Error::from)?;
+        if meta.file_type().is_symlink() || name == ".history" || name == ".rui.json" {
+            continue;
+        }
+        if meta.is_dir() {
+            walk(root, &path, out)?;
+            continue;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(&path).components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+        out.push(json!({"path": rel, "size": meta.len(), "text": text_of(&path, meta.len())}));
+    }
+    Ok(())
+}
+
+/// Lists every file in the skill folder, `SKILL.md` first, then by path.
+pub fn files(data: &Path, name: &str) -> LibResult<Vec<Value>> {
+    let dir = dir_of(data, name)?;
+    let mut out = Vec::new();
+    walk(&dir, &dir, &mut out)?;
+    out.sort_by_key(|v| {
+        let p = v["path"].as_str().unwrap_or_default().to_string();
+        (p != "SKILL.md", p)
+    });
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +372,22 @@ mod tests {
         assert!(std::fs::read_dir(d.path().join("trash")).unwrap().next().is_some());
         assert!(role_skills(d.path(), "backend").is_empty() && role_skills(d.path(), "tester").is_empty());
         assert!(matches!(delete(d.path(), "alpha"), Err(LibError::NotFound(_))));
+    }
+
+    #[test]
+    fn files_lists_skill_folder() {
+        let d = setup();
+        let root = d.path().join("skills/alpha");
+        write(&root.join("scripts/a.py"), "print(1)");
+        std::fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        write(&root.join(".rui.json"), "{}");
+        write(&root.join(".history/1.md"), "old");
+        let list = files(d.path(), "alpha").unwrap();
+        let paths: Vec<&str> = list.iter().map(|v| v["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["SKILL.md", "blob.bin", "scripts/a.py"]);
+        assert_eq!(list[2]["text"].as_str(), Some("print(1)"));
+        assert!(list[1]["text"].is_null());
+        assert!(matches!(files(d.path(), "nope"), Err(LibError::NotFound(_))));
     }
 
     #[test]
