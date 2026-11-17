@@ -299,7 +299,7 @@ pub mod logic {
     }
 
     /// Validates and registers a client; no audit record.
-    pub fn register_client(db: &Db, name: &str, repo_path: &str, test_command: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
+    pub fn register_client(db: &Db, data_dir: &Path, name: &str, repo_path: &str, test_command: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
         let name = name.trim();
         if name.is_empty() {
             anyhow::bail!("name must not be empty");
@@ -310,13 +310,15 @@ pub mod logic {
             anyhow::bail!("client '{name}' already exists");
         }
         let repo = path.to_string_lossy().into_owned();
-        Ok(db.create_client(name, &repo, test_command, allowed)?)
+        let client = db.create_client(name, &repo, test_command, allowed)?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, Some(false))?;
+        Ok(client)
     }
 
     /// Registers a client after validating its repo path and name.
-    pub fn create_client(db: &Db, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
+    pub fn create_client(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
         let cmds = a.allowed_commands.clone().unwrap_or_default();
-        let client = register_client(db, &a.name, &a.repo_path, a.test_command.as_deref(), &cmds)?;
+        let client = register_client(db, data_dir, &a.name, &a.repo_path, a.test_command.as_deref(), &cmds)?;
         record(db, ctx, Role::Rui, "use_repo", &a)?;
         Ok(serde_json::to_value(client)?)
     }
@@ -355,11 +357,14 @@ pub mod logic {
         let slug = crate::projects::slug(name);
         for n in [name, slug.as_str()] {
             if let Some(c) = db.get_client_by_name(n)? {
+                crate::client_state::ensure(data_dir, &c.name, &c.repo_path, None)?;
                 return Ok(c);
             }
         }
         let path = crate::projects::new_project(data_dir, name)?;
-        db.create_client(&slug, &path.to_string_lossy(), None, &[])
+        let client = db.create_client(&slug, &path.to_string_lossy(), None, &[])?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, Some(false))?;
+        Ok(client)
     }
 
     fn write_apps(repo: &Path, apps: &[AppSpec]) -> anyhow::Result<()> {
@@ -763,7 +768,7 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<CreateClientArgs>,
     ) -> CallToolResult {
-        finish(logic::create_client(&self.db, &ctx_from(&parts), a))
+        finish(logic::create_client(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Staff a task: pick the roles for the pod. A Lead is added automatically and splits the work among them. Omit project for a general task; a known project name reuses it, a new name creates it.")]
@@ -1046,7 +1051,7 @@ mod tests {
         let db = Db::open_test();
         let dir = git_dir();
         let ctx = Ctx { task_id: None, source_ref: Some("chat:12".into()) };
-        logic::create_client(&db, &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
+        logic::create_client(&db, &std::env::temp_dir().join("rui-mcp-test-none"), &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
         let t = logic::create_task(
             &db,
             &ctx,
@@ -1103,17 +1108,19 @@ mod tests {
         let db = Db::open_test();
         let dir = git_dir();
         let ctx = Ctx::default();
-        let c = logic::create_client(&db, &ctx, client_args("A", dir.path(), Some("cargo test"))).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let c = logic::create_client(&db, data.path(), &ctx, client_args("A", dir.path(), Some("cargo test"))).unwrap();
         assert_eq!(c["name"], "A");
+        assert!(data.path().join("clients/a/client.json").exists());
         assert_eq!(c["test_command"], "cargo test");
-        assert!(logic::create_client(&db, &ctx, client_args("A", dir.path(), None)).is_err());
+        assert!(logic::create_client(&db, data.path(), &ctx, client_args("A", dir.path(), None)).is_err());
     }
 
     #[test]
     fn create_client_rejects_non_git_dir() {
         let db = Db::open_test();
         let dir = tempfile::tempdir().unwrap();
-        let err = logic::create_client(&db, &Ctx::default(), client_args("A", dir.path(), None));
+        let err = logic::create_client(&db, dir.path(), &Ctx::default(), client_args("A", dir.path(), None));
         assert!(err.unwrap_err().to_string().contains("not a git repository"));
         assert!(db.list_clients().unwrap().is_empty());
     }

@@ -1,0 +1,180 @@
+//! Per-client state kept as plain files under `<data_dir>/clients/<slug>/`.
+
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientFile {
+    pub name: String,
+    pub repo_path: String,
+    #[serde(default)]
+    pub internal: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodRole {
+    pub role: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pod {
+    #[serde(default)]
+    pub roles: Vec<PodRole>,
+    #[serde(default)]
+    pub protected: Vec<String>,
+}
+
+/// Folder holding one client's state files.
+pub fn dir(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join("clients").join(crate::projects::slug(name))
+}
+
+fn now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn create_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    Ok(fs::write(path, content)?)
+}
+
+/// Creates the folder and any missing files; existing history is left as it is.
+pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<bool>) -> Result<ClientFile> {
+    if crate::projects::slug(name).is_empty() {
+        bail!("client name '{name}' has no usable letters or digits");
+    }
+    let d = dir(data_dir, name);
+    fs::create_dir_all(&d)?;
+    let kept = read_client(data_dir, name)?.map(|c| c.internal).unwrap_or(false);
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept) };
+    fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
+    create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
+    for f in ["briefs.md", "decisions.log", "playbook.md"] {
+        create_if_missing(&d.join(f), "")?;
+    }
+    Ok(file)
+}
+
+pub fn read_client(data_dir: &Path, name: &str) -> Result<Option<ClientFile>> {
+    let path = dir(data_dir, name).join("client.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
+pub fn read_pod(data_dir: &Path, name: &str) -> Result<Pod> {
+    let path = dir(data_dir, name).join("pod.json");
+    if !path.exists() {
+        return Ok(Pod::default());
+    }
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+pub fn write_pod(data_dir: &Path, name: &str, pod: &Pod) -> Result<()> {
+    let d = dir(data_dir, name);
+    fs::create_dir_all(&d)?;
+    Ok(fs::write(d.join("pod.json"), serde_json::to_string_pretty(pod)?)?)
+}
+
+fn append(data_dir: &Path, name: &str, file: &str, text: &str) -> Result<()> {
+    let d = dir(data_dir, name);
+    fs::create_dir_all(&d)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(d.join(file))?;
+    Ok(f.write_all(text.as_bytes())?)
+}
+
+pub fn append_brief(data_dir: &Path, name: &str, task_id: i64, title: &str, brief: &str) -> Result<()> {
+    append(data_dir, name, "briefs.md", &format!("## {} task {task_id}: {title}\n\n{brief}\n\n", now()))
+}
+
+pub fn append_decision(data_dir: &Path, name: &str, line: &str) -> Result<()> {
+    let flat = line.replace(['\n', '\r'], " ");
+    append(data_dir, name, "decisions.log", &format!("{} {}\n", now(), flat.trim()))
+}
+
+fn read_or_empty(data_dir: &Path, name: &str, file: &str) -> Result<String> {
+    let path = dir(data_dir, name).join(file);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(path)?)
+}
+
+/// Last `max_lines` lines of the decision log.
+pub fn read_log(data_dir: &Path, name: &str, max_lines: usize) -> Result<String> {
+    let text = read_or_empty(data_dir, name, "decisions.log")?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines[start..].join("\n"))
+}
+
+pub fn read_briefs(data_dir: &Path, name: &str) -> Result<String> {
+    read_or_empty(data_dir, name, "briefs.md")
+}
+
+pub fn read_playbook(data_dir: &Path, name: &str) -> Result<String> {
+    read_or_empty(data_dir, name, "playbook.md")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_creates_files_and_keeps_state() {
+        let t = tempfile::tempdir().unwrap();
+        ensure(t.path(), "Acme Co", "/r", Some(true)).unwrap();
+        let d = dir(t.path(), "Acme Co");
+        for f in ["client.json", "pod.json", "briefs.md", "decisions.log", "playbook.md"] {
+            assert!(d.join(f).exists(), "{f}");
+        }
+        append_decision(t.path(), "Acme Co", "kept").unwrap();
+        let c = ensure(t.path(), "Acme Co", "/r2", None).unwrap();
+        assert!(c.internal);
+        assert_eq!(c.repo_path, "/r2");
+        assert!(read_log(t.path(), "Acme Co", 10).unwrap().contains("kept"));
+    }
+
+    #[test]
+    fn pod_defaults_and_round_trips() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(read_pod(t.path(), "A").unwrap(), Pod::default());
+        let pod = Pod { roles: vec![PodRole { role: "backend".into(), skills: vec!["rust".into()] }], protected: vec!["src/db.rs".into()] };
+        write_pod(t.path(), "A", &pod).unwrap();
+        assert_eq!(read_pod(t.path(), "A").unwrap(), pod);
+    }
+
+    #[test]
+    fn decisions_are_flat_and_tailed() {
+        let t = tempfile::tempdir().unwrap();
+        append_decision(t.path(), "A", "first").unwrap();
+        append_decision(t.path(), "A", " second\nline ").unwrap();
+        let last = read_log(t.path(), "A", 1).unwrap();
+        assert!(last.ends_with("second line"));
+        assert!(!last.contains("first"));
+        assert_eq!(read_log(t.path(), "A", 10).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn brief_is_appended() {
+        let t = tempfile::tempdir().unwrap();
+        append_brief(t.path(), "A", 7, "Title", "Body text").unwrap();
+        let b = read_briefs(t.path(), "A").unwrap();
+        assert!(b.contains("task 7: Title") && b.contains("Body text"));
+        assert_eq!(read_playbook(t.path(), "A").unwrap(), "");
+    }
+
+    #[test]
+    fn empty_slug_errors() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(ensure(t.path(), "!!!", "/r", None).is_err());
+    }
+}

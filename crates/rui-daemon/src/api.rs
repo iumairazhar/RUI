@@ -147,7 +147,7 @@ async fn create_client_http(State(s): State<ApiState>, Json(b): Json<NewClient>)
     if !name.is_empty() && s.db.get_client_by_name(name)?.is_some() {
         return Err(conflict(&format!("client '{name}' already exists")));
     }
-    let client = crate::mcp::logic::register_client(&s.db, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
+    let client = crate::mcp::logic::register_client(&s.db, &s.data_dir, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
     Ok((StatusCode::CREATED, Json(client)))
 }
 
