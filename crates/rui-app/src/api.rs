@@ -386,6 +386,11 @@ pub fn changes(id: i64) -> Result<Vec<Change>> {
     Ok(serde_json::from_value(get(&format!("/tasks/{id}/changes"))?)?)
 }
 
+/// Delete a chat. Errors carry the daemon's `{error}` text (409 while Rui is answering).
+pub fn delete_chat(id: i64) -> Result<()> {
+    library("DELETE", &format!("/chats/{id}"), None).map(|_| ())
+}
+
 /// Post a user message to a chat.
 pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
     post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))

@@ -2,7 +2,8 @@
 
 use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
-use super::{chip, markdown, page_head, primary_button, question_card};
+use super::library::confirm_modal;
+use super::{chip, markdown, primary_button, question_card};
 use crate::api::LiveState;
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
@@ -26,6 +27,7 @@ pub struct ChatView {
     scroll: ScrollHandle,
     last_len: usize,
     last_chat: Option<i64>,
+    confirm_delete: Option<(i64, String)>,
 }
 
 impl ChatView {
@@ -34,7 +36,30 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None }
+        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None }
+    }
+
+    fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
+        self.confirm_delete = Some((id, title));
+        cx.notify();
+    }
+
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        cx.notify();
+    }
+
+    fn accept_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((id, _)) = self.confirm_delete.take() else { return };
+        self.store.update(cx, |s, cx| s.delete_chat(id, cx));
+        cx.notify();
+    }
+
+    fn delete_modal(&self, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, title) = self.confirm_delete.as_ref()?;
+        let head = format!("Delete \"{}\"?", cut_title(title));
+        let body = "The conversation and its open questions go away. Teams it started keep running and their work stays.";
+        Some(confirm_modal(&head, body, "Delete", true, Self::cancel_delete, Self::accept_delete, th, cx))
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -383,6 +408,38 @@ fn chat_sub(c: &Chat, today: i64) -> String {
     format!("{} \u{b7} {last}", when_label(&c.updated_at, today))
 }
 
+/// A chat title cut to 40 chars with "…".
+fn cut_title(title: &str) -> String {
+    match title.chars().count() > 40 {
+        true => format!("{}\u{2026}", title.chars().take(40).collect::<String>()),
+        false => title.to_string(),
+    }
+}
+
+fn delete_button(c: &Chat, th: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
+    let (id, title) = (c.id, c.title.clone());
+    let (muted, fg) = (th.muted, th.fg);
+    let group = format!("chat-row-{id}");
+    div()
+        .id(("chat-delete", id as usize))
+        .flex_none()
+        .size(px(20.))
+        .rounded(px(5.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .child(svg().path("icons/close.svg").size(px(12.)).text_color(muted))
+        .hover(move |s| s.bg(fg.opacity(0.12)))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.ask_delete(id, title.clone(), cx);
+        }))
+        .into_any_element()
+}
+
 fn chat_row(c: &Chat, selected: bool, today: i64, th: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
     let id = c.id;
     let (fg, hover_bg) = (th.fg, th.fg.opacity(0.08));
@@ -391,26 +448,31 @@ fn chat_row(c: &Chat, selected: bool, today: i64, th: &Theme, cx: &mut Context<C
         .whitespace_nowrap()
         .overflow_hidden()
         .text_ellipsis()
-        .text_size(px(12.5))
+        .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(c.title.clone());
     let sub = div()
-        .mt(px(3.))
+        .mt(px(2.))
         .whitespace_nowrap()
         .overflow_hidden()
         .text_ellipsis()
-        .text_size(px(10.5))
+        .text_size(px(10.))
         .text_color(sub_color)
         .child(chat_sub(c, today));
+    let text = div().flex_1().min_w_0().child(title).child(sub);
     let row = div()
         .id(("chat-row", id as usize))
+        .group(format!("chat-row-{id}"))
+        .flex()
+        .items_center()
+        .gap(px(6.))
         .px(px(10.))
-        .py(px(9.))
-        .mb(px(3.))
+        .py(px(7.))
+        .mb(px(2.))
         .rounded(px(9.))
         .cursor_pointer()
-        .child(title)
-        .child(sub)
+        .child(text)
+        .child(delete_button(c, th, cx))
         .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.select_chat(id, cx))));
     match selected {
         true => row.bg(th.sel).text_color(th.on_accent),
@@ -424,7 +486,7 @@ fn new_chat_button(th: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
     div()
         .id("chat-new")
         .w_full()
-        .h(px(34.))
+        .h(px(30.))
         .px(px(14.))
         .rounded(px(9.))
         .flex()
@@ -432,7 +494,7 @@ fn new_chat_button(th: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
         .gap(px(8.))
         .bg(base)
         .text_color(th.fg)
-        .text_size(px(12.5))
+        .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
@@ -447,7 +509,10 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
     let today = today_days();
     let rows: Vec<AnyElement> =
         chats.iter().map(|c| chat_row(c, current == Some(c.id), today, &th, cx)).collect();
-    let head = div().id("chats-head").px(px(12.)).pt(px(16.)).pb(px(12.)).child(new_chat_button(&th, cx));
+    let eyebrow = div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child("TALK TO THE SYSTEM");
+    let name = div().text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg).child("Rui");
+    let top = div().id("chats-title").px(px(14.)).pt(px(56.)).pb(px(12.)).flex().flex_col().gap(px(4.)).child(eyebrow).child(name);
+    let head = div().id("chats-head").px(px(12.)).pb(px(10.)).child(new_chat_button(&th, cx));
     let scroll = div()
         .id("chats-scroll")
         .flex_1()
@@ -458,7 +523,7 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
         .children(rows);
     div()
         .id("chats-list")
-        .w(px(296.))
+        .w(px(232.))
         .flex_none()
         .h_full()
         .flex()
@@ -466,6 +531,7 @@ fn chat_list(chats: &[Chat], current: Option<i64>, cx: &mut Context<ChatView>) -
         .bg(th.well)
         .border_r_1()
         .border_color(th.hairline)
+        .child(top)
         .child(head)
         .child(scroll)
         .into_any_element()
@@ -502,20 +568,15 @@ impl Render for ChatView {
             .min_w_0()
             .h_full()
             .pl(px(20.))
+            .pt(px(56.))
             .flex()
             .flex_col()
             .child(list)
             .child(composer);
-        let body = div()
-            .id("chat-body")
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_row()
-            .child(chat_list(&chats, current, cx))
-            .child(main);
-        let head = page_head("TALK TO THE SYSTEM", "Rui", cx).pr(px(40.));
-        div().id("chat-root").flex().flex_col().size_full().child(head).child(body)
+        let th = theme(cx).clone();
+        let modal = self.delete_modal(&th, cx);
+        let root = div().id("chat-root").relative().flex().flex_row().size_full();
+        root.child(chat_list(&chats, current, cx)).child(main).children(modal)
     }
 }
 
@@ -582,6 +643,13 @@ mod tests {
         let got = asks_of(Some(1), &[ask(5, 1, "open"), ask(6, 2, "open")], &[ask(2, 1, "answered")]);
         assert_eq!(got.iter().map(|a| a.id).collect::<Vec<_>>(), [2, 5]);
         assert!(asks_of(None, &[ask(5, 1, "open")], &[]).is_empty());
+    }
+
+    #[test]
+    fn cut_title_limits_to_40_chars() {
+        assert_eq!(cut_title("short"), "short");
+        assert_eq!(cut_title(&"a".repeat(40)), "a".repeat(40));
+        assert_eq!(cut_title(&"b".repeat(41)), format!("{}\u{2026}", "b".repeat(40)));
     }
 
     #[test]

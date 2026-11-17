@@ -476,6 +476,29 @@ impl Store {
         .detach();
     }
 
+    /// Delete a chat in the background; on success drop it and pick the next one, else toast the error.
+    pub fn delete_chat(&mut self, id: i64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { api::delete_chat(id) }).await;
+            this.update(cx, |s, cx| match res {
+                Ok(()) => s.remove_chat(id, cx),
+                Err(e) => s.show_toast("Could not delete chat", vec![e.to_string()], cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_chat(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.chats.retain(|c| c.id != id);
+        if self.current_chat == Some(id) {
+            self.current_chat = self.chats.first().map(|c| c.id);
+            self.chat.clear();
+        }
+        cx.notify();
+        self.refresh(cx);
+    }
+
     /// Answer a question (with the owner's reason, if any), then refresh.
     /// On success a toast says who picks it up; a failure (such as 409) lands in `action_error`.
     pub fn answer(&mut self, question_id: i64, text: String, why: Option<String>, cx: &mut Context<Self>) {
