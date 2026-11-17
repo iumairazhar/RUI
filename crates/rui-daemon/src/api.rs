@@ -82,6 +82,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/seat", get(get_seat))
         .route("/live", get(get_live))
         .route("/tasks/runs", get(list_task_runs))
+        .route("/tasks/stopped", get(list_stopped))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
         .route("/tasks/{id}/results", get(task_results))
@@ -279,6 +280,11 @@ fn seat_kind(payload: &serde_json::Value) -> &'static str {
         Some(_) => "api_key",
         None => "unknown",
     }
+}
+
+/// Stuck tasks the owner (or Rui) stopped, so the app can tell them from ones that need the owner.
+async fn list_stopped(State(s): State<ApiState>) -> ApiResult<Json<Vec<i64>>> {
+    Ok(Json(s.db.stopped_task_ids()?))
 }
 
 async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun>>> {
@@ -984,6 +990,18 @@ mod tests {
         assert_eq!(db.get_task(parent).unwrap().unwrap().status, TaskStatus::Split);
         let events = db.list_events(Some(sub.id), 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "instruction" && e.agent == "owner"));
+    }
+
+    #[tokio::test]
+    async fn stopped_lists_only_stopped_stuck_tasks() {
+        let (app, db, _rx) = setup();
+        let (cid, stopped) = seed_task(&db);
+        let stuck = seed_task_for(&db, cid);
+        db.set_task_status(stopped, TaskStatus::Stuck).unwrap();
+        db.set_task_status(stuck, TaskStatus::Stuck).unwrap();
+        db.add_event(Some(stopped), "owner", "stopped", &json!({"by": "owner"})).unwrap();
+        let (st, v) = call(&app, "GET", "/tasks/stopped", None).await;
+        assert_eq!((st, v), (StatusCode::OK, json!([stopped])));
     }
 
     #[tokio::test]

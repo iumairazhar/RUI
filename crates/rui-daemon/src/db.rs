@@ -659,6 +659,15 @@ impl Db {
         Ok(stmt.query_map(params![task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Ids of stuck tasks that were stopped (a `stopped` event exists), not stuck on their own.
+    pub fn stopped_task_ids(&self) -> Result<Vec<i64>> {
+        let conn = self.conn()?;
+        let sql = "SELECT t.id FROM tasks t WHERE t.status = 'stuck' \
+                   AND EXISTS (SELECT 1 FROM events e WHERE e.task_id = t.id AND e.kind = 'stopped') ORDER BY t.id";
+        let mut stmt = conn.prepare(sql)?;
+        Ok(stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Events with id > `after_id`, oldest first, at most `limit`.
     pub fn list_events_after(&self, task_id: Option<i64>, after_id: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn()?;
