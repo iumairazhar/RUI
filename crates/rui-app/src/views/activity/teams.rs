@@ -1,9 +1,9 @@
-//! Pure helpers for the Threads board: stop rules and the Landed cap.
+//! Pure helpers for the Threads board: stop rules and the Done cap.
 
 use rui_core::{Task, TaskStatus};
 
-/// Newest cards the Landed band shows before "Show more".
-pub const LANDED_CAP: usize = 5;
+/// Newest cards the Done band shows before "Show more".
+pub const DONE_CAP: usize = 5;
 
 /// Running or waiting: a task the owner can still stop.
 pub fn can_stop(s: &TaskStatus) -> bool {
@@ -40,11 +40,11 @@ mod tests {
     }
 
     #[test]
-    fn landed_cap_shows_newest_five_then_more() {
-        let (shown, hidden) = cap_items((1..=8).collect::<Vec<_>>(), LANDED_CAP, false);
+    fn done_cap_shows_newest_five_then_more() {
+        let (shown, hidden) = cap_items((1..=8).collect::<Vec<_>>(), DONE_CAP, false);
         assert_eq!((shown, hidden), (vec![1, 2, 3, 4, 5], 3));
-        assert_eq!(cap_items((1..=8).collect::<Vec<_>>(), LANDED_CAP, true).1, 0);
-        assert_eq!(cap_items(vec![1, 2], LANDED_CAP, false), (vec![1, 2], 0));
+        assert_eq!(cap_items((1..=8).collect::<Vec<_>>(), DONE_CAP, true).1, 0);
+        assert_eq!(cap_items(vec![1, 2], DONE_CAP, false), (vec![1, 2], 0));
     }
 
     #[test]

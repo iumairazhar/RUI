@@ -21,7 +21,7 @@ use theme::{Theme, theme};
 use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
-    activity::ThreadsView, agents::AgentsView, apps::AppsView, board::BoardView, chat::ChatView, clients,
+    activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, clients,
     library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
 };
 
@@ -138,7 +138,6 @@ struct Root {
     /// Bumped on every selection so the pill animation restarts.
     pill_seq: usize,
     chat: Entity<ChatView>,
-    board: Entity<BoardView>,
     questions: Entity<QuestionsView>,
     activity: Entity<ThreadsView>,
     agents: Entity<AgentsView>,
@@ -180,7 +179,6 @@ impl Root {
             pill_from: Nav::from_env(),
             pill_seq: 0,
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
-            board: cx.new(|cx| BoardView::new(store.clone(), cx)),
             questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
             activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
             agents: cx.new(|cx| AgentsView::new(store.clone(), cx)),
@@ -200,7 +198,6 @@ impl Root {
             Nav::Inbox => self.questions.clone().into_any_element(),
             Nav::Work => match tab(Sec::Work) {
                 0 => self.activity.clone().into_any_element(),
-                1 => self.board.clone().into_any_element(),
                 _ => self.apps.clone().into_any_element(),
             },
             Nav::Clients => match tab(Sec::Clients) {

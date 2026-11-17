@@ -4,7 +4,6 @@ pub mod activity;
 pub mod agents;
 pub mod apps;
 pub mod asks;
-pub mod board;
 pub mod character;
 pub mod chat;
 mod chat_tools;
@@ -24,12 +23,11 @@ pub mod status;
 pub mod toast;
 pub mod trace;
 
-use crate::theme::{Status, Theme, theme};
+use crate::theme::{Status, theme};
 use gpui::{
     AnyElement, App, Div, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
     svg,
 };
-use rui_core::TaskStatus;
 
 /// Page header: small eyebrow line above a big title. Pass the eyebrow already uppercase.
 pub fn page_head(eyebrow: &str, title: &str, cx: &App) -> Div {
@@ -127,17 +125,6 @@ pub fn chip(id: impl Into<SharedString>, label: &str, cx: &App) -> Stateful<Div>
         .child(label.to_string())
 }
 
-/// Status color family for a task status.
-pub fn task_status<'a>(t: &TaskStatus, th: &'a Theme) -> &'a Status {
-    match t {
-        TaskStatus::New | TaskStatus::Clarifying => &th.think,
-        TaskStatus::WaitingAnswer | TaskStatus::Open => &th.wait,
-        TaskStatus::Split | TaskStatus::InProgress => &th.run,
-        TaskStatus::Done => &th.done,
-        TaskStatus::Stuck => &th.block,
-    }
-}
-
 /// Amber card holding a question, an optional "why" input, an answer input and its button.
 pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
     let th = theme(cx);
@@ -163,18 +150,4 @@ pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, ans
         .max_w(px(660.))
         .child(head)
         .child(row)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_task_status_maps() {
-        let th = Theme::dark();
-        for s in TaskStatus::ALL {
-            let _ = task_status(s, &th);
-        }
-        assert_eq!(task_status(&TaskStatus::Stuck, &th).base, th.block.base);
-    }
 }

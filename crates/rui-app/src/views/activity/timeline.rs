@@ -1,6 +1,7 @@
-//! "Every thread, last four hours": one smooth line per thread moving between the four bands.
+//! "Every thread, last four hours": one smooth line per thread moving between the five bands.
 
-use super::{Col, col_of, mono, parse_secs};
+use super::{mono, parse_secs};
+use crate::views::status::Word;
 use crate::theme::Theme;
 use gpui::{
     AnyElement, Bounds, FontWeight, Hsla, Pixels, canvas, div, point, prelude::*, px, quad, relative,
@@ -13,7 +14,7 @@ use std::sync::OnceLock;
 /// The chart spans four hours; "now" sits 90% of the way across.
 const WINDOW_SECS: i64 = 4 * 3600;
 const BEFORE_NOW: f32 = 0.9;
-const HEIGHT: f32 = 340.;
+const HEIGHT: f32 = 430.;
 /// Plot starts this far in from the left and stops before the band labels.
 const PLOT_LEFT: f32 = 18.;
 const PLOT_RIGHT: f32 = 220.;
@@ -21,7 +22,7 @@ const LABEL_W: f32 = 186.;
 
 /// One thread's line: where it has been, oldest first, in its client's color.
 pub struct Line {
-    pub pts: Vec<(i64, Col)>,
+    pub pts: Vec<(i64, Word)>,
     pub color: Hsla,
 }
 
@@ -29,16 +30,21 @@ pub struct Line {
 pub struct Chart {
     pub lines: Vec<Line>,
     /// Cards in each band, in `ROWS` order.
-    pub counts: [usize; 4],
+    pub counts: [usize; 5],
     pub now: i64,
     pub clients: Vec<(String, Hsla)>,
 }
 
 /// Bands top to bottom.
-pub const ROWS: [(Col, &str); 4] =
-    [(Col::Landed, "Landed"), (Col::Doing, "Doing"), (Col::Standing, "Standing by"), (Col::Needs, "Needs you")];
+pub const ROWS: [(Word, &str); 5] = [
+    (Word::NeedsYou, "Needs you"),
+    (Word::Working, "Working"),
+    (Word::Waiting, "Waiting"),
+    (Word::Stopped, "Stopped"),
+    (Word::Done, "Done"),
+];
 
-fn row_of(c: Col) -> usize {
+fn row_of(c: Word) -> usize {
     ROWS.iter().position(|r| r.0 == c).unwrap_or(0)
 }
 
@@ -46,33 +52,45 @@ fn row_y(i: usize) -> f32 {
     42. + 82. * i as f32
 }
 
+/// Band a task status puts a thread in; split tasks do not move it.
+fn status_word(s: &TaskStatus) -> Option<Word> {
+    match s {
+        TaskStatus::WaitingAnswer | TaskStatus::Stuck => Some(Word::NeedsYou),
+        TaskStatus::New | TaskStatus::Open => Some(Word::Waiting),
+        TaskStatus::Clarifying | TaskStatus::InProgress => Some(Word::Working),
+        TaskStatus::Done => Some(Word::Done),
+        TaskStatus::Split => None,
+    }
+}
+
 /// Band a task event moves its thread into, if it moves it at all.
-pub fn event_col(kind: &str, payload: &Value) -> Option<Col> {
+pub fn event_col(kind: &str, payload: &Value) -> Option<Word> {
     match kind {
-        "init" => Some(Col::Doing),
-        "stuck" => Some(Col::Needs),
-        "stopped" => Some(Col::Standing),
-        "rollup" | "status" => payload["status"].as_str().and_then(TaskStatus::parse).and_then(|s| col_of(&s)),
+        "init" => Some(Word::Working),
+        "stuck" | "scheduler_error" | "agent_error" | "land_failed" => Some(Word::NeedsYou),
+        "stopped" => Some(Word::Stopped),
+        "resumed" | "instruction" => Some(Word::Waiting),
+        "rollup" | "status" => payload["status"].as_str().and_then(TaskStatus::parse).and_then(|s| status_word(&s)),
         _ => None,
     }
 }
 
-/// A task's path: created standing by, each status-changing event, then where it is now, extended to now.
-pub fn trajectory(task: &Task, events: &[Event], current: Col, now: i64) -> Vec<(i64, Col)> {
+/// A task's path: created waiting, each status-changing event, then where it is now, extended to now.
+pub fn trajectory(task: &Task, events: &[Event], current: Word, now: i64) -> Vec<(i64, Word)> {
     let start = parse_secs(&task.created_at).unwrap_or(now);
-    let mut moves: Vec<(i64, Col)> = events
+    let mut moves: Vec<(i64, Word)> = events
         .iter()
         .filter(|e| e.task_id == Some(task.id))
         .filter_map(|e| Some((parse_secs(&e.created_at)?, event_col(&e.kind, &e.payload)?)))
         .collect();
     moves.sort_by_key(|m| m.0);
-    let mut pts = vec![(start, Col::Standing)];
+    let mut pts = vec![(start, Word::Waiting)];
     for (t, c) in moves {
         if pts.last().map(|p| p.1) != Some(c) {
             pts.push((t.max(start), c));
         }
     }
-    let last = pts.last().copied().unwrap_or((start, Col::Standing));
+    let last = pts.last().copied().unwrap_or((start, Word::Waiting));
     if last.1 != current {
         let at = parse_secs(&task.updated_at).unwrap_or(now).clamp(last.0, now.max(last.0));
         pts.push((at, current));
@@ -82,7 +100,7 @@ pub fn trajectory(task: &Task, events: &[Event], current: Col, now: i64) -> Vec<
 }
 
 /// Cut a path to start at `from`: the band held at that moment, then what follows.
-pub fn clip(pts: Vec<(i64, Col)>, from: i64) -> Vec<(i64, Col)> {
+pub fn clip(pts: Vec<(i64, Word)>, from: i64) -> Vec<(i64, Word)> {
     let Some(i) = pts.iter().rposition(|p| p.0 <= from) else { return pts };
     let mut out = vec![(from, pts[i].1)];
     out.extend(pts[i + 1..].iter().copied());
@@ -90,8 +108,8 @@ pub fn clip(pts: Vec<(i64, Col)>, from: i64) -> Vec<(i64, Col)> {
 }
 
 /// Draw a thread only if it moved inside the window or is live now; old, settled threads stay off the chart.
-pub fn worth_drawing(pts: &[(i64, Col)], from: i64, current: Col) -> bool {
-    if matches!(current, Col::Doing | Col::Needs) {
+pub fn worth_drawing(pts: &[(i64, Word)], from: i64, current: Word) -> bool {
+    if matches!(current, Word::Working | Word::NeedsYou) {
         return true;
     }
     pts.iter().take(pts.len().saturating_sub(1)).any(|p| p.0 > from)
@@ -162,7 +180,7 @@ fn paint_chart(b: Bounds<Pixels>, chart: &Chart, th: &Theme, window: &mut gpui::
     let from = window_start(chart.now);
     let x_of = |t: i64| left + width * (t - from) as f32 / WINDOW_SECS as f32;
     let ov = if th.dark { gpui::white() } else { gpui::black() };
-    for i in 0..4 {
+    for i in 0..ROWS.len() {
         let y = top + row_y(i);
         if i % 2 == 0 {
             let zone = Bounds { origin: point(px(left), px(y - 41.)), size: size(px(width), px(82.)) };
@@ -174,7 +192,7 @@ fn paint_chart(b: Bounds<Pixels>, chart: &Chart, th: &Theme, window: &mut gpui::
     let now_x = x_of(chart.now);
     let mut dashed = PathBuilder::stroke(px(1.)).dash_array(&[px(3.), px(4.)]);
     dashed.move_to(point(px(now_x), px(top + 26.)));
-    dashed.line_to(point(px(now_x), px(top + 306.)));
+    dashed.line_to(point(px(now_x), px(top + HEIGHT - 34.)));
     if let Ok(path) = dashed.build() {
         window.paint_path(path, th.accent_text.opacity(0.7));
     }
@@ -248,7 +266,7 @@ pub fn view(chart: Chart, th: &Theme) -> AnyElement {
     let ticks = ticks.into_iter().map(|(t, text)| tick((t - from) as f32 / WINDOW_SECS as f32, text, th));
     let axis = div().absolute().top_0().bottom_0().left(px(PLOT_LEFT)).right(px(PLOT_RIGHT));
     let axis = axis.child(now_label(th)).children(ticks);
-    let bands: Vec<AnyElement> = (0..4).map(|i| band_label(i, chart.counts[i], th)).collect();
+    let bands: Vec<AnyElement> = (0..ROWS.len()).map(|i| band_label(i, chart.counts[i], th)).collect();
     let theme = th.clone();
     let paint = canvas(|_, _, _| (), move |b, _, window, _| paint_chart(b, &chart, &theme, window));
     let plot = div().id("timeline-plot").relative().w_full().h(px(HEIGHT));
@@ -275,10 +293,15 @@ mod tests {
 
     #[test]
     fn events_map_to_bands() {
-        assert_eq!(event_col("init", &json!({})), Some(Col::Doing));
-        assert_eq!(event_col("rollup", &json!({"status":"done"})), Some(Col::Landed));
-        assert_eq!(event_col("status", &json!({"status":"waiting_answer"})), Some(Col::Needs));
-        assert_eq!(event_col("stuck", &json!({})), Some(Col::Needs));
+        assert_eq!(event_col("init", &json!({})), Some(Word::Working));
+        assert_eq!(event_col("rollup", &json!({"status":"done"})), Some(Word::Done));
+        assert_eq!(event_col("status", &json!({"status":"waiting_answer"})), Some(Word::NeedsYou));
+        for k in ["stuck", "scheduler_error", "agent_error", "land_failed"] {
+            assert_eq!(event_col(k, &json!({})), Some(Word::NeedsYou));
+        }
+        assert_eq!(event_col("stopped", &json!({})), Some(Word::Stopped));
+        assert_eq!(event_col("resumed", &json!({})), Some(Word::Waiting));
+        assert_eq!(event_col("instruction", &json!({})), Some(Word::Waiting));
         assert_eq!(event_col("assistant", &json!({})), None);
         assert_eq!(event_col("rollup", &json!({"status":"split"})), None);
     }
@@ -287,35 +310,42 @@ mod tests {
     fn path_follows_events_and_ends_now() {
         let base = parse_secs("2026-11-15 10:00:00").unwrap();
         let events = vec![ev("init", json!({}), "2026-11-15T10:30:00Z"), ev("rollup", json!({"status":"done"}), "2026-11-15T11:00:00Z")];
-        let pts = trajectory(&task("done"), &events, Col::Landed, base + 7200);
-        let bands: Vec<Col> = pts.iter().map(|p| p.1).collect();
-        assert_eq!(bands, vec![Col::Standing, Col::Doing, Col::Landed, Col::Landed]);
+        let pts = trajectory(&task("done"), &events, Word::Done, base + 7200);
+        let bands: Vec<Word> = pts.iter().map(|p| p.1).collect();
+        assert_eq!(bands, vec![Word::Waiting, Word::Working, Word::Done, Word::Done]);
         assert_eq!(pts[1].0, base + 1800);
         assert_eq!(pts.last().unwrap().0, base + 7200);
     }
 
     #[test]
     fn path_without_events_jumps_to_current_band() {
-        let pts = trajectory(&task("in_progress"), &[], Col::Doing, parse_secs("2026-11-15 13:00:00").unwrap());
-        assert_eq!(pts.iter().map(|p| p.1).collect::<Vec<_>>(), vec![Col::Standing, Col::Doing, Col::Doing]);
+        let pts = trajectory(&task("in_progress"), &[], Word::Working, parse_secs("2026-11-15 13:00:00").unwrap());
+        assert_eq!(pts.iter().map(|p| p.1).collect::<Vec<_>>(), vec![Word::Waiting, Word::Working, Word::Working]);
+    }
+
+    #[test]
+    fn path_ends_in_stopped_band() {
+        let now = parse_secs("2026-11-15 13:00:00").unwrap();
+        let pts = trajectory(&task("stuck"), &[ev("stopped", json!({}), "2026-11-15T12:00:00Z")], Word::Stopped, now);
+        assert_eq!(pts.last().map(|p| p.1), Some(Word::Stopped));
     }
 
     #[test]
     fn clip_holds_the_band_at_the_left_edge() {
-        let pts = vec![(0, Col::Standing), (100, Col::Doing), (300, Col::Landed)];
-        assert_eq!(clip(pts.clone(), 150), vec![(150, Col::Doing), (300, Col::Landed)]);
+        let pts = vec![(0, Word::Waiting), (100, Word::Working), (300, Word::Done)];
+        assert_eq!(clip(pts.clone(), 150), vec![(150, Word::Working), (300, Word::Done)]);
         assert_eq!(clip(pts.clone(), -5), pts);
     }
 
     #[test]
     fn only_recent_or_live_threads_are_drawn() {
-        let old = vec![(100, Col::Landed), (500, Col::Landed)];
-        assert!(!worth_drawing(&old, 100, Col::Landed));
-        assert!(worth_drawing(&old, 100, Col::Doing));
-        let moved = vec![(100, Col::Standing), (300, Col::Landed), (500, Col::Landed)];
-        assert!(worth_drawing(&moved, 100, Col::Landed));
-        let new = vec![(200, Col::Standing), (500, Col::Standing)];
-        assert!(worth_drawing(&new, 100, Col::Standing));
+        let old = vec![(100, Word::Done), (500, Word::Done)];
+        assert!(!worth_drawing(&old, 100, Word::Done));
+        assert!(worth_drawing(&old, 100, Word::Working));
+        let moved = vec![(100, Word::Waiting), (300, Word::Done), (500, Word::Done)];
+        assert!(worth_drawing(&moved, 100, Word::Done));
+        let new = vec![(200, Word::Waiting), (500, Word::Waiting)];
+        assert!(worth_drawing(&new, 100, Word::Waiting));
     }
 
     #[test]

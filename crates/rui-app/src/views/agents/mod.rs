@@ -8,13 +8,15 @@ use super::character::{CharState, character};
 use super::library::{self as lib, EditState, after_slide, run, slide_overlay, toast};
 use super::roster::{role_code, role_title};
 use super::section::{Sec, section_top};
+use super::status::{self, Word, word_of};
 use super::{card, chip, role_chip};
-use crate::api::{self, RoleInfo, SkillInfo};
+use crate::api::{self, OwnerState, RoleInfo, SkillInfo};
 use crate::store::{self, Store};
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, Context, Div, Entity, FontWeight, Window, div, prelude::*, px};
 use rui_core::{Client, Role, Task, TaskStatus};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 /// Loop limits offered in the drawer.
 const LIMITS: [i64; 5] = [3, 4, 6, 8, 10];
@@ -58,10 +60,10 @@ pub struct AgentsView {
 
 // ---- pure helpers ----
 
-/// Is a member of this pod with this agent running right now.
-fn is_live(pod: &Task, agent: &str, tasks: &[Task], running: &dyn Fn(&Task) -> bool) -> bool {
+/// The status word of this agent's task in the pod; None when the pod has no task for it.
+fn role_word(pod: &Task, agent: &str, tasks: &[Task], states: &HashMap<i64, OwnerState>) -> Option<Word> {
     let mine = |t: &&Task| (t.id == pod.id || t.parent_id == Some(pod.id)) && t.agent.as_deref() == Some(agent);
-    tasks.iter().filter(mine).any(running)
+    tasks.iter().find(mine).map(|t| word_of(states, t.id))
 }
 
 /// Lead parents that are not done.
@@ -379,47 +381,57 @@ impl AgentsView {
     fn pod_role(&self, pod: &Task, i: usize, agent: &str, color: gpui::Hsla, cx: &Context<Self>) -> AnyElement {
         let th = theme(cx);
         let s = self.store.read(cx);
-        let running = |t: &Task| s.live.task(t.id).is_some() || matches!(t.status, TaskStatus::InProgress | TaskStatus::Clarifying);
-        let live = is_live(pod, agent, &s.tasks, &running);
-        let state: AnyElement = match live {
-            true => {
-                let id = ("team-rui", pod.id as usize * 32 + i);
-                let face = character(CharState::Doing, px(18.), id, color, th);
-                div().flex().items_center().gap(px(5.)).child(face).child("In the loop").into_any_element()
-            }
-            false => div().child("Idle").into_any_element(),
-        };
+        let word = role_word(pod, agent, &s.tasks, &s.states);
+        let label = word.map_or("Idle", Word::label);
+        let fg = word.map_or(th.muted, |w| status::style(w, th).fg);
+        let face = (word == Some(Word::Working)).then(|| {
+            character(CharState::Doing, px(18.), ("team-rui", pod.id as usize * 32 + i), color, th)
+        });
+        let state = div().flex().items_center().gap(px(5.)).text_color(fg).children(face).child(label);
         let name = div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(role_title(&s.roles, agent));
-        let sub = div().text_size(px(10.5)).text_color(th.muted).child(state);
+        let sub = div().text_size(px(10.5)).child(state);
         let text = div().flex().flex_col().child(name).child(sub);
         let item = div().flex().items_center().gap(px(9.)).px(px(8.)).py(px(8.)).rounded(px(10.)).bg(th.well);
         item.child(role_chip(&role_code(&s.roles, agent), 28., color)).child(text).into_any_element()
     }
 
-    fn pod_card(&self, pod: &Task, cx: &Context<Self>) -> AnyElement {
-        let th = theme(cx);
-        let s = self.store.read(cx);
+    /// "Resume team" on a stopped pod: instructing its top task resumes the chain.
+    fn resume_button(&self, pod_id: i64, cx: &mut Context<Self>) -> AnyElement {
+        let b = chip(format!("pod-resume-{pod_id}"), "Resume team", cx);
+        let on_click = cx.listener(move |this, _, _, cx| {
+            let text = "Resume where you left off.".to_string();
+            this.store.update(cx, |s, cx| s.instruct_task(pod_id, text, cx));
+        });
+        b.on_click(on_click).into_any_element()
+    }
+
+    fn pod_card(&self, pod: &Task, cx: &mut Context<Self>) -> AnyElement {
+        let th = theme(cx).clone();
         let color = th.client_color(pod.client_id);
         let roles: Vec<AnyElement> = pod.pod.iter().enumerate().map(|(i, a)| self.pod_role(pod, i, a, color, cx)).collect();
-        let running = |t: &Task| s.live.task(t.id).is_some() || matches!(t.status, TaskStatus::InProgress | TaskStatus::Clarifying);
-        let live = pod.pod.iter().filter(|a| is_live(pod, a, &s.tasks, &running)).count();
+        let s = self.store.read(cx);
+        let words = pod.pod.iter().filter_map(|a| role_word(pod, a, &s.tasks, &s.states));
+        let working = words.filter(|w| *w == Word::Working).count();
+        let stopped = word_of(&s.states, pod.id) == Word::Stopped;
         let dot = div().flex_none().size(px(8.)).rounded_full().bg(color);
         let title = div().text_size(px(14.)).font_weight(FontWeight::BOLD).child(pod.title.clone());
-        let meta = format!("{} roles \u{b7} {live} in flight \u{b7} max loops {}", pod.pod.len(), pod.max_loops);
+        let meta = format!("{} roles \u{b7} {working} working \u{b7} max loops {}", pod.pod.len(), pod.max_loops);
         let max = div().ml_auto().text_size(px(11.5)).text_color(th.muted).child(meta);
-        let head = div().flex().items_center().gap(px(8.)).mb(px(12.)).child(dot).child(title).child(max);
+        let resume = stopped.then(|| self.resume_button(pod.id, cx));
+        let head = div().flex().items_center().gap(px(8.)).mb(px(12.)).child(dot).child(title).child(max).children(resume);
         let roles = div().flex().flex_wrap().gap(px(8.)).children(roles);
         card(cx).id(("pod", pod.id as usize)).p(px(14.)).max_w(px(1040.)).child(head).child(roles).into_any_element()
     }
 
     /// One heading plus its pod cards for each client group.
-    fn pod_groups(&self, groups: &[(String, Vec<&Task>)], th: &Theme, cx: &Context<Self>) -> Vec<AnyElement> {
-        let one = |(name, pods): &(String, Vec<&Task>)| {
+    fn pod_groups(&self, groups: &[(String, Vec<&Task>)], th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        for (name, pods) in groups {
             let cards: Vec<AnyElement> = pods.iter().map(|p| self.pod_card(p, cx)).collect();
             let list = div().flex().flex_col().gap(px(8.)).children(cards);
-            div().flex().flex_col().child(heading(name, th)).child(list).into_any_element()
-        };
-        groups.iter().map(one).collect()
+            out.push(div().flex().flex_col().child(heading(name, th)).child(list).into_any_element());
+        }
+        out
     }
 
     fn table_head(&self, th: &Theme) -> Div {
@@ -532,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn live_members_and_pods() {
+    fn role_words_and_pods() {
         let pod = ["lead", "backend"];
         let tasks = vec![
             task(1, None, "lead", "lead", "split", &pod),
@@ -540,9 +552,11 @@ mod tests {
             task(3, Some(1), "tester", "builder", "open", &pod),
             task(4, None, "lead", "lead", "done", &pod),
         ];
-        let running = |t: &Task| t.status == TaskStatus::InProgress;
-        assert!(is_live(&tasks[0], "backend", &tasks, &running));
-        assert!(!is_live(&tasks[0], "tester", &tasks, &running));
+        let state = |id: i64, word: &str| (id, OwnerState { task_id: id, word: word.into(), reason: String::new(), since: String::new() });
+        let states: HashMap<i64, OwnerState> = [state(2, "Working"), state(3, "Stopped")].into();
+        assert_eq!(role_word(&tasks[0], "backend", &tasks, &states), Some(Word::Working));
+        assert_eq!(role_word(&tasks[0], "tester", &tasks, &states), Some(Word::Stopped));
+        assert_eq!(role_word(&tasks[0], "writer", &tasks, &states), None);
         let pods = pods_in_flight(&tasks);
         assert_eq!(pods.len(), 1);
         assert_eq!(counts(&pods), (1, 2));

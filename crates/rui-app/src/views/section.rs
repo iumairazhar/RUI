@@ -54,7 +54,7 @@ impl Sec {
     /// Sub-tab names; a section with one page has none.
     pub fn tabs(self) -> &'static [&'static str] {
         match self {
-            Sec::Work => &["Threads", "Tasks", "Apps"],
+            Sec::Work => &["Board", "Apps"],
             Sec::Clients => &["Clients", "Pods"],
             Sec::Knowledge => &["Skills", "Playbook"],
             Sec::Cost => &["Cost", "Seats"],

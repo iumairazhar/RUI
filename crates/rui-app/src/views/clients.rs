@@ -1,24 +1,25 @@
 //! Clients page: one card per client.
 
-use super::activity::{Col, col_of};
+use super::status::{Word, word_of};
+use crate::api::OwnerState;
+use std::collections::HashMap;
 use super::card;
 use super::character::{CharState, character};
 use super::section::{Sec, section_top};
 use crate::store::StoreHandle;
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, App, Div, FontWeight, div, prelude::*, px};
-use rui_core::{Client, Task, TaskStatus};
+use rui_core::{Client, Task};
 
 /// Top-level tasks of a client.
 fn mine(client: i64, tasks: &[Task]) -> impl Iterator<Item = &Task> {
     tasks.iter().filter(move |t| t.client_id == client && t.parent_id.is_none())
 }
 
-/// Counts for the card: (in the loop, waiting, needs you).
-fn counts(client: i64, tasks: &[Task]) -> (usize, usize, usize) {
-    let in_col = |c: Col| mine(client, tasks).filter(|t| col_of(&t.status) == Some(c)).count();
-    let running = mine(client, tasks).filter(|t| t.status == TaskStatus::InProgress).count();
-    (running, in_col(Col::Standing), in_col(Col::Needs))
+/// Counts for the card: (working, waiting, needs you, stopped) of its top-level tasks.
+fn counts(client: i64, tasks: &[Task], states: &HashMap<i64, OwnerState>) -> [usize; 4] {
+    let n = |w: Word| mine(client, tasks).filter(|t| word_of(states, t.id) == w).count();
+    [n(Word::Working), n(Word::Waiting), n(Word::NeedsYou), n(Word::Stopped)]
 }
 
 /// A count as text, with a dash for zero.
@@ -52,21 +53,16 @@ fn kv(label: &str, value: String, th: &Theme) -> AnyElement {
 }
 
 /// The four stat rows of a client card.
-fn stats(running: usize, waiting: usize, needs: usize, th: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.))
-        .child(kv("In the loop", running.to_string(), th))
-        .child(kv("Waiting", waiting.to_string(), th))
-        .child(kv("Spend", "—".to_string(), th))
-        .child(kv("Needs you", dash_zero(needs), th))
+fn stats(c: [usize; 4], th: &Theme) -> Div {
+    let rows = [("Working", c[0]), ("Waiting", c[1]), ("Needs you", c[2]), ("Stopped", c[3])];
+    let kvs = rows.map(|(label, n)| kv(label, dash_zero(n), th));
+    div().flex().flex_col().gap(px(4.)).children(kvs)
 }
 
-fn client_card(c: &Client, tasks: &[Task], cx: &App) -> AnyElement {
+fn client_card(c: &Client, tasks: &[Task], states: &HashMap<i64, OwnerState>, cx: &App) -> AnyElement {
     let th = theme(cx);
-    let (running, waiting, needs) = counts(c.id, tasks);
-    let state = match (running, needs > 0) {
+    let n = counts(c.id, tasks, states);
+    let state = match (n[0], n[2] > 0) {
         (0, true) => CharState::Blocked,
         (0, false) => CharState::Standing,
         _ => CharState::Doing,
@@ -75,7 +71,7 @@ fn client_card(c: &Client, tasks: &[Task], cx: &App) -> AnyElement {
     let name = div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(c.name.clone());
     let head = div().flex().items_center().gap(px(10.)).child(face).child(name);
     let foot = div().truncate().text_size(px(11.)).text_color(th.muted).child(since(&c.created_at));
-    let body = div().flex().flex_col().gap(px(12.)).child(head).child(stats(running, waiting, needs, th)).child(foot);
+    let body = div().flex().flex_col().gap(px(12.)).child(head).child(stats(n, th)).child(foot);
     let card = card(cx).id(("client-card", c.id as usize)).w(px(280.)).p(px(16.));
     card.child(body).into_any_element()
 }
@@ -89,7 +85,7 @@ pub fn folder_name(path: &str) -> Option<String> {
 /// The Clients tab of the Clients section; `add` is the "+ Add client" button.
 pub fn page(add: AnyElement, cx: &App) -> AnyElement {
     let store = cx.global::<StoreHandle>().0.read(cx);
-    let cards: Vec<AnyElement> = store.clients.iter().map(|c| client_card(c, &store.tasks, cx)).collect();
+    let cards: Vec<AnyElement> = store.clients.iter().map(|c| client_card(c, &store.tasks, &store.states, cx)).collect();
     let grid = div().id("clients-grid").flex().flex_wrap().gap(px(12.)).pb(px(28.)).children(cards);
     let scroll = div().id("clients-scroll").flex_1().min_h_0().overflow_y_scroll().child(grid);
     let lead = div().id("clients-lead").text_size(px(14.)).text_color(theme(cx).fg_2).child(lead_text(store.clients.len()));
@@ -133,10 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn counts_only_top_level_tasks() {
-        let tasks = vec![task(1, None, "in_progress"), task(2, Some(1), "in_progress"), task(3, None, "in_progress")];
-        assert_eq!(counts(1, &tasks).0, 2);
-        assert_eq!(counts(2, &tasks), (0, 0, 0));
+    fn counts_only_top_level_tasks_by_word() {
+        let tasks = vec![task(1, None, "in_progress"), task(2, Some(1), "in_progress"), task(3, None, "in_progress"), task(4, None, "open")];
+        let state = |id: i64, word: &str| (id, OwnerState { task_id: id, word: word.into(), reason: String::new(), since: String::new() });
+        let states: HashMap<i64, OwnerState> = [state(1, "Working"), state(2, "Working"), state(3, "Stopped")].into();
+        assert_eq!(counts(1, &tasks, &states), [1, 1, 0, 1]);
+        assert_eq!(counts(2, &tasks, &states), [0, 0, 0, 0]);
         assert_eq!(dash_zero(0), "—");
         assert_eq!(dash_zero(2), "2");
     }

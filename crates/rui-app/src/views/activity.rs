@@ -1,4 +1,4 @@
-//! Threads: four live columns of agent threads plus a detail drawer.
+//! Threads: five live columns of agent threads plus a detail drawer.
 
 mod team_view;
 mod teams;
@@ -9,10 +9,12 @@ use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touch
 use super::character::{char_state, character};
 use super::motion::{self, delayed, ease, spring};
 use super::roster::{Dot, Loops, member_name, pod_line, role_code};
-use team_view::{Phase, stopped_ids};
+use team_view::Phase;
+use timeline::ROWS;
 use teams::can_stop;
 use super::section::{Sec, section_top};
-use super::{chip, markdown, primary_button, role_chip, tag, task_status};
+use super::status::{self, Word, word_of};
+use super::{chip, markdown, primary_button, role_chip, tag};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
 use crate::store::{self, Store};
@@ -141,44 +143,6 @@ pub fn summarize(e: &Event) -> (String, bool) {
 }
 
 
-/// Board column a thread belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Col {
-    Needs,
-    Standing,
-    Doing,
-    Landed,
-}
-
-/// Column for a task status; split tasks are not threads.
-pub fn col_of(s: &TaskStatus) -> Option<Col> {
-    match s {
-        TaskStatus::WaitingAnswer | TaskStatus::Stuck => Some(Col::Needs),
-        TaskStatus::New | TaskStatus::Open => Some(Col::Standing),
-        TaskStatus::Clarifying | TaskStatus::InProgress => Some(Col::Doing),
-        TaskStatus::Done => Some(Col::Landed),
-        TaskStatus::Split => None,
-    }
-}
-
-/// State word for a task; a member waiting on an answer only "Needs you" when the owner must answer.
-fn state_word(s: &TaskStatus, owner_asked: bool) -> &'static str {
-    match s {
-        TaskStatus::Clarifying => "Thinking",
-        TaskStatus::InProgress => "In the loop",
-        TaskStatus::New | TaskStatus::Open => "Waiting",
-        TaskStatus::WaitingAnswer if !owner_asked => "Waiting",
-        TaskStatus::WaitingAnswer | TaskStatus::Stuck => "Needs you",
-        TaskStatus::Done => "Landed",
-        TaskStatus::Split => "Split",
-    }
-}
-
-/// State word for a thread: one the owner stopped says so, instead of "Needs you".
-fn thread_word(t: &Thread) -> &'static str {
-    if t.stopped { "Stopped" } else { state_word(&t.task.status, t.owner_asked) }
-}
-
 fn role_name(r: &Role) -> &'static str {
     match r {
         Role::Lead => "Lead",
@@ -238,38 +202,33 @@ struct Thread {
     code: String,
     /// Pod line such as "Lead, Pod: BE FE", set on a lead parent.
     pod_line: Option<String>,
-    /// An owner-level question is open for this task.
-    owner_asked: bool,
-    /// Stuck because it was stopped, so it is not waiting on the owner.
-    stopped: bool,
+    /// The task's status word, from the daemon.
+    word: Word,
+    /// The daemon's one-line reason for the word.
+    reason: String,
 }
 
-fn threads_of(s: &Store, stopped: &HashSet<i64>) -> Vec<Thread> {
+fn threads_of(s: &Store) -> Vec<Thread> {
     let open_q = |id: i64| {
         let q = s.questions.iter().find(|q| q.task_id == id && q.status == QuestionStatus::Open);
-        q.map(|q| (q.id, q.text.clone(), q.level == "owner"))
+        q.map(|q| (q.id, q.text.clone()))
     };
-    s.tasks.iter().filter(|t| col_of(&t.status).is_some()).map(|t| thread_of(s, t, open_q(t.id), stopped)).collect()
+    s.tasks.iter().map(|t| thread_of(s, t, open_q(t.id))).collect()
 }
 
-fn thread_of(s: &Store, t: &Task, question: Option<(i64, String, bool)>, stopped: &HashSet<i64>) -> Thread {
+fn thread_of(s: &Store, t: &Task, question: Option<(i64, String)>) -> Thread {
     let agent = t.agent.as_deref().unwrap_or("builder");
     Thread {
         task: t.clone(),
         client: s.clients.iter().find(|c| c.id == t.client_id).map_or(String::new(), |c| c.name.clone()),
         model: s.runs.get(&t.id).and_then(|r| r.model.clone()),
-        owner_asked: question.as_ref().is_some_and(|q| q.2),
-        question: question.map(|q| (q.0, q.1)),
+        question,
         name: member_name(t, &s.tasks, &s.roles).unwrap_or_else(|| label(t)),
         code: role_code(&s.roles, agent),
         pod_line: pod_line(t, &s.roles),
-        stopped: t.status == TaskStatus::Stuck && stopped.contains(&t.id),
+        word: word_of(&s.states, t.id),
+        reason: s.states.get(&t.id).map_or(String::new(), |o| o.reason.clone()),
     }
-}
-
-/// Band a thread is counted in: owner-stopped ones stand by.
-fn thread_col(t: &Thread) -> Option<Col> {
-    if t.stopped { Some(Col::Standing) } else { col_of(&t.task.status) }
 }
 
 /// Tab of the drawer.
@@ -314,15 +273,13 @@ pub struct ThreadsView {
     /// Drawer is playing its slide-out before it closes.
     closing: bool,
     /// Last column of each thread, to spot band changes.
-    bands: HashMap<i64, Col>,
+    bands: HashMap<i64, Word>,
     /// Threads that just changed column: the column they left and when.
-    moves: HashMap<i64, (Col, Instant)>,
+    moves: HashMap<i64, (Word, Instant)>,
     /// Threads already shown since the view last appeared; new ones rise unstaggered.
     seen: HashSet<i64>,
-    /// Landed band shows every card, not just the newest few.
-    show_landed: bool,
-    /// The Stopped group of the Standing band is open.
-    show_stopped: bool,
+    /// Done band shows every card, not just the newest few.
+    show_done: bool,
     /// Tasks being stopped and when, so their rows can play the leave animation.
     stopping: HashMap<i64, Instant>,
     /// The "Stop every running team?" confirm is open.
@@ -338,7 +295,7 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen, show_landed: false, show_stopped: false, stopping: HashMap::new(), confirm_all: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, closing: false, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -418,7 +375,7 @@ impl ThreadsView {
     fn track_moves(&mut self, threads: &[Thread]) {
         let now = Instant::now();
         for t in threads {
-            let Some(col) = thread_col(t) else { continue };
+            let col = t.word;
             match self.bands.insert(t.task.id, col) {
                 Some(prev) if prev != col => _ = self.moves.insert(t.task.id, (prev, now)),
                 _ => {}
@@ -469,15 +426,15 @@ impl ThreadsView {
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
-    /// One agent card: avatar, "Agent · task", "Client · state · elapsed", and the seat mark when running.
+    /// One agent card: avatar, "Agent · task", "Client · reason · elapsed", and the seat mark when running.
     fn row(&self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let id = t.task.id;
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
         let live = self.store.read(cx).live.task(id).cloned();
-        let state = char_state(&t.task.status, live.as_ref());
-        let word = live.as_ref().map_or_else(|| thread_word(t).to_string(), live_sub);
-        let parts = [t.client.clone(), word, elapsed(&t.task.updated_at, now)];
+        let state = if live.is_some() { char_state(&t.task.status, live.as_ref()) } else { status::char_state(t.word) };
+        let reason = live.as_ref().map_or_else(|| t.reason.clone(), live_sub);
+        let parts = [t.client.clone(), reason, elapsed(&t.task.updated_at, now)];
         let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
         let title = format!("{} \u{b7} {}", t.name, t.task.title);
         let name = div().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
@@ -531,7 +488,7 @@ impl ThreadsView {
     }
 
     /// Ghost rows sliding out of the column a thread just left.
-    fn leaving(&self, col: Col, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn leaving(&self, col: Word, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let left_here = |t: &&Thread| match self.moves.get(&t.task.id) {
             Some((from, at)) => !self.stopping.contains_key(&t.task.id) && *from == col && at.elapsed() < Duration::from_millis(LEAVE_MS),
             None => false,
@@ -802,8 +759,8 @@ pub(super) fn muted_status(th: &Theme) -> Status {
 }
 
 fn composer_hint(t: &Thread, th: &Theme) -> Div {
-    let tail = match col_of(&t.task.status) {
-        Some(Col::Doing) => "It folds this into the work it is already doing.",
+    let tail = match t.word {
+        Word::Working => "It folds this into the work it is already doing.",
         _ => "It is holding its context, so it picks up where it stopped.",
     };
     let text = format!("Goes straight to {}. {tail}", t.name);
@@ -828,8 +785,7 @@ fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
 }
 
 fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyElement, face: AnyElement) -> AnyElement {
-    let shown = if t.stopped { TaskStatus::Open } else { t.task.status };
-    let st = task_status(&shown, th);
+    let st = status::style(t.word, th);
     let color = th.client_color(t.task.client_id);
     let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
     let top = div()
@@ -842,7 +798,7 @@ fn drawer_head(t: &Thread, now: i64, th: &Theme, close: AnyElement, tabs: AnyEle
     let title = div().flex().items_center().gap(px(10.)).child(role_chip(&t.code, 26., color)).child(name);
     let model = t.model.clone().map(|m| mono(11., th.muted, m));
     let time = mono(10.5, th.muted, elapsed(&t.task.updated_at, now));
-    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, thread_word(t))).children(model).child(time);
+    let meta = div().flex().items_center().gap(px(8.)).child(tag(st, t.word.label())).children(model).child(time);
     let sub = div().text_size(px(12.5)).text_color(th.muted).child(t.task.title.clone());
     let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
     let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(meta).child(sub).children(pod);
@@ -1215,42 +1171,32 @@ fn seat_mark(status: &TaskStatus) -> Option<Div> {
     running.then(|| div().flex().flex_none().items_center().child(spark))
 }
 
-/// Counts for the lead line: agents holding a seat and threads waiting on the owner.
+/// Counts for the lead line: agents holding a seat and threads that need the owner.
 fn lead_counts(s: &Store, threads: &[Thread]) -> (usize, usize) {
-    let doing: Vec<i64> = threads.iter().filter(|t| thread_col(t) == Some(Col::Doing)).map(|t| t.task.id).collect();
-    let needs = threads.iter().filter(|t| thread_col(t) == Some(Col::Needs)).count();
+    let doing: Vec<i64> = threads.iter().filter(|t| t.word == Word::Working).map(|t| t.task.id).collect();
+    let needs = threads.iter().filter(|t| t.word == Word::NeedsYou).count();
     (busy_count(&doing, &s.live), needs)
 }
 
-/// "**4** agents are holding a seat and working. **1 is waiting on you.**"
-fn lead_line(running: usize, needs: usize, th: &Theme) -> AnyElement {
+/// "**4** working \u{b7} **1** need you"
+fn lead_line(working: usize, needs: usize, th: &Theme) -> AnyElement {
     let bold = |n: usize| div().text_size(px(19.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(n.to_string());
-    let noun = if running == 1 { "agent is" } else { "agents are" };
-    let tail = match needs {
-        0 => div().child("Nothing is waiting on you."),
-        n => {
-            let verb = if n == 1 { "is" } else { "are" };
-            let text = format!("{n} {verb} waiting on you");
-            let jump = div().font_weight(FontWeight::SEMIBOLD).text_color(th.block.fg).border_b_1().border_color(th.block.rim);
-            div().flex().child(jump.child(text)).child(".")
-        }
-    };
+    let verb = if needs == 1 { "needs you" } else { "need you" };
     let lead = div().id("threads-lead").flex().items_baseline().gap(px(5.)).text_size(px(15.)).text_color(th.fg_2);
-    lead.child(bold(running)).child(format!("{noun} holding a seat and working.")).child(tail).into_any_element()
+    let need = div().flex().items_baseline().gap(px(5.)).child(bold(needs)).child(verb);
+    lead.child(bold(working)).child("working \u{b7}").child(need).into_any_element()
 }
 
 impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let stopped = stopped_ids(self.store.read(cx));
-        let threads = threads_of(self.store.read(cx), &stopped);
+        let threads = threads_of(self.store.read(cx));
         self.track_moves(&threads);
         self.prune_stopping(cx);
         let now = now_secs();
         let (running, needs) = lead_counts(self.store.read(cx), &threads);
         let bands = self.bands(&threads);
-        let cols = [Col::Needs, Col::Standing, Col::Doing, Col::Landed];
-        let columns: Vec<AnyElement> = cols.map(|c| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
+        let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
         self.seen.extend(threads.iter().map(|t| t.task.id));
         let chart = self.chart(&threads, now, &th, cx);
         let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
@@ -1381,29 +1327,6 @@ mod tests {
         assert_eq!(sum("tool_call", json!({"tool":"t","args":{}})).0, "tool: t");
         assert_eq!(sum("other", json!(null)), ("other".into(), false));
         assert_eq!(sum("weird", json!({})).0, "weird");
-    }
-
-    #[test]
-    fn col_of_maps_statuses() {
-        assert_eq!(col_of(&TaskStatus::WaitingAnswer), Some(Col::Needs));
-        assert_eq!(col_of(&TaskStatus::Stuck), Some(Col::Needs));
-        assert_eq!(col_of(&TaskStatus::New), Some(Col::Standing));
-        assert_eq!(col_of(&TaskStatus::Open), Some(Col::Standing));
-        assert_eq!(col_of(&TaskStatus::Clarifying), Some(Col::Doing));
-        assert_eq!(col_of(&TaskStatus::InProgress), Some(Col::Doing));
-        assert_eq!(col_of(&TaskStatus::Done), Some(Col::Landed));
-        assert_eq!(col_of(&TaskStatus::Split), None);
-    }
-
-    #[test]
-    fn state_words() {
-        assert_eq!(state_word(&TaskStatus::WaitingAnswer, true), "Needs you");
-        assert_eq!(state_word(&TaskStatus::WaitingAnswer, false), "Waiting");
-        assert_eq!(state_word(&TaskStatus::Stuck, false), "Needs you");
-        assert_eq!(state_word(&TaskStatus::Open, true), "Waiting");
-        assert_eq!(state_word(&TaskStatus::Clarifying, false), "Thinking");
-        assert_eq!(state_word(&TaskStatus::InProgress, false), "In the loop");
-        assert_eq!(state_word(&TaskStatus::Done, false), "Landed");
     }
 
     #[test]

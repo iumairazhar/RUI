@@ -1,16 +1,16 @@
 //! Threads board pieces: flat bands of agent cards, Stop buttons, the Stop all confirm and the chart data.
 
-use super::teams::{LANDED_CAP, can_stop, cap_items, stop_targets};
+use super::teams::{DONE_CAP, can_stop, cap_items, stop_targets};
 use super::timeline::{Chart, Line, ROWS, clip, trajectory, window_start, worth_drawing};
-use super::{Col, Thread, ThreadsView, parse_secs, thread_col};
-use crate::store::Store;
+use super::{Thread, ThreadsView, parse_secs};
 use crate::theme::Theme;
 use crate::views::library::{confirm_modal, danger_button};
+use crate::store::Store;
 use crate::views::status::Word;
 use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, div, prelude::*, px};
 use rui_core::{Task, TaskStatus};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Where a task's row is in its stop animation.
@@ -21,17 +21,13 @@ pub(super) enum Phase {
     Gone,
 }
 
-/// What one band shows: its cards, and (Standing only) the stopped ones kept apart.
-#[derive(Default)]
-pub(super) struct Band {
-    items: Vec<Thread>,
-    stopped: Vec<Thread>,
-}
-
-/// Ids of tasks whose status word is Stopped.
-pub(super) fn stopped_ids(s: &Store) -> HashSet<i64> {
-    let stopped = s.states.values().filter(|o| Word::from_str(&o.word) == Word::Stopped);
-    stopped.map(|o| o.task_id).collect()
+/// "Stops N teams: A, B. They keep what they've done so far."
+fn stop_all_body(s: &Store) -> String {
+    // Same rule as the daemon's /stop-all, so the list matches exactly what gets stopped.
+    let live = |t: &&Task| !matches!(t.status, TaskStatus::Done | TaskStatus::Stuck);
+    let titles: Vec<&str> = s.tasks.iter().filter(|t| t.parent_id.is_none()).filter(live).map(|t| t.title.as_str()).collect();
+    let noun = if titles.len() == 1 { "team" } else { "teams" };
+    format!("Stops {} {noun}: {}. They keep what they've done so far.", titles.len(), titles.join(", "))
 }
 
 fn find(tasks: &[Task], id: i64) -> Option<&Task> {
@@ -39,15 +35,16 @@ fn find(tasks: &[Task], id: i64) -> Option<&Task> {
 }
 
 impl ThreadsView {
-    /// Every band's cards, one per agent; Landed is newest first.
-    pub(super) fn bands(&self, threads: &[Thread]) -> HashMap<Col, Band> {
-        let mut out: HashMap<Col, Band> = ROWS.iter().map(|r| (r.0, Band::default())).collect();
+    /// Every band's cards, one per agent; Done is newest first.
+    pub(super) fn bands(&self, threads: &[Thread]) -> HashMap<Word, Vec<Thread>> {
+        let mut out: HashMap<Word, Vec<Thread>> = ROWS.iter().map(|r| (r.0, Vec::new())).collect();
         for t in threads {
-            let Some(band) = thread_col(t).and_then(|c| out.get_mut(&c)) else { continue };
-            if t.stopped { band.stopped.push(t.clone()) } else { band.items.push(t.clone()) }
+            if let Some(band) = out.get_mut(&t.word) {
+                band.push(t.clone());
+            }
         }
-        if let Some(landed) = out.get_mut(&Col::Landed) {
-            landed.items.sort_by_key(|t| Reverse(parse_secs(&t.task.updated_at).unwrap_or(0)));
+        if let Some(done) = out.get_mut(&Word::Done) {
+            done.sort_by_key(|t| Reverse(parse_secs(&t.task.updated_at).unwrap_or(0)));
         }
         out
     }
@@ -57,14 +54,13 @@ impl ThreadsView {
         let s = self.store.read(cx);
         let from = window_start(now);
         let line = |t: &Thread| {
-            let col = thread_col(t)?;
-            let pts = clip(trajectory(&t.task, &s.events, col, now), from);
-            if !worth_drawing(&pts, from, col) {
+            let pts = clip(trajectory(&t.task, &s.events, t.word, now), from);
+            if !worth_drawing(&pts, from, t.word) {
                 return None;
             }
             Some(Line { pts, color: th.client_color(t.task.client_id) })
         };
-        let counts = ROWS.map(|(c, _)| threads.iter().filter(|t| thread_col(t) == Some(c)).count());
+        let counts = ROWS.map(|(c, _)| threads.iter().filter(|t| t.word == c).count());
         let clients = s.clients.iter().map(|c| (c.name.clone(), th.client_color(c.id))).collect();
         Chart { lines: threads.iter().filter_map(line).collect(), counts, now, clients }
     }
@@ -117,9 +113,11 @@ impl ThreadsView {
     }
 
     pub(super) fn confirm_view(&self, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let body = "Stop every running team? They keep what they've done so far.";
-        let modal = confirm_modal("Stop all teams?", body, "Stop all", true, Self::cancel_stop_all, Self::accept_stop_all, th, cx);
-        self.confirm_all.then_some(modal)
+        if !self.confirm_all {
+            return None;
+        }
+        let body = stop_all_body(self.store.read(cx));
+        Some(confirm_modal("Stop all teams?", &body, "Stop all", true, Self::cancel_stop_all, Self::accept_stop_all, th, cx))
     }
 
     /// Danger "Stop all" button for the page head, only while something can be stopped.
@@ -166,50 +164,29 @@ impl ThreadsView {
             .into_any_element()
     }
 
-    /// Landed shows the newest cards with a "Show more" toggle.
-    fn landed_rows(&self, items: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// Done shows the newest cards with a "Show N done" toggle.
+    fn done_rows(&self, items: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let refs: Vec<&Thread> = items.iter().collect();
-        let (shown, hidden) = cap_items(refs, LANDED_CAP, self.show_landed);
+        let (shown, hidden) = cap_items(refs, DONE_CAP, self.show_done);
         let mut rows: Vec<AnyElement> = shown.iter().enumerate().map(|(i, t)| self.moving_row(t, i, now, th, cx)).collect();
-        let text = if self.show_landed { "Show fewer".to_string() } else { format!("Show {hidden} more") };
-        if hidden > 0 || (self.show_landed && items.len() > LANDED_CAP) {
-            rows.push(self.toggle_link("landed-toggle", text, th, cx, |v| v.show_landed = !v.show_landed));
+        let text = if self.show_done { "Show fewer".to_string() } else { format!("Show {hidden} done") };
+        if hidden > 0 || (self.show_done && items.len() > DONE_CAP) {
+            rows.push(self.toggle_link("done-toggle", text, th, cx, |v| v.show_done = !v.show_done));
         }
         rows
     }
 
-    /// The muted Stopped group at the bottom of Standing by, folded by default.
-    fn stopped_rows(&self, stopped: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if stopped.is_empty() {
-            return vec![];
-        }
-        let text = if self.show_stopped { "Hide stopped".to_string() } else { format!("Show {} stopped", stopped.len()) };
-        let mut rows = vec![self.toggle_link("stopped-toggle", text, th, cx, |v| v.show_stopped = !v.show_stopped)];
-        if self.show_stopped {
-            let list = stopped.iter().enumerate().map(|(i, t)| self.moving_row(t, i, now, th, cx));
-            rows.push(div().flex().flex_col().opacity(0.6).children(list).into_any_element());
-        }
-        rows
-    }
-
-    pub(super) fn column(&self, col: Col, band: &Band, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (name, empty) = match col {
-            Col::Needs => ("Needs you", "Empty"),
-            Col::Standing => ("Standing by", "Empty"),
-            Col::Doing => ("Doing", "Empty"),
-            Col::Landed => ("Landed", "Empty"),
-        };
+    pub(super) fn column(&self, col: Word, items: &[Thread], all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut rows: Vec<AnyElement> = match col {
-            Col::Landed => self.landed_rows(&band.items, now, th, cx),
-            _ => band.items.iter().enumerate().map(|(i, t)| self.moving_row(t, i, now, th, cx)).collect(),
+            Word::Done => self.done_rows(items, now, th, cx),
+            _ => items.iter().enumerate().map(|(i, t)| self.moving_row(t, i, now, th, cx)).collect(),
         };
         let ghosts = self.leaving(col, all, now, th, cx);
-        let stopped = if col == Col::Standing { self.stopped_rows(&band.stopped, now, th, cx) } else { vec![] };
-        let blank = rows.is_empty() && ghosts.is_empty() && stopped.is_empty();
-        let none = blank.then(|| div().px(px(8.)).py(px(16.)).text_size(px(11.5)).text_color(th.muted).child(empty));
+        let blank = rows.is_empty() && ghosts.is_empty();
+        let none = blank.then(|| div().px(px(8.)).py(px(16.)).text_size(px(11.5)).text_color(th.muted).child("Empty"));
         rows.extend(ghosts);
         let list = div().id(("threads-col-list", col as usize)).flex().flex_col().p(px(8.));
-        let list = list.children(rows).children(none).children(stopped);
+        let list = list.children(rows).children(none);
         div()
             .id(("threads-col", col as usize))
             .flex()
@@ -221,7 +198,7 @@ impl ThreadsView {
             .bg(th.well)
             .border_1()
             .border_color(th.hairline)
-            .child(super::column_head(name, band.items.len() + band.stopped.len(), th))
+            .child(super::column_head(col.label(), items.len(), th))
             .child(list)
             .into_any_element()
     }

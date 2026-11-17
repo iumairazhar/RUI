@@ -1,10 +1,12 @@
 //! The five owner-facing status words and how they look.
 
 use super::character::CharState;
+use crate::api::OwnerState;
 use crate::theme::{Status, Theme};
+use std::collections::HashMap;
 
 /// One of the five status words shown everywhere.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Word {
     NeedsYou,
     Working,
@@ -25,8 +27,7 @@ impl Word {
         }
     }
 
-    /// The word as shown to the owner. Used by the Work board in the next task.
-    #[allow(dead_code)]
+    /// The word as shown to the owner.
     pub fn label(self) -> &'static str {
         match self {
             Word::NeedsYou => "Needs you",
@@ -36,6 +37,11 @@ impl Word {
             Word::Done => "Done",
         }
     }
+}
+
+/// A task's status word from the daemon's states; a task with no state yet reads as Waiting.
+pub fn word_of(states: &HashMap<i64, OwnerState>, id: i64) -> Word {
+    states.get(&id).map_or(Word::Waiting, |o| Word::from_str(&o.word))
 }
 
 /// Colour family for a status word. Stopped is muted like Standing (the wait family).
