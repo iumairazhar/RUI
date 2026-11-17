@@ -79,12 +79,13 @@ impl ThreadsView {
         row.child(face).child(info).child(actions).into_any_element()
     }
 
-    /// "Abandon" for a whole task that isn't done; a second click drops it for good.
+    /// "Abandon" for a task that isn't done; a second click drops the whole task (its top-level
+    /// task and every teammate), even from a teammate's page.
     fn abandon_control(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if t.task.parent_id.is_some() || t.word == Word::Done {
+        if t.word == Word::Done {
             return None;
         }
-        let id = t.task.id;
+        let id = t.task.parent_id.unwrap_or(t.task.id);
         if !self.abandon_armed {
             let arm = chip("task-abandon", "Abandon", cx).on_click(cx.listener(|this, _, _, cx| this.arm_abandon(cx)));
             return Some(arm.into_any_element());
