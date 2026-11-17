@@ -1,5 +1,5 @@
--- Apply with:
---   sqlite3 "$HOME/Library/Application Support/RUI/rui.db" < db/schema.sql
+-- Reference only: the full current schema. The daemon builds databases from db/migrations/;
+-- a test keeps this file and the migrations in sync.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS clients (

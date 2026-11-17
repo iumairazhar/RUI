@@ -1,8 +1,4 @@
 -- Migrates an existing v1 database to v2 (multiple chats).
--- Apply with:
---   sqlite3 "$HOME/Library/Application Support/RUI/rui.db" < db/migrations/002_chats.sql
-PRAGMA foreign_keys = OFF;
-BEGIN;
 
 CREATE TABLE chats (
   id INTEGER PRIMARY KEY,
@@ -22,5 +18,3 @@ ALTER TABLE events ADD COLUMN chat_id INTEGER REFERENCES chats(id);
 CREATE INDEX idx_events_chat_id ON events(chat_id);
 UPDATE events SET chat_id = 1 WHERE agent = 'rui';
 
-PRAGMA user_version = 2;
-COMMIT;

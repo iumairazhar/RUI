@@ -1,13 +1,14 @@
-//! SQLite access layer. Plain SQL, one query per function. Never creates tables.
+//! SQLite access layer. Plain SQL, one query per function. Schema comes from db/migrations.
 
 use anyhow::{Result, anyhow, bail};
 use rui_core::{
-    Chat, ChatAsk, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, Rung, SCHEMA_VERSION,
-    SourceKind, Task, TaskStatus,
+    Chat, ChatAsk, ChatMessage, ChatRole, Client, Event, Question, QuestionStatus, Role, Rung, SourceKind, Task, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
-use std::path::Path;
+use rusqlite_migration::{M, Migrations};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const TASK_COLS: &str = "id, client_id, parent_id, title, body, status, done_command, max_loops, \
@@ -216,26 +217,62 @@ fn fetch_client(conn: &Connection, id: i64) -> Result<Option<Client>> {
     Ok(conn.query_row(&sql, [id], client_from_row).optional()?)
 }
 
+/// Migration steps in order. Step N leaves `user_version` at N.
+const MIGRATION_SQL: [&str; 5] = [
+    include_str!("../../../db/migrations/001_base.sql"),
+    include_str!("../../../db/migrations/002_chats.sql"),
+    include_str!("../../../db/migrations/003_skills.sql"),
+    include_str!("../../../db/migrations/004_teams.sql"),
+    include_str!("../../../db/migrations/005_chat_asks.sql"),
+];
+
+pub fn migrations() -> Migrations<'static> {
+    Migrations::new(MIGRATION_SQL.iter().map(|sql| M::up(sql)).collect())
+}
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+/// Write a full copy of the DB next to itself before it is migrated.
+/// `VACUUM INTO` includes anything still in the WAL file, unlike a plain file copy.
+fn backup_before_migrating(conn: &Connection, path: &Path, from: i64, to: i64) -> Result<()> {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".bak-v{from}-{secs}"));
+    let backup = PathBuf::from(name);
+    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy()])?;
+    eprintln!("migrating database v{from} -> v{to}; backup at {}", backup.display());
+    Ok(())
+}
+
 impl Db {
-    /// Open an existing, correctly versioned database. Never creates tables.
+    /// Open the database, creating it if missing and applying pending migrations.
+    /// An existing file that needs migrating is backed up first.
     pub fn open(path: &Path) -> Result<Db> {
-        if !path.exists() {
-            bail!("database not found at {}; apply db/schema.sql with sqlite3", path.display());
+        let existed = path.exists();
+        let mut conn = Connection::open(path)?;
+        let (version, latest) = (user_version(&conn)?, MIGRATION_SQL.len() as i64);
+        if version > latest {
+            bail!("database is newer than this daemon (schema v{version}, daemon knows v{latest})");
         }
-        let conn = Connection::open(path)?;
+        if existed && version < latest {
+            backup_before_migrating(&conn, path, version, latest)?;
+        }
+        // SQLite refuses ALTER TABLE ADD COLUMN ... REFERENCES on non-empty tables while foreign keys are on.
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        migrations().to_latest(&mut conn)?;
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
-            bail!("schema version {version}, expected {SCHEMA_VERSION}; apply db/schema.sql");
-        }
         Ok(Db { conn: Mutex::new(conn) })
     }
 
-    /// In-memory database with the schema applied. Tests only.
+    /// In-memory database with the migrations applied. Tests only.
     #[cfg(test)]
     pub fn open_test() -> Db {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../../db/schema.sql")).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations().to_latest(&mut conn).unwrap();
+        // Migration 002 seeds chat 1 for old databases; tests start with no chats.
+        conn.execute("DELETE FROM chats", []).unwrap();
         Db { conn: Mutex::new(conn) }
     }
 
@@ -726,6 +763,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rui_core::SCHEMA_VERSION;
 
     fn new_task(client_id: i64, title: &str) -> NewTask {
         NewTask {
@@ -890,29 +928,105 @@ mod tests {
         PRAGMA user_version = 1;";
 
     #[test]
-    fn migration_005_adds_chat_asks_to_a_v4_db() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE chats (id INTEGER PRIMARY KEY, title TEXT); PRAGMA user_version = 4;").unwrap();
-        conn.execute_batch(include_str!("../../../db/migrations/005_chat_asks.sql")).unwrap();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        conn.execute("INSERT INTO chats (id, title) VALUES (1, 't')", []).unwrap();
-        conn.execute("INSERT INTO chat_asks (chat_id, text) VALUES (1, 'q')", []).unwrap();
-        assert!(conn.execute("INSERT INTO chat_asks (chat_id, text, status) VALUES (1, 'q', 'bogus')", []).is_err());
+    fn chat_asks_status_is_checked() {
+        let db = Db::open_test();
+        let conn = db.conn().unwrap();
+        conn.execute("INSERT INTO chats (id, title) VALUES (2, 't')", []).unwrap();
+        conn.execute("INSERT INTO chat_asks (chat_id, text) VALUES (2, 'q')", []).unwrap();
+        assert!(conn.execute("INSERT INTO chat_asks (chat_id, text, status) VALUES (2, 'q', 'bogus')", []).is_err());
     }
 
     #[test]
     fn migration_002_upgrades_v1_db() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(V1_SCHEMA).unwrap();
-        conn.execute_batch(include_str!("../../../db/migrations/002_chats.sql")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute_batch(MIGRATION_SQL[1]).unwrap();
         let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
-        assert_eq!(one("PRAGMA user_version"), 2);
         assert_eq!(one("SELECT chat_id FROM chat_messages"), 1);
         assert_eq!(one("SELECT chat_id FROM agent_sessions WHERE role = 'rui'"), 1);
         assert_eq!(one("SELECT chat_id FROM events WHERE agent = 'rui'"), 1);
         assert_eq!(one("SELECT COUNT(*) FROM events WHERE chat_id IS NULL"), 1);
         assert_eq!(one("SELECT COUNT(*) FROM chats WHERE id = 1 AND title = 'Rui'"), 1);
+    }
+
+    #[test]
+    fn migrations_are_valid_and_match_schema_version() {
+        migrations().validate().unwrap();
+        assert_eq!(MIGRATION_SQL.len() as i64, SCHEMA_VERSION);
+    }
+
+    /// Table and index definitions with comments dropped and words sorted, so column
+    /// order (ALTER TABLE appends columns) and formatting do not count as drift.
+    fn schema_of(conn: &Connection) -> Vec<(String, String, Vec<String>)> {
+        let mut stmt = conn.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name").unwrap();
+        let rows = stmt.query_map([], |r| {
+            let sql: Option<String> = r.get(2)?;
+            let code: Vec<&str> = sql.as_deref().unwrap_or("").lines().map(|l| l.split("--").next().unwrap()).collect();
+            let flat = code.join(" ").replace(['(', ')', ','], " ");
+            let mut words: Vec<String> = flat.split_whitespace().map(String::from).collect();
+            words.sort();
+            Ok((r.get(0)?, r.get(1)?, words))
+        });
+        rows.unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn migrations_match_schema_sql() {
+        let from_sql = Connection::open_in_memory().unwrap();
+        from_sql.execute_batch(include_str!("../../../db/schema.sql")).unwrap();
+        let mut from_migrations = Connection::open_in_memory().unwrap();
+        migrations().to_latest(&mut from_migrations).unwrap();
+        assert_eq!(schema_of(&from_sql), schema_of(&from_migrations));
+    }
+
+    fn version_of(path: &Path) -> i64 {
+        user_version(&Connection::open(path).unwrap()).unwrap()
+    }
+
+    fn backups_in(dir: &Path, prefix: &str) -> usize {
+        let names = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
+        names.filter(|n| n.contains(prefix)).count()
+    }
+
+    #[test]
+    fn open_creates_a_fresh_file_at_latest_without_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rui.db");
+        Db::open(&path).unwrap();
+        assert_eq!(version_of(&path), SCHEMA_VERSION);
+        assert_eq!(backups_in(dir.path(), ".bak-"), 0);
+    }
+
+    #[test]
+    fn open_migrates_an_old_file_and_backs_it_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rui.db");
+        let mut conn = Connection::open(&path).unwrap();
+        Migrations::new(MIGRATION_SQL[..3].iter().map(|sql| M::up(sql)).collect()).to_latest(&mut conn).unwrap();
+        drop(conn);
+        Db::open(&path).unwrap();
+        assert_eq!(version_of(&path), SCHEMA_VERSION);
+        assert_eq!(backups_in(dir.path(), "rui.db.bak-v3-"), 1);
+    }
+
+    #[test]
+    fn open_current_file_makes_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rui.db");
+        Db::open(&path).unwrap();
+        Db::open(&path).unwrap();
+        assert_eq!(backups_in(dir.path(), ".bak-"), 0);
+    }
+
+    #[test]
+    fn open_rejects_a_newer_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rui.db");
+        Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 99").unwrap();
+        let err = Db::open(&path).err().unwrap().to_string();
+        assert!(err.contains("newer than this daemon"));
+        assert_eq!(backups_in(dir.path(), ".bak-"), 0);
     }
 
     #[test]
@@ -958,21 +1072,5 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(db.get_session(Role::Rui, None).unwrap(), None);
-    }
-
-    #[test]
-    fn open_missing_path_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = Db::open(&dir.path().join("nope.db")).err().unwrap();
-        assert!(err.to_string().contains("database not found"));
-    }
-
-    #[test]
-    fn open_wrong_version_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.db");
-        Connection::open(&path).unwrap();
-        let err = Db::open(&path).err().unwrap();
-        assert!(err.to_string().contains("schema version 0"));
     }
 }
