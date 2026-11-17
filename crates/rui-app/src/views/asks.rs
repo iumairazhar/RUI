@@ -39,7 +39,8 @@ impl AskInputs {
         Some(text).filter(|t| !t.is_empty())
     }
 
-    fn get(&self, id: i64) -> Option<Entity<TextInput>> {
+    /// The input of an ask.
+    pub fn get(&self, id: i64) -> Option<Entity<TextInput>> {
         self.inputs.get(&id).cloned()
     }
 }
