@@ -40,6 +40,12 @@ fn system_prompt(data_dir: &Path) -> String {
     format!("{RUI_PROMPT}\n\n# Roles you can staff\n{}", roster::catalog(data_dir))
 }
 
+/// Tools Rui may use without asking: its MCP tools plus read-only built-ins (not Bash).
+fn allowed_tools() -> Vec<String> {
+    let extra = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"];
+    RUI_TOOLS.split(',').chain(extra).map(String::from).collect()
+}
+
 async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<()> {
     let (id, chat_id) = (msg.id, msg.chat_id);
     let run = AgentRun {
@@ -48,10 +54,12 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
         cwd: cfg.data_dir.clone(),
         prompt: msg.content,
         system_prompt: system_prompt(&cfg.data_dir),
-        allowed_tools: RUI_TOOLS.split(',').map(String::from).collect(),
-        // Rui only delegates: no shell, file or web tools, just its MCP tools.
-        builtin_tools: Some(String::new()),
+        allowed_tools: allowed_tools(),
+        // Rui reads and researches with real tools; risky Bash calls go through
+        // `mcp__rui__approve`, which holds them for the owner's OK.
+        builtin_tools: Some("Bash,Read,Glob,Grep,WebSearch,WebFetch".into()),
         permission_mode: None,
+        permission_prompt_tool: Some("mcp__rui__approve".into()),
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
         mcp_headers: vec![("X-Rui-Source-Ref".into(), format!("chat:{id}"))],
         resume: db.get_rui_session(chat_id)?,
@@ -83,6 +91,9 @@ mod tests {
             assert!(RUI_PROMPT.contains(t), "{t} missing from rui.md");
             assert!(RUI_TOOLS.contains(&format!("mcp__rui__{t}")), "{t} missing from RUI_TOOLS");
         }
+        assert!(!RUI_TOOLS.contains("approve"));
+        assert!(!allowed_tools().iter().any(|t| t == "Bash" || t.ends_with("approve")));
+        assert!(allowed_tools().iter().any(|t| t == "Read"));
         assert!(RUI_PROMPT.contains("duplicate"));
         assert!(RUI_PROMPT.contains("STOP"));
     }

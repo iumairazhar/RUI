@@ -151,7 +151,44 @@ async fn list_questions(
     Ok(Json(owner_only))
 }
 
-const CHAT_GREETING: &str = "What do you want set up?";
+/// Builds Rui's opening line for a new chat from the time of day and what is going on.
+pub fn greeting(hour: u32, in_loop: usize, needs_you: usize, open: usize) -> String {
+    let opener = match hour {
+        0..12 => "Good morning.",
+        12..18 => "Good afternoon.",
+        _ => "Good evening.",
+    };
+    let close = match needs_you {
+        0 => "What do you want to set up?",
+        _ => "Want to start with those, or set up something new?",
+    };
+    format!("{opener} {} {close}", state_line(in_loop, needs_you, open))
+}
+
+/// The middle sentence of the greeting: what needs the owner, runs, or is open.
+fn state_line(in_loop: usize, needs_you: usize, open: usize) -> String {
+    match (needs_you, in_loop, open) {
+        (1, _, _) => "1 thing waits for you in the Inbox.".into(),
+        (n, _, _) if n > 1 => format!("{n} things wait for you in the Inbox."),
+        (_, 1, _) => "1 thread is in the loop.".into(),
+        (_, n, _) if n > 1 => format!("{n} threads are in the loop."),
+        (_, _, 1) => "1 thread is open, none running.".into(),
+        (_, _, n) if n > 1 => format!("{n} threads are open, none running."),
+        _ => "All quiet.".into(),
+    }
+}
+
+/// Counts (in the loop, needs the owner, open) for the greeting.
+fn greeting_counts(db: &Db) -> anyhow::Result<(usize, usize, usize)> {
+    let tasks = db.list_tasks()?;
+    let top = || tasks.iter().filter(|t| t.parent_id.is_none());
+    let open = top().filter(|t| t.status != TaskStatus::Done).count();
+    let in_loop = top().filter(|t| t.status == TaskStatus::InProgress).count();
+    let questions = db.list_questions(Some(QuestionStatus::Open))?;
+    let owner_qs = questions.iter().filter(|q| q.level == "owner").count();
+    let needs_you = owner_qs + db.list_chat_asks(Some("open"))?.len();
+    Ok((in_loop, needs_you, open))
+}
 
 async fn list_chats(State(s): State<ApiState>) -> ApiResult<Json<Vec<Chat>>> {
     Ok(Json(s.db.list_chats()?))
@@ -160,7 +197,9 @@ async fn list_chats(State(s): State<ApiState>) -> ApiResult<Json<Vec<Chat>>> {
 /// Creates a chat that opens with a Rui greeting.
 async fn create_chat(State(s): State<ApiState>) -> ApiResult<(StatusCode, Json<Chat>)> {
     let chat = s.db.create_chat()?;
-    s.db.add_chat_message(chat.id, ChatRole::Rui, CHAT_GREETING)?;
+    let (in_loop, needs_you, open) = greeting_counts(&s.db)?;
+    let hour = chrono::Timelike::hour(&chrono::Local::now());
+    s.db.add_chat_message(chat.id, ChatRole::Rui, &greeting(hour, in_loop, needs_you, open))?;
     let chat = s.db.get_chat(chat.id)?.ok_or_else(|| not_found("chat not found"))?;
     Ok((StatusCode::CREATED, Json(chat)))
 }
@@ -730,13 +769,26 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn greeting_covers_each_state() {
+        assert_eq!(greeting(8, 0, 0, 0), "Good morning. All quiet. What do you want to set up?");
+        assert_eq!(greeting(12, 2, 0, 3), "Good afternoon. 2 threads are in the loop. What do you want to set up?");
+        assert_eq!(greeting(17, 1, 0, 1), "Good afternoon. 1 thread is in the loop. What do you want to set up?");
+        assert_eq!(greeting(18, 0, 0, 1), "Good evening. 1 thread is open, none running. What do you want to set up?");
+        assert_eq!(greeting(23, 0, 0, 4), "Good evening. 4 threads are open, none running. What do you want to set up?");
+        let ask = "Want to start with those, or set up something new?";
+        assert_eq!(greeting(9, 3, 1, 3), format!("Good morning. 1 thing waits for you in the Inbox. {ask}"));
+        assert_eq!(greeting(9, 0, 2, 0), format!("Good morning. 2 things wait for you in the Inbox. {ask}"));
+    }
+
     #[tokio::test]
     async fn chats_create_list_and_title_from_first_message() {
         let (app, _db, _rx) = setup();
         let (st, c) = call(&app, "POST", "/chats", None).await;
         assert_eq!(st, StatusCode::CREATED);
         assert_eq!(c["title"].as_str(), Some("New chat"));
-        assert_eq!(c["last"].as_str(), Some("What do you want set up?"));
+        let last = c["last"].as_str().unwrap();
+        assert!(last.starts_with("Good ") && last.ends_with('?'), "{last}");
         let cid = c["id"].as_i64().unwrap();
         let long = "x".repeat(60);
         call(&app, "POST", "/chat", Some(json!({"chat_id": cid, "content": long}))).await;

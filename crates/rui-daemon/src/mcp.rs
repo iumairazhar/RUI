@@ -131,6 +131,16 @@ pub struct ProjectArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoArgs {}
 
+/// Arguments for `approve`, sent by the Claude CLI's permission prompt.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ApproveArgs {
+    /// Name of the tool the agent wants to use.
+    pub tool_name: String,
+    /// The tool's input.
+    pub input: Value,
+}
+
 /// Arguments for `ask_owner`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -385,9 +395,9 @@ pub mod logic {
         Ok(json!({"project": client.name, "repo_path": client.repo_path, "task_id": parent.id, "pod": full_pod}))
     }
 
-    /// Stores a question for the owner; it shows in the Inbox. Rui must end its turn afterwards.
-    pub fn ask_owner(db: &Db, ctx: &Ctx, a: AskOwnerArgs) -> anyhow::Result<Value> {
-        let question = a.question.trim();
+    /// Creates an open chat ask for the chat in `ctx`, enforcing the per-turn limit.
+    fn create_ask(db: &Db, ctx: &Ctx, question: &str, options: &[String]) -> anyhow::Result<rui_core::ChatAsk> {
+        let question = question.trim();
         if question.is_empty() {
             anyhow::bail!("question must not be empty");
         }
@@ -397,10 +407,60 @@ pub mod logic {
         if let Some(m) = msg_id.filter(|m| db.count_asks_of_message(*m).unwrap_or(0) >= crate::asks::MAX_ASKS_PER_TURN) {
             anyhow::bail!("at most {} asks per turn (message {m}); end your turn", crate::asks::MAX_ASKS_PER_TURN);
         }
-        let options: Vec<String> = a.options.iter().flatten().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
-        let ask = db.create_chat_ask(chat_id, msg_id, question, &options)?;
+        let options: Vec<String> = options.iter().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+        db.create_chat_ask(chat_id, msg_id, question, &options)
+    }
+
+    /// Stores a question for the owner; it shows in the Inbox. Rui must end its turn afterwards.
+    pub fn ask_owner(db: &Db, ctx: &Ctx, a: AskOwnerArgs) -> anyhow::Result<Value> {
+        let ask = create_ask(db, ctx, &a.question, a.options.as_deref().unwrap_or_default())?;
         record(db, ctx, Role::Rui, "ask_owner", &a)?;
         Ok(json!({"ask_id": ask.id, "next": "Asked. The owner will answer in the Inbox or chat. End your turn now."}))
+    }
+
+    fn allow(input: &Value) -> Value {
+        json!({"behavior": "allow", "updatedInput": input})
+    }
+
+    fn deny(message: &str) -> Value {
+        json!({"behavior": "deny", "message": message})
+    }
+
+    /// Permission-prompt tool for Rui's built-in tools: allows everything except dangerous Bash
+    /// commands, which are held until the owner answers "Run it" (the approval is single use).
+    /// The returned Value is the verdict itself; `finish` turns it into exactly one text block
+    /// holding its JSON string, which is the shape the Claude CLI expects.
+    pub fn approve(db: &Db, data_dir: &Path, ctx: &Ctx, a: ApproveArgs) -> anyhow::Result<Value> {
+        let verdict = decide(db, data_dir, ctx, &a)?;
+        record(db, ctx, Role::Rui, "approve", &a)?;
+        Ok(verdict)
+    }
+
+    /// Works out the allow or deny verdict for one tool call.
+    fn decide(db: &Db, data_dir: &Path, ctx: &Ctx, a: &ApproveArgs) -> anyhow::Result<Value> {
+        if a.tool_name != "Bash" {
+            return Ok(allow(&a.input));
+        }
+        let Some(command) = a.input["command"].as_str() else { return Ok(deny("no command")) };
+        let Some(reason) = crate::shell::danger(command) else { return Ok(allow(&a.input)) };
+        let source = ctx.source_ref.as_deref().ok_or_else(|| anyhow::anyhow!("approve works only in a chat"))?;
+        let chat_id = db.chat_id_for_source_ref(source)?.ok_or_else(|| anyhow::anyhow!("chat not found"))?;
+        if let Some(path) = crate::shell::find_approval(data_dir, db, chat_id, command) {
+            crate::shell::consume(&path)?;
+            return Ok(allow(&a.input));
+        }
+        hold(db, data_dir, ctx, chat_id, command, reason)
+    }
+
+    /// Asks the owner about a dangerous command and denies it for now.
+    fn hold(db: &Db, data_dir: &Path, ctx: &Ctx, chat_id: i64, command: &str, reason: &str) -> anyhow::Result<Value> {
+        let question = format!("Rui wants to run `{command}`. Risk: {reason}.");
+        let ask = create_ask(db, ctx, &question, &["Run it".to_string(), "Don't run".to_string()])?;
+        crate::shell::save_approval(data_dir, ask.id, chat_id, command)?;
+        Ok(deny(&format!(
+            "Held for the owner's OK (ask {}). Tell the owner in one line what you want to run and why, then end your turn.",
+            ask.id
+        )))
     }
 
     /// Stops a task and its unfinished subtasks.
@@ -743,6 +803,15 @@ impl RuiServer {
         Parameters(a): Parameters<AskOwnerArgs>,
     ) -> CallToolResult {
         finish(logic::ask_owner(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Permission prompt for built-in tools: holds dangerous Bash commands for the owner's OK. Not for the agent to call.")]
+    async fn approve(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<ApproveArgs>,
+    ) -> CallToolResult {
+        finish(logic::approve(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Stop a task and all its unfinished subtasks, for example when the owner cancels or changes course. Give the reason. Returns the stopped task ids.")]
@@ -1122,6 +1191,50 @@ mod tests {
         assert!(logic::ask_owner(&db, &no_chat, AskOwnerArgs { question: "q".into(), options: None }).is_err());
     }
 
+    fn approve_args(tool: &str, input: Value) -> ApproveArgs {
+        ApproveArgs { tool_name: tool.into(), input }
+    }
+
+    fn chat_ctx(db: &Db) -> Ctx {
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, rui_core::ChatRole::User, "hi").unwrap();
+        Ctx { task_id: None, source_ref: Some(format!("chat:{}", msg.id)) }
+    }
+
+    #[test]
+    fn approve_allows_safe_bash_and_other_tools() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        let ctx = chat_ctx(&db);
+        let ls = json!({"command": "ls -la"});
+        let r = logic::approve(&db, data.path(), &ctx, approve_args("Bash", ls.clone())).unwrap();
+        assert_eq!(r, json!({"behavior": "allow", "updatedInput": ls}));
+        let risky = json!({"command": "git push"});
+        let r = logic::approve(&db, data.path(), &ctx, approve_args("Read", risky)).unwrap();
+        assert_eq!(r["behavior"], "allow");
+        let r = logic::approve(&db, data.path(), &ctx, approve_args("Bash", json!({}))).unwrap();
+        assert_eq!(r, json!({"behavior": "deny", "message": "no command"}));
+        assert!(db.list_chat_asks(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn approve_holds_dangerous_bash_until_run_it_once() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        let ctx = chat_ctx(&db);
+        let input = json!({"command": "git push origin main"});
+        let call = || logic::approve(&db, data.path(), &ctx, approve_args("Bash", input.clone())).unwrap();
+        let held = call();
+        assert_eq!(held["behavior"], "deny");
+        assert!(held["message"].as_str().unwrap().contains("Held for the owner's OK"));
+        let asks = db.list_chat_asks(Some("open")).unwrap();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].text, "Rui wants to run `git push origin main`. Risk: rewrites or pushes git history.");
+        assert_eq!(asks[0].options, vec!["Run it".to_string(), "Don't run".to_string()]);
+        db.answer_chat_ask(asks[0].id, "Run it").unwrap();
+        assert_eq!(call(), json!({"behavior": "allow", "updatedInput": input}));
+        assert_eq!(call()["behavior"], "deny");
+        assert_eq!(db.list_chat_asks(Some("open")).unwrap().len(), 1);
+    }
+
     #[test]
     fn rui_stop_and_instruct_tools() {
         let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
@@ -1382,7 +1495,7 @@ mod tests {
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
-        let rui = ["ask_owner", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "staff_task", "stop_apps", "stop_task", "use_repo"];
+        let rui = ["approve", "ask_owner", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "staff_task", "stop_apps", "stop_task", "use_repo"];
         assert_eq!(tool_names(&app, "/mcp/rui").await, rui);
     }
 
@@ -1407,6 +1520,7 @@ mod tests {
             allowed_tools: vec!["mcp__rui__use_repo".into()],
             builtin_tools: None,
             permission_mode: None,
+            permission_prompt_tool: None,
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
             mcp_headers: vec![],
             resume: None,
