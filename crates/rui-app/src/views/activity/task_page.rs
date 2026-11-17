@@ -73,9 +73,36 @@ impl ThreadsView {
         let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
         let info = div().id("task-info").flex().flex_col().flex_1().min_w_0().gap(px(6.));
         let info = info.child(eyebrow).child(title).child(meta).children(pod);
-        let action = self.page_action(t, th, cx);
+        let actions = div().id("task-actions").flex().items_center().gap(px(8.));
+        let actions = actions.children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx));
         let row = div().id("task-head").flex().flex_none().items_start().gap(px(14.)).px(px(40.)).pt(px(8.));
-        row.child(face).child(info).children(action).into_any_element()
+        row.child(face).child(info).child(actions).into_any_element()
+    }
+
+    /// "Abandon" for a whole task that isn't done; a second click drops it for good.
+    fn abandon_control(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if t.task.parent_id.is_some() || t.word == Word::Done {
+            return None;
+        }
+        let id = t.task.id;
+        if !self.abandon_armed {
+            let arm = chip("task-abandon", "Abandon", cx).on_click(cx.listener(|this, _, _, cx| this.arm_abandon(cx)));
+            return Some(arm.into_any_element());
+        }
+        let go = danger_button("task-abandon-now", "Click again to abandon", true, th);
+        Some(go.on_click(cx.listener(move |this, _, _, cx| this.abandon(id, cx))).into_any_element())
+    }
+
+    fn arm_abandon(&mut self, cx: &mut Context<Self>) {
+        self.abandon_armed = true;
+        cx.notify();
+    }
+
+    /// Stop the whole team and mark the task dropped; it moves to Done as "Dropped by you".
+    fn abandon(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.abandon_armed = false;
+        self.store.update(cx, |s, cx| s.drop_task(id, cx));
+        cx.notify();
     }
 
     /// Stop while it can run, Resume team once stopped.

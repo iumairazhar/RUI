@@ -269,6 +269,8 @@ pub struct ThreadsView {
     expanded: HashSet<usize>,
     /// The Stop button was clicked and the optional "Why?" is showing.
     stop_open: bool,
+    /// "Abandon" was clicked once; the next click drops the task.
+    abandon_armed: bool,
     /// One-line reason for a stop from the task page.
     why: Entity<TextInput>,
     /// Last column of each thread, to spot band changes.
@@ -296,7 +298,7 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -308,6 +310,7 @@ impl ThreadsView {
     pub fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open = Some(id);
         self.stop_open = false;
+        self.abandon_armed = false;
         self.why.update(cx, |i, cx| i.clear(cx));
         self.set_tab(Tab::Trace);
         self.file = None;
@@ -356,6 +359,7 @@ impl ThreadsView {
         }
         self.open = None;
         self.stop_open = false;
+        self.abandon_armed = false;
         self.store.update(cx, |s, cx| s.load_changes(None, cx));
         cx.notify();
     }
