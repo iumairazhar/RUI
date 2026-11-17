@@ -3,6 +3,7 @@
 use crate::apps::{self, AppInfo, Apps};
 use crate::results::ResultFile;
 use crate::db::Db;
+use crate::client_state;
 use crate::prompts;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
@@ -17,11 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const LEAD_PROMPT: &str = include_str!("../prompts/lead.md");
+const ACCOUNT_LEAD_PROMPT: &str = include_str!("../prompts/account_lead.md");
 const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
-mcp__rui__set_limit,mcp__rui__set_done_command";
+mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -295,8 +296,17 @@ pub fn settle_decision(db: &Db, id: i64, level: &str) -> Result<()> {
 /// Abort handles of the turns currently running, keyed by task id (decision turns: `-question_id`).
 pub type Runs = Arc<Mutex<HashMap<i64, tokio::task::AbortHandle>>>;
 
+/// One lock per client, so only one Account Lead wake runs at a time for it.
+pub type ClientLocks = Arc<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// The client's wake lock, created on first use.
+pub fn client_lock(locks: &ClientLocks, client_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(client_id).or_default().clone()
+}
+
 /// Runs forever: every tick, plan and execute. Never exits on error.
-pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, live: Live, apps: Apps) {
+pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, live: Live, apps: Apps) {
     loop {
         tokio::time::sleep(cfg.tick).await;
         let snapshot: HashSet<i64> =
@@ -304,7 +314,7 @@ pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, live: Live, apps: Apps
         match plan_tick(&db, &snapshot) {
             Ok(actions) => {
                 for a in actions {
-                    execute(&db, &cfg, &running, &live, &apps, a);
+                    execute(&db, &cfg, &running, &locks, &live, &apps, a);
                 }
             }
             Err(e) => report_error(&db, None, &e),
@@ -317,7 +327,7 @@ fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
     let _ = db.add_event(task_id, "scheduler", "scheduler_error", &json!({"error": format!("{e:#}")}));
 }
 
-fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps, action: Action) {
+fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live: &Live, apps: &Apps, action: Action) {
     match action {
         Action::Rollup { task_id, status } => {
             let res = db
@@ -335,21 +345,22 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps,
             }
         }
         Action::StartLead { task_id, answers } => {
-            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, move |db, cfg, live| async move {
+            let lock = lock_for_task(db, locks, task_id);
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, lock, move |db, cfg, live| async move {
                 lead_turn(&db, &cfg, &live, task_id, answers).await
             });
         }
         Action::StartBuilder { task_id } => {
-            spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, move |db, cfg, live| async move {
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, None, move |db, cfg, live| async move {
                 builder_turn(&db, &cfg, &live, task_id).await
             });
         }
-        Action::Decide { question_id, level } => spawn_decision(db, cfg, running, live, question_id, level),
+        Action::Decide { question_id, level } => spawn_decision(db, cfg, running, locks, live, question_id, level),
     }
 }
 
 /// Runs one decision turn in the background; at most one per question.
-fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: i64, level: String) {
+fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live: &Live, qid: i64, level: String) {
     let key = -qid;
     let Ok(mut map) = running.lock() else { return };
     if map.contains_key(&key) {
@@ -357,8 +368,13 @@ fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: 
     }
     let (db, cfg, live) = (db.clone(), cfg.clone(), live.clone());
     let guard = RunGuard(running.clone(), key);
+    let lock = if level == "lead" { question_client(&db, qid).map(|c| client_lock(locks, c)) } else { None };
     let handle = tokio::spawn(async move {
         let _guard = guard;
+        let _wake = match &lock {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
         if let Err(e) = decide(&db, &cfg, &live, qid, &level).await {
             report_error(&db, None, &e);
         }
@@ -367,6 +383,18 @@ fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: 
         }
     });
     map.insert(key, handle.abort_handle());
+}
+
+/// The client of the task a question belongs to.
+fn question_client(db: &Db, qid: i64) -> Option<i64> {
+    let q = db.get_question(qid).ok()??;
+    Some(db.get_task(q.task_id).ok()??.client_id)
+}
+
+/// The client's wake lock for a task, if the task exists.
+fn lock_for_task(db: &Db, locks: &ClientLocks, task_id: i64) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    let task = db.get_task(task_id).ok()??;
+    Some(client_lock(locks, task.client_id))
 }
 
 /// After a top-level chat task is done, starts its project's apps and tells the chat.
@@ -481,6 +509,7 @@ fn spawn_turn<F, Fut>(
     live: &Live,
     task_id: i64,
     start_status: TaskStatus,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
     turn: F,
 ) where
     F: FnOnce(Arc<Db>, Config, Live) -> Fut + Send + 'static,
@@ -500,6 +529,10 @@ fn spawn_turn<F, Fut>(
     let live = live.clone();
     let handle = tokio::spawn(async move {
         let _guard = (guard, live_guard);
+        let _wake = match &lock {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
         if let Err(e) = turn(db.clone(), cfg, live).await {
             report_error(&db, Some(task_id), &e);
             let _ = db.set_task_status(task_id, TaskStatus::Stuck);
@@ -544,21 +577,24 @@ async fn run_logged(db: &Db, live: &Live, agent: &str, task_id: i64, run: &Agent
     .await
 }
 
+/// The task itself, plus the owner's answers when this wake follows questions.
+/// Every wake is a fresh session, so the task details are always included.
 fn lead_prompt(task: &Task, client: &Client, answers: &[(String, String)]) -> String {
+    let members: Vec<&str> = task.pod.iter().map(String::as_str).filter(|p| *p != "lead").collect();
+    let base = format!(
+        "Client: {}\nTask id: {}\nTitle: {}\n\n{}\n\nClient test command: {}\nPod roles for this task (create subtasks only for these agents): {}",
+        client.name,
+        task.id,
+        task.title,
+        task.body,
+        client.test_command.as_deref().unwrap_or("(none)"),
+        if members.is_empty() { "(any role)".into() } else { members.join(", ") }
+    );
     if answers.is_empty() {
-        let members: Vec<&str> = task.pod.iter().map(String::as_str).filter(|p| *p != "lead").collect();
-        return format!(
-            "Client: {}\nTask id: {}\nTitle: {}\n\n{}\n\nClient test command: {}\nYour pod (create subtasks only for these agents): {}",
-            client.name,
-            task.id,
-            task.title,
-            task.body,
-            client.test_command.as_deref().unwrap_or("(none)"),
-            if members.is_empty() { "(any role)".into() } else { members.join(", ") }
-        );
+        return base;
     }
     let pairs: Vec<String> = answers.iter().map(|(q, a)| format!("Q: {q}\nA: {a}")).collect();
-    format!("The owner answered:\n\n{}\n\nContinue: split the task.", pairs.join("\n\n"))
+    format!("{base}\n\nThe owner answered your questions:\n\n{}\n\nContinue: split the task.", pairs.join("\n\n"))
 }
 
 /// When the owner redirected a task that already has subtasks, lists them so the Lead can adjust them.
@@ -600,14 +636,53 @@ fn role_prompt(role: Option<&roster::Role>, prompt: &str) -> String {
     }
 }
 
-/// Role tools plus MCP tools for a Lead, or read-only tools when the role is missing.
-fn lead_tools(role: Option<&roster::Role>) -> Vec<String> {
+/// Role tools plus MCP tools for an Account Lead. It never writes files, so Edit and Write are dropped.
+fn account_lead_tools(role: Option<&roster::Role>) -> Vec<String> {
     let mut tools: Vec<String> = LEAD_MCP.split(',').map(String::from).collect();
     match role {
         Some(r) => tools.extend(roster::cli_tools(r)),
         None => tools.extend(READ_ONLY_TOOLS.map(String::from)),
     }
+    tools.retain(|t| t != "Edit" && t != "Write");
     tools
+}
+
+/// Last `max` chars of `text`, cut at a char boundary, with a leading "…" when cut.
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max).collect();
+    format!("\u{2026}{tail}")
+}
+
+/// One line per pod role: its title and its own skills plus the pod's extra ones.
+fn pod_roles_and_skills(data_dir: &Path, client: &Client) -> Result<String> {
+    let pod = client_state::read_pod(data_dir, &client.name)?;
+    let mut lines = Vec::new();
+    for pr in &pod.roles {
+        let mut skills = roster::load(data_dir, &pr.role).map(|r| r.skills).unwrap_or_default();
+        skills.extend(pr.skills.iter().cloned());
+        let mut seen = HashSet::new();
+        skills.retain(|s| seen.insert(s.clone()));
+        let title = roster::title_of(data_dir, &pr.role);
+        lines.push(format!("- {} ({title}): skills {}", pr.role, skills.join(", ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Values for account_lead.md: the client, why it woke, its briefs and log, playbook and pod.
+fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Vec<(&'static str, String)>> {
+    let briefs = tail_chars(&client_state::read_briefs(data_dir, &client.name)?, 6000);
+    let log = client_state::read_log(data_dir, &client.name, 60)?;
+    Ok(vec![
+        ("client", client.name.clone()),
+        ("event", event.to_string()),
+        ("client_log", format!("Briefs:\n{briefs}\n\nDecisions log (latest last):\n{log}")),
+        ("client_playbook", client_state::read_playbook(data_dir, &client.name)?),
+        ("pod_roles_and_skills", pod_roles_and_skills(data_dir, client)?),
+    ])
 }
 
 /// Installs the role's skills plus the client's attached ones in `wt`, logs one `skill_used` event
@@ -629,25 +704,28 @@ fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, cl
     Ok(unique)
 }
 
-/// Builds the Lead's run for `task` (a parent task) in the client's repo, with the role's skills installed.
-fn lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, prompt: String) -> Result<AgentRun> {
+/// Builds an Account Lead wake for `task`: a fresh session in the task worktree, read-only tools.
+fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: &str, prompt: String) -> Result<AgentRun> {
     let role = roster::load(&cfg.data_dir, "lead");
     let repo = expand_home(&client.repo_path);
+    let (wt, branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), task.id)?;
+    record_parent_branch(db, task.id, &branch)?;
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    install_logged(db, cfg, &repo, task, "lead", &client.name, &names)?;
+    install_logged(db, cfg, &wt, task, "lead", &client.name, &names)?;
+    let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &account_lead_vars(&cfg.data_dir, client, event)?);
     Ok(AgentRun {
         role: Role::Lead,
         task_id: Some(task.id),
-        cwd: repo,
+        cwd: wt,
         prompt,
-        system_prompt: role_prompt(role.as_ref(), LEAD_PROMPT),
-        allowed_tools: lead_tools(role.as_ref()),
+        system_prompt: role_prompt(role.as_ref(), &filled),
+        allowed_tools: account_lead_tools(role.as_ref()),
         builtin_tools: None,
         permission_mode: None,
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/lead", cfg.port),
         mcp_headers: vec![("X-Rui-Task-Id".into(), task.id.to_string())],
-        resume: db.get_session(Role::Lead, Some(task.id))?,
+        resume: None,
         partial: true,
     })
 }
@@ -657,14 +735,9 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let client = client_for(db, &task)?;
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
-    let run = lead_run(db, cfg, &task, &client, prompt)?;
-    match run_logged(db, live, "lead", task_id, &run).await {
-        Ok(out) => {
-            if let Some(id) = out.session_id {
-                db.set_session(Role::Lead, Some(task_id), &id)?;
-            }
-        }
-        Err(e) => return agent_failed(db, task_id, &e),
+    let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
+    if let Err(e) = run_logged(db, live, "lead", task_id, &run).await {
+        return agent_failed(db, task_id, &e);
     }
     after_lead_turn(db, task_id)?;
     Ok(())
@@ -719,11 +792,8 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let tool = if level == "lead" { "escalate" } else { "escalate_to_owner" };
     let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), tool);
     if level == "lead" {
-        let run = lead_run(db, cfg, &parent, &client, prompt)?;
-        let out = run_logged(db, live, "lead", parent.id, &run).await?;
-        if let Some(id) = out.session_id {
-            db.set_session(Role::Lead, Some(parent.id), &id)?;
-        }
+        let run = account_lead_run(db, cfg, &parent, &client, "a member's question", prompt)?;
+        run_logged(db, live, "lead", parent.id, &run).await?;
         return Ok(());
     }
     let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent)?);
@@ -852,7 +922,15 @@ fn builder_prompt(task: &Task, done_command: &str, last_output: Option<&str>) ->
     p
 }
 
-/// On daemon start: orphaned in_progress tasks go back to open, clarifying ones to new.
+/// A clarifying top-level task that already has subtasks was split; it must not get a "new task" wake again.
+fn recovered_status(db: &Db, t: &Task, to: TaskStatus) -> Result<TaskStatus> {
+    if to == TaskStatus::New && t.parent_id.is_none() && !db.subtasks(t.id)?.is_empty() {
+        return Ok(TaskStatus::Split);
+    }
+    Ok(to)
+}
+
+/// On daemon start: orphaned in_progress tasks go back to open, clarifying ones to new (split if they already have subtasks).
 pub fn recover_on_start(db: &Db) -> Result<usize> {
     let moves = [
         (TaskStatus::InProgress, TaskStatus::Open),
@@ -861,6 +939,7 @@ pub fn recover_on_start(db: &Db) -> Result<usize> {
     let mut count = 0;
     for (from, to) in moves {
         for t in db.tasks_with_status(from)? {
+            let to = recovered_status(db, &t, to)?;
             db.set_task_status(t.id, to)?;
             let payload = json!({"from": from.as_str(), "to": to.as_str()});
             db.add_event(Some(t.id), "scheduler", "recovered", &payload)?;
@@ -1039,6 +1118,52 @@ mod tests {
         let evs = db.list_events(Some(sub.id), 10).unwrap();
         assert!(evs.iter().any(|e| e.kind == "recovered"));
         assert_eq!(recover_on_start(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn recover_sends_a_split_clarifying_task_to_split() {
+        let (db, c) = setup();
+        let parent = mk(&db, c, None, TaskStatus::Clarifying);
+        mk(&db, c, Some(parent.id), TaskStatus::Open);
+        assert_eq!(recover_on_start(&db).unwrap(), 1);
+        assert_eq!(db.get_task(parent.id).unwrap().unwrap().status, TaskStatus::Split);
+    }
+
+    #[test]
+    fn account_lead_vars_fill_every_placeholder() {
+        let (db, c) = setup();
+        let client = db.get_client(c).unwrap().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        client_state::ensure(data.path(), "acme", "/repo", None).unwrap();
+        client_state::append_brief(data.path(), "acme", 1, "Title", "the brief").unwrap();
+        client_state::append_decision(data.path(), "acme", "picked sqlite").unwrap();
+        let pod = client_state::Pod {
+            roles: vec![client_state::PodRole { role: "backend".into(), skills: vec!["extra-skill".into()] }],
+            protected: vec![],
+        };
+        client_state::write_pod(data.path(), "acme", &pod).unwrap();
+        let vars = account_lead_vars(data.path(), &client, "a new task").unwrap();
+        let get = |k: &str| vars.iter().find(|v| v.0 == k).unwrap().1.clone();
+        assert!(get("client_log").contains("the brief") && get("client_log").contains("picked sqlite"));
+        assert!(get("pod_roles_and_skills").contains("backend") && get("pod_roles_and_skills").contains("extra-skill"));
+        assert_eq!(get("event"), "a new task");
+        assert!(prompts::unfilled(&prompts::fill(ACCOUNT_LEAD_PROMPT, &vars)).is_empty());
+    }
+
+    #[test]
+    fn account_lead_never_gets_edit_or_write() {
+        let role = roster::parse("---\nname: lead\ncode: L\ntitle: Lead\ndescription: d\ntools: [\"Read\", \"Edit\", \"Shell\"]\n---\nbody").unwrap();
+        let tools = account_lead_tools(Some(&role));
+        assert!(!tools.iter().any(|t| t == "Edit" || t == "Write"));
+        assert!(tools.iter().any(|t| t == "mcp__rui__log_decision"));
+        assert!(tools.iter().any(|t| t == "Bash"));
+    }
+
+    #[test]
+    fn client_lock_is_per_client() {
+        let locks = ClientLocks::default();
+        assert!(Arc::ptr_eq(&client_lock(&locks, 1), &client_lock(&locks, 1)));
+        assert!(!Arc::ptr_eq(&client_lock(&locks, 1), &client_lock(&locks, 2)));
     }
 
     #[test]

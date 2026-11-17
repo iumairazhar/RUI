@@ -280,6 +280,14 @@ pub struct SetDoneArgs {
     pub done_command: String,
 }
 
+/// Arguments for `log_decision`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LogDecisionArgs {
+    /// One line: what happened and why.
+    pub line: String,
+}
+
 // ---- plain tool logic ----
 
 /// Tool logic as plain functions: `(&Db, &Ctx, args) -> Result<Value>`.
@@ -755,6 +763,18 @@ pub mod logic {
         Ok(json!({"ok": true, "task_id": task.id}))
     }
 
+    /// Account Lead appends one line to its client's decisions log.
+    pub fn log_decision(db: &Db, data_dir: &Path, ctx: &Ctx, a: LogDecisionArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if a.line.trim().is_empty() {
+            anyhow::bail!("line must not be empty");
+        }
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        crate::client_state::append_decision(data_dir, &client.name, &a.line)?;
+        record(db, ctx, Role::Lead, "log_decision", &a)?;
+        Ok(json!({"ok": true}))
+    }
+
     /// The open question a Lead or Rui is allowed to decide: right level, and for a Lead, its own member's.
     fn decidable(db: &Db, ctx: &Ctx, level: &str, id: i64) -> anyhow::Result<rui_core::Question> {
         let q = db.get_question(id)?.ok_or_else(|| anyhow::anyhow!("question {id} not found"))?;
@@ -1062,6 +1082,15 @@ impl LeadServer {
         Parameters(a): Parameters<SetDoneArgs>,
     ) -> CallToolResult {
         finish(logic::set_done_command(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
+    async fn log_decision(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<LogDecisionArgs>,
+    ) -> CallToolResult {
+        finish(logic::log_decision(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 }
 
@@ -1598,6 +1627,15 @@ mod tests {
     }
 
     #[test]
+    fn log_decision_appends_to_the_clients_log() {
+        let (db, data, lead, _) = staffed();
+        logic::log_decision(&db, data.path(), &lead, LogDecisionArgs { line: "chose sqlite".into() }).unwrap();
+        let log = crate::client_state::read_log(data.path(), "Acme", 10).unwrap();
+        assert!(log.contains("chose sqlite"), "{log}");
+        assert!(logic::log_decision(&db, data.path(), &lead, LogDecisionArgs { line: "  ".into() }).is_err());
+    }
+
+    #[test]
     fn lead_rule_answers_and_reopens_member() {
         let (db, data, lead, member) = staffed();
         let qid = ask(&db, data.path(), &member);
@@ -1693,7 +1731,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["create_subtask", "escalate", "mark_split", "rule", "set_done_command", "set_limit"];
+        let lead = ["create_subtask", "escalate", "log_decision", "mark_split", "rule", "set_done_command", "set_limit"];
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);

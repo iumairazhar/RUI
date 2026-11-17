@@ -10,6 +10,9 @@ pub const DECIDE_VARS: [&str; 8] =
 /// Placeholders filled in `rui.md`.
 pub const RUI_VARS: [&str; 1] = ["role_catalog"];
 
+/// Placeholders filled in `account_lead.md`.
+pub const ACCOUNT_LEAD_VARS: [&str; 5] = ["client", "event", "client_log", "client_playbook", "pod_roles_and_skills"];
+
 /// What a placeholder gets when there is nothing to say yet.
 pub const NONE_YET: &str = "(none yet)";
 
@@ -62,7 +65,7 @@ mod tests {
             (include_str!("../prompts/builder.md"), all(&BUILDER_VARS)),
             (include_str!("../prompts/decide.md"), all(&DECIDE_VARS)),
             (include_str!("../prompts/rui.md"), all(&RUI_VARS)),
-            (include_str!("../prompts/lead.md"), vec![]),
+            (include_str!("../prompts/account_lead.md"), all(&ACCOUNT_LEAD_VARS)),
         ];
         for (template, vars) in cases {
             assert_eq!(unfilled(&fill(template, &vars)), Vec::<String>::new());

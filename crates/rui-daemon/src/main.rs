@@ -29,6 +29,7 @@ async fn main() {
     let (chat_tx, chat_rx) = tokio::sync::mpsc::unbounded_channel();
     let seat_cache = seat::SeatCache::default();
     let runs = scheduler::Runs::default();
+    let client_locks = scheduler::ClientLocks::default();
     let live = live::Live::default();
     let apps = apps::Apps::default();
     skills::seed(&data_dir);
@@ -43,7 +44,7 @@ async fn main() {
         }
     };
     tokio::spawn(seat::refresh_loop(seat_cache));
-    tokio::spawn(scheduler::run(db.clone(), cfg.clone(), runs, live.clone(), apps.clone()));
+    tokio::spawn(scheduler::run(db.clone(), cfg.clone(), runs, client_locks, live.clone(), apps.clone()));
     tokio::spawn(chat::run(db, chat_rx, cfg, live));
     println!("rui-daemon listening on 127.0.0.1:{port}");
     let served = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await;
