@@ -8,7 +8,7 @@ use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
 use crate::roster;
 use crate::skills::{self, Skill};
-use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, diff_vs_main, ensure_task_worktree, merge_into, run_done_command};
+use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, ensure_task_worktree, merge_into, run_done_command};
 use anyhow::{Context, Result};
 use rui_core::{ChatRole, Client, Question, QuestionStatus, Role, Rung, SourceKind, Task, TaskStatus};
 use serde_json::{Value, json};
@@ -910,7 +910,7 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
             db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
         }
     }
-    finish_builder(db, cfg, live, &task, &wt, &done_command).await
+    finish_builder(db, cfg, &task, &wt, &done_command).await
 }
 
 /// Remembers the per-task branch on the parent, once.
@@ -922,16 +922,12 @@ fn record_parent_branch(db: &Db, parent_id: i64, branch: &str) -> Result<()> {
     Ok(())
 }
 
-async fn finish_builder(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
+async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
     let current = db.get_task(task.id)?.context("task not found")?;
     if matches!(current.status, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
         return Ok(());
     }
     let check = run_done_command(wt, done_command).await?;
-    if check.passed && wants_evaluator(db, &current)? {
-        record_check(db, task.id, &check)?;
-        return commit_evaluate_land(db, cfg, live, &current, wt, done_command).await;
-    }
     if after_done_check(db, &cfg.data_dir, task.id, &check)? != TaskStatus::Done {
         return Ok(());
     }
@@ -946,102 +942,6 @@ fn commit_task(db: &Db, task: &Task, wt: &Path) -> Result<bool> {
     let committed = commit_all(wt, &format!("rui: task {}: {}", task.id, task.title))?;
     db.add_event(Some(task.id), "scheduler", "commit", &json!({"committed": committed}))?;
     Ok(committed)
-}
-
-/// True when the member's parent pod has an evaluator.
-fn wants_evaluator(db: &Db, task: &Task) -> Result<bool> {
-    let Some(pid) = task.parent_id else { return Ok(false) };
-    let parent = db.get_task(pid)?;
-    Ok(parent.is_some_and(|p| p.pod.iter().any(|r| r == "evaluator")))
-}
-
-/// Check passed: commit, let the evaluator review, then land on PASS or send back on FAIL.
-async fn commit_evaluate_land(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done: &str) -> Result<()> {
-    if !commit_task(db, task, wt)? {
-        return db.set_task_status(task.id, TaskStatus::Done);
-    }
-    let text = evaluator_review(db, cfg, live, task, wt, done).await?;
-    if parse_verdict(&text) == Some(Verdict::Pass) {
-        db.set_task_status(task.id, TaskStatus::Done)?;
-        return merge_subtask(db, cfg, task);
-    }
-    let findings = if parse_verdict(&text).is_some() { text } else { format!("No verdict was given.\n{text}") };
-    send_back(db, &cfg.data_dir, task.id, &findings)?;
-    Ok(())
-}
-
-/// The evaluator's final verdict.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Verdict {
-    Pass,
-    Fail,
-}
-
-/// Reads `VERDICT: PASS` or `VERDICT: FAIL` from the last line that has one.
-pub fn parse_verdict(text: &str) -> Option<Verdict> {
-    let plain = |c: char| matches!(c, '*' | '`' | '_' | ' ');
-    text.lines().rev().find_map(|line| {
-        let line = line.trim().trim_matches(plain).to_uppercase();
-        match line.strip_prefix("VERDICT:")?.trim_matches(plain) {
-            "PASS" => Some(Verdict::Pass),
-            "FAIL" => Some(Verdict::Fail),
-            _ => None,
-        }
-    })
-}
-
-fn evaluator_prompt(task: &Task, done: &str, diff: &str) -> String {
-    format!(
-        "Job:\n{}\n\nDone command: {done}\n\nReview this change (git diff main) against the job:\n```diff\n{diff}\n```\n\n\
-         Reply with your findings. The final line must be exactly `VERDICT: PASS` or `VERDICT: FAIL`.",
-        task.body
-    )
-}
-
-/// Tools for the evaluator: its role's tools without Edit or Write.
-fn evaluator_tools(role: Option<&roster::Role>) -> Vec<String> {
-    let tools = match role {
-        Some(r) => roster::cli_tools(r),
-        None => READ_ONLY_TOOLS.map(String::from).to_vec(),
-    };
-    tools.into_iter().filter(|t| t != "Edit" && t != "Write").collect()
-}
-
-/// Runs the evaluator in the member's worktree and returns its final text.
-async fn evaluator_review(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done: &str) -> Result<String> {
-    let role = roster::load(&cfg.data_dir, "evaluator");
-    let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    let client = client_for(db, task)?;
-    install_logged(db, cfg, wt, task, "evaluator", &client.name, &names)?;
-    let run = AgentRun {
-        role: Role::Builder,
-        task_id: Some(task.id),
-        cwd: wt.to_path_buf(),
-        prompt: evaluator_prompt(task, done, &diff_vs_main(wt)?),
-        system_prompt: role.as_ref().map(|r| r.body.clone()).unwrap_or_default(),
-        allowed_tools: evaluator_tools(role.as_ref()),
-        builtin_tools: None,
-        permission_mode: None,
-        permission_prompt_tool: None,
-        mcp_url: format!("http://127.0.0.1:{}/mcp/builder", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task.id.to_string())],
-        resume: None,
-        partial: true,
-    };
-    let out = run_logged(db, live, "evaluator", task.id, &run).await?;
-    Ok(out.result_text.unwrap_or_default())
-}
-
-/// Evaluator said FAIL: record the findings as an instruction, count a loop, reopen the member.
-pub fn send_back(db: &Db, data_dir: &Path, task_id: i64, findings: &str) -> Result<TaskStatus> {
-    db.add_event(Some(task_id), "evaluator", "sent_back", &json!({"findings": findings}))?;
-    let text = format!("The evaluator sent your work back:\n{findings}");
-    db.add_event(Some(task_id), "evaluator", "instruction", &json!({"text": text}))?;
-    let task = db.get_task(task_id)?.context("task not found")?;
-    let reason = format!("the evaluator still rejects it: {findings}");
-    let next = count_failed_loop(db, data_dir, &task, &reason)?;
-    db.set_task_status(task_id, next)?;
-    Ok(next)
 }
 
 /// Merges a finished subtask branch into its parent's task branch; a conflict turns it Stuck.
@@ -1343,57 +1243,6 @@ mod tests {
         assert!(answer_question(&db, q, "again", None, "owner").is_err());
     }
 
-    #[test]
-    fn verdict_parsing() {
-        assert_eq!(parse_verdict("ok\nVERDICT: PASS"), Some(Verdict::Pass));
-        assert_eq!(parse_verdict("bad\n**VERDICT: FAIL**\n"), Some(Verdict::Fail));
-        assert_eq!(parse_verdict("verdict: pass  "), Some(Verdict::Pass));
-        assert_eq!(parse_verdict("VERDICT: PASS\nlater\nVERDICT: FAIL"), Some(Verdict::Fail));
-        assert_eq!(parse_verdict("VERDICT: MAYBE"), None);
-        assert_eq!(parse_verdict("all good"), None);
-    }
-
-    #[test]
-    fn sent_back_records_findings_counts_a_loop_and_reopens() {
-        let (db, c) = setup();
-        let t = mk(&db, c, Some(1), TaskStatus::InProgress);
-        assert_eq!(send_back(&db, &dd(), t.id, "missing tests").unwrap(), TaskStatus::Open);
-        let now = db.get_task(t.id).unwrap().unwrap();
-        assert_eq!((now.status, now.loops_used), (TaskStatus::Open, 1));
-        let evs = db.list_events(Some(t.id), 10).unwrap();
-        assert!(evs.iter().any(|e| e.kind == "sent_back"));
-        assert!(db.pending_instructions(t.id).unwrap()[0].1.contains("missing tests"));
-        assert_eq!(send_back(&db, &dd(), t.id, "still bad").unwrap(), TaskStatus::WaitingAnswer);
-        assert_eq!(db.questions_for_task(t.id).unwrap()[0].level, "lead");
-    }
-
-    #[test]
-    fn evaluator_is_wanted_only_when_in_the_pod() {
-        let (db, c) = setup();
-        let mut parent = mk(&db, c, None, TaskStatus::Split);
-        let member = mk(&db, c, Some(parent.id), TaskStatus::InProgress);
-        assert!(!wants_evaluator(&db, &member).unwrap());
-        let with = db
-            .create_task(&NewTask {
-                client_id: c,
-                parent_id: None,
-                title: "p".into(),
-                body: String::new(),
-                status: TaskStatus::Split,
-                done_command: None,
-                max_loops: 5,
-                role: Role::Lead,
-                source_kind: SourceKind::User,
-                source_ref: None,
-                agent: Some("lead".into()),
-                pod: vec!["lead".into(), "evaluator".into()],
-            })
-            .unwrap();
-        parent = with;
-        let member = mk(&db, c, Some(parent.id), TaskStatus::InProgress);
-        assert!(wants_evaluator(&db, &member).unwrap());
-    }
-
     fn role(tools: &[&str]) -> roster::Role {
         let text = format!(
             "---\nname: r\ndescription: d\ntools: {}\n---\nI am r.\n",
@@ -1421,13 +1270,6 @@ mod tests {
         let shell = member_tools(Some(&role(&["Shell"])), &[skill], &client, "make t");
         assert!(shell.contains(&"Bash".to_string()));
         assert!(!shell.iter().any(|t| t.starts_with("Bash(")));
-    }
-
-    #[test]
-    fn evaluator_tools_are_read_only() {
-        let tools = evaluator_tools(Some(&role(&["Read", "Edit", "Shell"])));
-        assert_eq!(tools, ["Read", "Bash"]);
-        assert_eq!(evaluator_tools(None), ["Read", "Glob", "Grep"]);
     }
 
     #[test]
