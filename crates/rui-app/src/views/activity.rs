@@ -1070,7 +1070,8 @@ impl Render for ThreadsView {
         }
         let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
         let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll();
-        let body = body.child(timeline::view(chart, &th)).child(board);
+        // Tasks first; the four-hour chart sits below them.
+        let body = body.child(board).child(timeline::view(chart, &th));
         let confirm = self.confirm_view(&th, cx);
         let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
         let page = div().id("threads-page").relative().flex().flex_col().size_full();
