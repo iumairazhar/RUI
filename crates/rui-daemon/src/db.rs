@@ -668,6 +668,15 @@ impl Db {
         Ok(stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every event whose kind is in `kinds`, oldest first.
+    pub fn events_of_kinds(&self, kinds: &[&str]) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let marks = vec!["?"; kinds.len()].join(",");
+        let sql = format!("SELECT {EVENT_COLS} FROM events WHERE kind IN ({marks}) ORDER BY id");
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map(rusqlite::params_from_iter(kinds.iter()), event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Events with id > `after_id`, oldest first, at most `limit`.
     pub fn list_events_after(&self, task_id: Option<i64>, after_id: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn()?;

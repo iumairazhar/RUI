@@ -83,6 +83,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/live", get(get_live))
         .route("/tasks/runs", get(list_task_runs))
         .route("/tasks/stopped", get(list_stopped))
+        .route("/tasks/state", get(list_states))
+        .route("/inbox", get(get_inbox))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
         .route("/tasks/{id}/results", get(task_results))
@@ -90,6 +92,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/stop", post(stop_task))
         .route("/stop-all", post(stop_all))
         .route("/tasks/{id}/instruct", post(instruct_task))
+        .route("/tasks/{id}/review", post(review_task))
+        .route("/tasks/{id}/drop", post(drop_task))
+        .route("/tasks/{id}/retry", post(retry_task))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
@@ -282,9 +287,20 @@ fn seat_kind(payload: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Stuck tasks the owner (or Rui) stopped, so the app can tell them from ones that need the owner.
+/// Ids of tasks whose state word is "Stopped" right now.
 async fn list_stopped(State(s): State<ApiState>) -> ApiResult<Json<Vec<i64>>> {
-    Ok(Json(s.db.stopped_task_ids()?))
+    let states = crate::owner_state::all_states(&s.db)?;
+    Ok(Json(states.into_iter().filter(|o| o.word == "Stopped").map(|o| o.task_id).collect()))
+}
+
+/// The owner-facing word and reason of every task.
+async fn list_states(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::owner_state::OwnerState>>> {
+    Ok(Json(crate::owner_state::all_states(&s.db)?))
+}
+
+/// Everything that needs the owner, newest first.
+async fn get_inbox(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::inbox::InboxItem>>> {
+    Ok(Json(crate::inbox::inbox(&s.db)?))
 }
 
 async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun>>> {
@@ -430,33 +446,89 @@ impl From<crate::control::ControlError> for ApiError {
     }
 }
 
+/// A task, plus a note saying what was resumed so it could continue.
+#[derive(serde::Serialize)]
+struct InstructReply {
+    #[serde(flatten)]
+    task: Task,
+    note: Option<String>,
+}
+
 /// Saves an owner instruction, aborts any run and puts the task back in the queue.
 async fn instruct_task(
     State(s): State<ApiState>,
     Path(id): Path<i64>,
     Json(b): Json<InstructBody>,
-) -> ApiResult<Json<Task>> {
+) -> ApiResult<Json<InstructReply>> {
     require_text(&b.text, "text")?;
-    Ok(Json(crate::control::instruct(&s.db, &s.runs, id, &b.text, "owner")?))
+    let (task, note) = crate::control::instruct(&s.db, &s.runs, id, &b.text, "owner")?;
+    Ok(Json(InstructReply { task, note }))
+}
+
+/// Optional body of a stop call: where it came from and why.
+#[derive(Deserialize, Default)]
+struct StopBody {
+    source: Option<String>,
+    reason: Option<String>,
+}
+
+/// Reads a stop body; an empty body means no source and no reason.
+fn parse_stop_body(bytes: &[u8]) -> ApiResult<StopBody> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(StopBody::default());
+    }
+    serde_json::from_slice(bytes).map_err(|e| bad_request(&format!("invalid body: {e}")))
 }
 
 /// Stops a task and its unfinished subtasks, aborting their runs.
-async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
-    let ids = crate::control::stop_tree(&s.db, &s.runs, id, "owner", None)?;
+async fn stop_task(State(s): State<ApiState>, Path(id): Path<i64>, body: axum::body::Bytes) -> ApiResult<Json<serde_json::Value>> {
+    let b = parse_stop_body(&body)?;
+    let ids = crate::control::stop_tree(&s.db, &s.runs, id, "owner", b.source.as_deref(), b.reason.as_deref())?;
     Ok(Json(serde_json::json!({ "stopped": ids })))
 }
 
 /// Stops every top-level task that is not done or stuck, with its subtasks.
-async fn stop_all(State(s): State<ApiState>) -> ApiResult<Json<serde_json::Value>> {
+async fn stop_all(State(s): State<ApiState>, body: axum::body::Bytes) -> ApiResult<Json<serde_json::Value>> {
+    let b = parse_stop_body(&body)?;
     let open: Vec<i64> = (s.db.list_tasks()?.iter())
         .filter(|t| t.parent_id.is_none() && !matches!(t.status, TaskStatus::Done | TaskStatus::Stuck))
         .map(|t| t.id)
         .collect();
     let mut stopped = Vec::new();
     for id in open {
-        stopped.extend(crate::control::stop_tree(&s.db, &s.runs, id, "owner", None)?);
+        stopped.extend(crate::control::stop_tree(&s.db, &s.runs, id, "owner", b.source.as_deref(), b.reason.as_deref())?);
     }
     Ok(Json(serde_json::json!({ "stopped": stopped })))
+}
+
+#[derive(Deserialize)]
+struct ReviewBody {
+    verdict: String,
+    text: Option<String>,
+}
+
+/// The owner's verdict on finished work: "ok", or "changes" with a text for the Lead.
+async fn review_task(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<ReviewBody>) -> ApiResult<Json<Task>> {
+    if !["ok", "changes"].contains(&b.verdict.as_str()) {
+        return Err(bad_request("verdict must be ok or changes"));
+    }
+    Ok(Json(crate::control::review(&s.db, &s.runs, id, &b.verdict, b.text.as_deref())?))
+}
+
+/// Drops a task: stops it and its team for good.
+async fn drop_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let ids = crate::control::drop_task(&s.db, &s.runs, id)?;
+    Ok(Json(serde_json::json!({ "stopped": ids })))
+}
+
+/// Puts a stuck task back to work.
+async fn retry_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if task.status != TaskStatus::Stuck {
+        return Err(conflict("task is not stuck"));
+    }
+    let ids = crate::scheduler::retry_stuck(&s.db, id, "owner")?;
+    Ok(Json(serde_json::json!({ "resumed": ids })))
 }
 
 /// Files changed by a task: committed diff when done, else the live worktree diff.
@@ -926,6 +998,73 @@ mod tests {
         assert_eq!(db.get_task(tid).unwrap().unwrap().status, TaskStatus::Stuck);
         let events = db.list_events(Some(tid), 10).unwrap();
         assert!(events.iter().any(|e| e.kind == "stopped" && e.agent == "owner"));
+    }
+
+    #[tokio::test]
+    async fn stop_takes_optional_source_and_reason() {
+        let (app, db, _rx) = setup();
+        let (_, a) = seed_task(&db);
+        let uri = format!("/tasks/{a}/stop");
+        let body = Some(json!({"source": "Task page", "reason": "wrong plan"}));
+        assert_eq!(call(&app, "POST", &uri, body).await.0, StatusCode::OK);
+        let (_, v) = call(&app, "GET", "/tasks/state", None).await;
+        assert_eq!(v[0]["reason"], "Stopped by you from Task page: wrong plan");
+        let (_, v) = call(&app, "GET", "/tasks/stopped", None).await;
+        assert_eq!(v, json!([a]));
+        db.set_task_status(a, TaskStatus::Open).unwrap();
+        assert_eq!(call(&app, "POST", &uri, Some(json!({}))).await.0, StatusCode::OK);
+        db.set_task_status(a, TaskStatus::Open).unwrap();
+        assert_eq!(call(&app, "POST", &uri, None).await.0, StatusCode::OK);
+        let stops = db.events_of_kinds(&["stopped"]).unwrap();
+        assert_eq!((stops.len(), stops[2].payload["source"].clone()), (3, json!(null)));
+    }
+
+    #[tokio::test]
+    async fn stop_all_accepts_body_and_empty_body() {
+        let (app, db, _rx) = setup();
+        let (_, a) = seed_task(&db);
+        let (st, _) = call(&app, "POST", "/stop-all", Some(json!({"source": "Work stop all"}))).await;
+        assert_eq!(st, StatusCode::OK);
+        let e = db.list_events(Some(a), 10).unwrap().into_iter().find(|e| e.kind == "stopped").unwrap();
+        assert_eq!(e.payload["source"], "Work stop all");
+        assert_eq!(call(&app, "POST", "/stop-all", None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn retry_drop_and_review_routes() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        assert_eq!(call(&app, "POST", &format!("/tasks/{tid}/retry"), None).await.0, StatusCode::CONFLICT);
+        db.set_task_status(tid, TaskStatus::Stuck).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{tid}/retry"), None).await;
+        assert_eq!((st, v["resumed"].clone()), (StatusCode::OK, json!([tid])));
+        assert_eq!(db.get_task(tid).unwrap().unwrap().status, TaskStatus::New);
+        let (st, _) = call(&app, "POST", &format!("/tasks/{tid}/drop"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(db.events_of_kinds(&["dropped"]).unwrap().len(), 1);
+        let uri = format!("/tasks/{tid}/review");
+        let review = |v: Value| call(&app, "POST", &uri, Some(v));
+        assert_eq!(review(json!({"verdict": "ok"})).await.0, StatusCode::CONFLICT);
+        assert_eq!(review(json!({"verdict": "maybe"})).await.0, StatusCode::BAD_REQUEST);
+        db.set_task_status(tid, TaskStatus::Done).unwrap();
+        assert_eq!(review(json!({"verdict": "changes"})).await.0, StatusCode::CONFLICT);
+        assert_eq!(review(json!({"verdict": "changes", "text": "shorter"})).await.0, StatusCode::OK);
+        assert_eq!(db.get_task(tid).unwrap().unwrap().status, TaskStatus::New);
+        db.set_task_status(tid, TaskStatus::Done).unwrap();
+        assert_eq!(review(json!({"verdict": "ok"})).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn inbox_lists_stuck_task_and_instruct_reply_has_note() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.set_task_status(tid, TaskStatus::Stuck).unwrap();
+        db.add_event(Some(tid), "scheduler", "agent_error", &json!({"error": "boom"})).unwrap();
+        let (st, v) = call(&app, "GET", "/inbox", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!((v[0]["kind"].clone(), v[0]["id"].clone(), v[0]["reason"].clone()), (json!("stuck"), json!(tid), json!("Failed: boom")));
+        let (_, v) = call(&app, "POST", &format!("/tasks/{tid}/instruct"), Some(json!({"text": "go"}))).await;
+        assert!(v["note"].is_null() && v["id"] == tid);
     }
 
     #[tokio::test]

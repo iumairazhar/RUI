@@ -230,14 +230,33 @@ fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result
         return Ok(());
     }
     if word.starts_with("retry") {
-        for sub in db.subtasks(task.id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
-            db.set_task_status(sub.id, TaskStatus::Open)?;
-        }
-        let has_subs = !db.subtasks(task.id)?.is_empty();
-        return db.set_task_status(task.id, if has_subs { TaskStatus::Split } else { TaskStatus::New });
+        return retry_stuck(db, task.id, by).map(|_| ());
     }
     db.add_event(Some(task.id), by, "instruction", &json!({"text": answer}))?;
     db.set_task_status(task.id, TaskStatus::New)
+}
+
+/// Puts a stuck task back to work: its stuck subtasks reopen and the task itself goes back
+/// to split (with subtasks), new (a Lead), or open (a member). Logs `resumed`. Returns the resumed ids.
+pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
+    let task = db.get_task(id)?.context("task not found")?;
+    if task.status != TaskStatus::Stuck {
+        return Ok(vec![]);
+    }
+    let mut ids = vec![id];
+    for sub in db.subtasks(id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
+        db.set_task_status(sub.id, TaskStatus::Open)?;
+        ids.push(sub.id);
+    }
+    let has_subs = !db.subtasks(id)?.is_empty();
+    let next = match (task.role, has_subs) {
+        (Role::Builder, _) => TaskStatus::Open,
+        (_, true) => TaskStatus::Split,
+        (_, false) => TaskStatus::New,
+    };
+    db.set_task_status(id, next)?;
+    db.add_event(Some(id), by, "resumed", &json!({"ids": ids, "by": by}))?;
+    Ok(ids)
 }
 
 /// Passes an open question up one level: lead to rui, rui to owner.

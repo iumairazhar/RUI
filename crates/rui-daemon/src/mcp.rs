@@ -470,7 +470,7 @@ pub mod logic {
 
     /// Stops a task and its unfinished subtasks.
     pub fn stop_task(db: &Db, runs: &Runs, ctx: &Ctx, a: StopTaskArgs) -> anyhow::Result<Value> {
-        let ids = crate::control::stop_tree(db, runs, a.task_id, "rui", Some(a.reason.trim())).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ids = crate::control::stop_tree(db, runs, a.task_id, "rui", Some("Rui chat"), Some(a.reason.trim())).map_err(|e| anyhow::anyhow!("{e}"))?;
         record(db, ctx, Role::Rui, "stop_task", &a)?;
         Ok(json!({"stopped": ids}))
     }
@@ -480,9 +480,9 @@ pub mod logic {
         if a.text.trim().is_empty() {
             anyhow::bail!("text must not be empty");
         }
-        let t = crate::control::instruct(db, runs, a.task_id, a.text.trim(), "rui").map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (t, note) = crate::control::instruct(db, runs, a.task_id, a.text.trim(), "rui").map_err(|e| anyhow::anyhow!("{e}"))?;
         record(db, ctx, Role::Rui, "instruct_task", &a)?;
-        Ok(json!({"task_id": t.id, "status": t.status}))
+        Ok(json!({"task_id": t.id, "status": t.status, "note": note}))
     }
 
     /// Creates a top-level lead task for an existing client.
