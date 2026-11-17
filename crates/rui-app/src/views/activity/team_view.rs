@@ -1,7 +1,7 @@
 //! Threads board pieces: flat bands of agent cards, Stop buttons, the Stop all confirm and the chart data.
 
 use super::teams::{LANDED_CAP, can_stop, cap_items, stop_targets};
-use super::timeline::{Chart, Line, ROWS, clip, trajectory, window_start};
+use super::timeline::{Chart, Line, ROWS, clip, trajectory, window_start, worth_drawing};
 use super::{Col, Thread, ThreadsView, parse_secs, thread_col};
 use crate::store::Store;
 use crate::theme::Theme;
@@ -57,6 +57,9 @@ impl ThreadsView {
         let line = |t: &Thread| {
             let col = thread_col(t)?;
             let pts = clip(trajectory(&t.task, &s.events, col, now), from);
+            if !worth_drawing(&pts, from, col) {
+                return None;
+            }
             Some(Line { pts, color: th.client_color(t.task.client_id) })
         };
         let counts = ROWS.map(|(c, _)| threads.iter().filter(|t| thread_col(t) == Some(c)).count());

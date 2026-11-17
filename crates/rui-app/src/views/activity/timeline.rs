@@ -89,6 +89,14 @@ pub fn clip(pts: Vec<(i64, Col)>, from: i64) -> Vec<(i64, Col)> {
     out
 }
 
+/// Draw a thread only if it moved inside the window or is live now; old, settled threads stay off the chart.
+pub fn worth_drawing(pts: &[(i64, Col)], from: i64, current: Col) -> bool {
+    if matches!(current, Col::Doing | Col::Needs) {
+        return true;
+    }
+    pts.iter().take(pts.len().saturating_sub(1)).any(|p| p.0 > from)
+}
+
 /// Whole local hours inside the window, as (unix seconds, "HH:00").
 pub fn hour_ticks(from: i64, to: i64, offset: i64) -> Vec<(i64, String)> {
     let first = (from + offset + 3599).div_euclid(3600) * 3600 - offset;
@@ -297,6 +305,17 @@ mod tests {
         let pts = vec![(0, Col::Standing), (100, Col::Doing), (300, Col::Landed)];
         assert_eq!(clip(pts.clone(), 150), vec![(150, Col::Doing), (300, Col::Landed)]);
         assert_eq!(clip(pts.clone(), -5), pts);
+    }
+
+    #[test]
+    fn only_recent_or_live_threads_are_drawn() {
+        let old = vec![(100, Col::Landed), (500, Col::Landed)];
+        assert!(!worth_drawing(&old, 100, Col::Landed));
+        assert!(worth_drawing(&old, 100, Col::Doing));
+        let moved = vec![(100, Col::Standing), (300, Col::Landed), (500, Col::Landed)];
+        assert!(worth_drawing(&moved, 100, Col::Landed));
+        let new = vec![(200, Col::Standing), (500, Col::Standing)];
+        assert!(worth_drawing(&new, 100, Col::Standing));
     }
 
     #[test]
