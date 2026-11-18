@@ -32,6 +32,8 @@ pub struct ApiState {
     pub live: Live,
     pub data_dir: std::path::PathBuf,
     pub apps: Apps,
+    /// Owner token required in the `x-rui-owner` header.
+    pub owner_token: Arc<str>,
 }
 
 /// Error that renders as `{ "error": msg }` with a status code.
@@ -111,6 +113,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::support_api::routes())
         .merge(crate::inputs_api::routes())
         .merge(crate::costs::routes())
+        .route_layer(axum::middleware::from_fn_with_state(state.owner_token.clone(), crate::owner_auth::require))
         .with_state(state)
 }
 
@@ -762,11 +765,11 @@ mod tests {
     fn setup() -> (Router, Arc<Db>, UnboundedReceiver<i64>) {
         let db = Arc::new(Db::open_test());
         let (chat_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() }), db, rx)
+        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default(), owner_token: crate::owner_auth::test_token() }), db, rx)
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let mut req = Request::builder().method(method).uri(uri);
+        let mut req = Request::builder().method(method).uri(uri).header(crate::owner_auth::HEADER, "test-owner-token");
         let body = match body {
             Some(b) => {
                 req = req.header("content-type", "application/json");
@@ -799,6 +802,29 @@ mod tests {
             })
             .unwrap();
         (c.id, t.id)
+    }
+
+    async fn status_with(app: &Router, uri: &str, token: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(t) = token {
+            req = req.header(crate::owner_auth::HEADER, t);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn owner_routes_need_the_token_but_mcp_stays_open() {
+        let (app, db, _rx) = setup();
+        let app = app.merge(crate::mcp::mcp_router(db, std::env::temp_dir(), Apps::default(), Runs::default()));
+        assert_eq!(status_with(&app, "/tasks", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/tasks", Some("wrong")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/skills", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/tasks", Some("test-owner-token")).await, StatusCode::OK);
+        let mcp = Request::post("/mcp/rui").header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream").header("host", "localhost")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(mcp).await.unwrap().status(), StatusCode::OK);
     }
 
     fn seed_task_for(db: &Db, client_id: i64) -> i64 {
@@ -996,7 +1022,7 @@ mod tests {
         let (chat_tx, _rx2) = tokio::sync::mpsc::unbounded_channel();
         let live = Live::default();
         live.lock().unwrap().insert(crate::live::LiveKey::Chat(cid), Default::default());
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let busy_app = router(state);
         assert_eq!(call(&busy_app, "DELETE", &format!("/chats/{cid}"), None).await.0, StatusCode::CONFLICT);
         assert!(db.get_chat(cid).unwrap().is_some());
@@ -1349,7 +1375,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runs = Runs::default();
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: runs.clone(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: runs.clone(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let app = router(state);
         let (_, tid) = seed_task(&db);
         let join = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(3600)));
@@ -1375,7 +1401,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (_, tid) = seed_task(&db);
-        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default() };
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         (router(state), tid)
     }
 
@@ -1387,7 +1413,7 @@ mod tests {
         let st = crate::live::LiveState { text: "hi".into(), tool: Some("Bash".into()), ..Default::default() };
         live.lock().unwrap().insert(crate::live::LiveKey::Task(5), st);
         live.lock().unwrap().insert(crate::live::LiveKey::Chat(2), Default::default());
-        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let (code, v) = call(&router(state), "GET", "/live", None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["tasks"]["5"]["text"], "hi");
@@ -1498,7 +1524,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let app = router(state);
         let (_, tid) = seed_task(&db);
         crate::client_state::ensure(dir.path(), "acme", "/repo", None).unwrap();
@@ -1518,7 +1544,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let app = router(state);
         let (_, tid) = seed_task(&db);
         let q = db.create_question(tid, Role::Lead, "why?").unwrap();

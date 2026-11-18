@@ -215,7 +215,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let c = db.create_client("acme", "/tmp/acme", None, &[]).unwrap();
         client_state::ensure(data, "acme", "/tmp/acme", None).unwrap();
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.to_path_buf(), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         (router(state), db, c.id)
     }
 
@@ -230,7 +230,7 @@ mod tests {
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
-        let req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+        let req = Request::builder().method(method).uri(uri).header(crate::owner_auth::HEADER, "test-owner-token").header("content-type", "application/json");
         let resp = app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();

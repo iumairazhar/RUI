@@ -652,7 +652,9 @@ pub mod logic {
             return Ok(allow(&a.input));
         }
         let Some(command) = a.input["command"].as_str() else { return Ok(deny("no command")) };
-        let Some(reason) = crate::shell::danger(command) else { return Ok(allow(&a.input)) };
+        let Some(reason) = crate::shell::danger(command).or_else(|| owner_api_risk(data_dir, command)) else {
+            return Ok(allow(&a.input));
+        };
         let source = ctx.source_ref.as_deref().ok_or_else(|| anyhow::anyhow!("approve works only in a chat"))?;
         let chat_id = db.chat_id_for_source_ref(source)?.ok_or_else(|| anyhow::anyhow!("chat not found"))?;
         if let Some(path) = crate::shell::find_approval(data_dir, db, chat_id, command) {
@@ -660,6 +662,12 @@ pub mod logic {
             return Ok(allow(&a.input));
         }
         hold(db, data_dir, ctx, chat_id, command, reason)
+    }
+
+    /// Risk text when a command could read the owner token or call the owner API.
+    fn owner_api_risk(data_dir: &Path, command: &str) -> Option<&'static str> {
+        crate::owner_auth::touches_owner_api(command, data_dir, crate::owner_auth::port())
+            .then_some("touches the owner token, the data folder or the owner API")
     }
 
     /// Asks the owner about a dangerous command and denies it for now.
@@ -1766,6 +1774,18 @@ mod tests {
         assert_eq!(call(), json!({"behavior": "allow", "updatedInput": input}));
         assert_eq!(call()["behavior"], "deny");
         assert_eq!(db.list_chat_asks(Some("open")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn approve_holds_commands_that_reach_the_owner_api() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        let ctx = chat_ctx(&db);
+        let port = crate::owner_auth::port();
+        let call = |cmd: String| logic::approve(&db, data.path(), &ctx, approve_args("Bash", json!({"command": cmd}))).unwrap();
+        assert_eq!(call("cat ~/x/owner.token".into())["behavior"], "deny");
+        assert_eq!(call(format!("ls {}", data.path().display()))["behavior"], "deny");
+        assert_eq!(call(format!("curl -X POST http://127.0.0.1:{port}/stop-all"))["behavior"], "deny");
+        assert_eq!(call(format!("curl http://localhost:{port}/mcp/rui"))["behavior"], "allow");
     }
 
     #[test]

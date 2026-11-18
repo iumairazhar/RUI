@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, apps, chat, db::Db, live, mcp, roster, scheduler, seat, skills, state};
+use rui_daemon::{api, apps, chat, db::Db, live, mcp, owner_auth, roster, scheduler, seat, skills, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,9 +32,16 @@ async fn main() {
     let client_locks = scheduler::ClientLocks::default();
     let live = live::Live::default();
     let apps = apps::Apps::default();
+    let owner_token: Arc<str> = match owner_auth::issue(&data_dir) {
+        Ok(t) => Arc::from(t),
+        Err(e) => {
+            eprintln!("cannot write owner token: {e:#}");
+            std::process::exit(1);
+        }
+    };
     skills::seed(&data_dir);
     roster::seed(&data_dir);
-    let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone(), runs: runs.clone(), live: live.clone(), data_dir: data_dir.clone(), apps: apps.clone() };
+    let state = api::ApiState { db: db.clone(), chat_tx, seat: seat_cache.clone(), runs: runs.clone(), live: live.clone(), data_dir: data_dir.clone(), apps: apps.clone(), owner_token };
     let app = api::router(state).merge(mcp::mcp_router(db.clone(), data_dir, apps.clone(), runs.clone()));
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,

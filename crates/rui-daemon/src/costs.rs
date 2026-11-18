@@ -248,10 +248,10 @@ mod tests {
         spend(&db, None, 0.5, "default", json!({"input_tokens": 3}));
         let state = ApiState {
             db, chat_tx, seat: Default::default(), runs: Default::default(), live: Default::default(),
-            data_dir: data.path().to_path_buf(), apps: Default::default(),
+            data_dir: data.path().to_path_buf(), apps: Default::default(), owner_token: crate::owner_auth::test_token(),
         };
         let app = crate::api::router(state);
-        let get = |uri: &str| axum::http::Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        let get = |uri: &str| axum::http::Request::get(uri).header(crate::owner_auth::HEADER, "test-owner-token").body(axum::body::Body::empty()).unwrap();
         let resp = app.clone().oneshot(get("/costs?days=7")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
