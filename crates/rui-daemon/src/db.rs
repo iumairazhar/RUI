@@ -18,6 +18,16 @@ const EVENT_COLS: &str = "id, task_id, chat_id, agent, kind, payload, created_at
 const CHAT_COLS: &str = "id, chat_id, role, content, created_at";
 const QUESTION_COLS: &str = "id, task_id, asked_by, text, answer, status, created_at, level, ladder, why";
 
+/// One `result` event's spend, as read for the cost report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultCost {
+    pub task_id: Option<i64>,
+    pub created_at: String,
+    pub usd: f64,
+    pub tokens: i64,
+    pub seat_id: Option<String>,
+}
+
 /// Handle to the SQLite database, safe to share across threads.
 pub struct Db {
     conn: Mutex<Connection>,
@@ -752,6 +762,23 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every `result` event since `since` (an ISO time) as (task_id, created_at, usd, tokens, seat_id).
+    /// Tokens add up input, output and both cache counts from the result's `usage`.
+    pub fn result_costs_since(&self, since: &str) -> Result<Vec<ResultCost>> {
+        let conn = self.conn()?;
+        let tok = |k: &str| format!("COALESCE(json_extract(payload, '$.usage.{k}'), 0)");
+        let sql = format!(
+            "SELECT task_id, created_at, COALESCE(json_extract(payload, '$.total_cost_usd'), 0), {} + {} + {} + {}, \
+             json_extract(payload, '$.seat_id') FROM events WHERE kind = 'result' AND created_at >= ?1 ORDER BY id",
+            tok("input_tokens"), tok("output_tokens"), tok("cache_read_input_tokens"), tok("cache_creation_input_tokens")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(ResultCost { task_id: r.get(0)?, created_at: r.get(1)?, usd: r.get(2)?, tokens: r.get(3)?, seat_id: r.get(4)? })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

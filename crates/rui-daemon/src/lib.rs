@@ -5,6 +5,7 @@ pub mod chat;
 pub mod client_state;
 pub mod coach;
 pub mod control;
+pub mod costs;
 pub mod db;
 pub mod deploy;
 pub mod drop;
