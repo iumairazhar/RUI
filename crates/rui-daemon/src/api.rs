@@ -305,11 +305,13 @@ async fn list_states(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::own
 struct ThreadsQuery {
     client_id: Option<i64>,
     state: Option<String>,
+    all: Option<String>,
 }
 
 /// Threads (top-level tasks as conversations), needs-you first.
 async fn list_threads(State(s): State<ApiState>, Query(q): Query<ThreadsQuery>) -> ApiResult<Json<Vec<crate::thread::ThreadSummary>>> {
-    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    let all = matches!(q.all.as_deref(), Some("1" | "true"));
+    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), all, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
     Ok(Json(list))
 }
 

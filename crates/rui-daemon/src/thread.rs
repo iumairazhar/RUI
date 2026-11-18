@@ -543,21 +543,35 @@ pub fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Done threads idle longer than this are left out of the thread list unless `all` is set.
+pub const DONE_KEEP_SECS: i64 = 7 * 24 * 3600;
+
 /// Every thread, optionally narrowed to one client and one state. Threads that need you come
-/// first, then the most recently active.
-pub fn summaries(db: &Db, client_id: Option<i64>, state: Option<&str>, now: i64, stall: i64) -> Result<Vec<ThreadSummary>> {
+/// first, then the most recently active. Old done threads are skipped unless `all` is set.
+pub fn summaries(db: &Db, client_id: Option<i64>, state: Option<&str>, all: bool, now: i64, stall: i64) -> Result<Vec<ThreadSummary>> {
     let mut built = vec![];
     for t in db.list_tasks()?.into_iter().filter(|t| t.parent_id.is_none()) {
         if client_id.is_some_and(|c| c != t.client_id) {
             continue;
         }
         let th = build(db, &t, now, stall)?;
-        if state.is_none_or(|s| s == th.state) {
-            built.push((th, t.updated_at));
+        if state.is_some_and(|s| s != th.state) || (!all && is_old_done(db, &th, now)?) {
+            continue;
         }
+        built.push((th, t.updated_at));
     }
     built.sort_by_key(|(th, _)| (th.state != "needs_you", std::cmp::Reverse(th.last_event_id)));
     Ok(built.into_iter().map(|(th, updated_at)| summary(th, updated_at)).collect())
+}
+
+/// True when the thread is done and nothing in it has happened for DONE_KEEP_SECS.
+fn is_old_done(db: &Db, th: &Thread, now: i64) -> Result<bool> {
+    if th.state != "done" {
+        return Ok(false);
+    }
+    let ids: Vec<i64> = std::iter::once(th.id).chain(db.subtasks(th.id)?.iter().map(|s| s.id)).collect();
+    let last = db.last_activity(&ids)?.into_values().max().unwrap_or(now);
+    Ok(now - last > DONE_KEEP_SECS)
 }
 
 fn summary(th: Thread, updated_at: String) -> ThreadSummary {
@@ -876,5 +890,38 @@ mod tests {
         let th = get(&db, top, real_now());
         let titles: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
         assert_eq!(titles, vec!["You said: use v2".to_string()]);
+    }
+
+    fn listed(db: &Db, all: bool, now: i64) -> usize {
+        summaries(db, None, None, all, now, STALL_SECS).unwrap().len()
+    }
+
+    /// A done thread and the epoch second of its last activity.
+    fn done_thread() -> (Db, i64) {
+        let (db, top, sub) = setup(TaskStatus::Done);
+        db.set_task_status(top, TaskStatus::Done).unwrap();
+        let last = *db.last_activity(&[top, sub]).unwrap().values().max().unwrap();
+        (db, last)
+    }
+
+    #[test]
+    fn old_done_thread_hidden_unless_all() {
+        let (db, last) = done_thread();
+        let now = last + DONE_KEEP_SECS + 1;
+        assert_eq!(listed(&db, false, now), 0);
+        assert_eq!(listed(&db, true, now), 1);
+    }
+
+    #[test]
+    fn recent_done_thread_shown() {
+        let (db, last) = done_thread();
+        assert_eq!(listed(&db, false, last + 60), 1);
+    }
+
+    #[test]
+    fn old_open_thread_shown() {
+        let (db, _, sub) = setup(TaskStatus::InProgress);
+        let last = db.last_activity(&[sub]).unwrap()[&sub];
+        assert_eq!(listed(&db, false, last + DONE_KEEP_SECS + 1), 1);
     }
 }
