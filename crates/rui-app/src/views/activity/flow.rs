@@ -4,7 +4,8 @@ use super::{ThreadsView, loop_dots, mono};
 use crate::api::{Node, Thread};
 use crate::theme::{Status, Theme};
 use crate::views::roster::Loops;
-use gpui::{AnyElement, Context, FontWeight, div, prelude::*, px};
+use gpui::{AnyElement, Bounds, Context, FontWeight, Hsla, PathBuilder, Pixels, Window, canvas, div, point, prelude::*, px};
+use std::collections::HashMap;
 
 /// Lanes top to bottom: daemon lane key and its label.
 pub const LANES: [(&str, &str); 3] = [("in", "Came in"), ("work", "Agent work"), ("out", "Went out")];
@@ -14,6 +15,11 @@ const COL_W: f32 = 196.;
 const CHIP_W: f32 = 180.;
 /// Room above the lanes for the "now" label.
 const TOP: f32 = 18.;
+/// Middle of a chip from its top edge (a chip with its meta line is about 50 px tall).
+const CHIP_MID: f32 = 25.;
+
+/// A point on the track, in pixels from its top-left corner.
+type Point = (f32, f32);
 
 /// A node's slot on the chart: lane row, column, and whether it is still planned.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +51,36 @@ pub fn layout(nodes: &[Node]) -> (Vec<Slot>, usize) {
     (order.iter().enumerate().map(slot).collect(), now)
 }
 
+/// One connector per `after` edge: from the right middle of the earlier chip to the left middle of the later one.
+pub fn edges(nodes: &[Node], slots: &[Slot]) -> Vec<(Point, Point)> {
+    let at: HashMap<&str, &Slot> = slots.iter().map(|s| (nodes[s.node].id.as_str(), s)).collect();
+    let mut out = Vec::new();
+    for s in slots {
+        let froms = nodes[s.node].after.iter().filter_map(|a| at.get(a.as_str()));
+        out.extend(froms.map(|from| (chip_side(from, CHIP_W), chip_side(s, 0.))));
+    }
+    out
+}
+
+/// A point on a chip's middle line, `dx` from its left edge.
+fn chip_side(s: &Slot, dx: f32) -> Point {
+    (s.col as f32 * COL_W + 8. + dx, TOP + s.lane as f32 * LANE_H + 8. + CHIP_MID)
+}
+
+/// Thin S-curves between chips, behind them.
+fn paint_edges(b: Bounds<Pixels>, edges: &[(Point, Point)], color: Hsla, window: &mut Window) {
+    let at = |(x, y): Point| point(b.left() + px(x), b.top() + px(y));
+    for &(from, to) in edges {
+        let k = (to.0 - from.0).abs() * 0.5;
+        let mut pb = PathBuilder::stroke(px(1.));
+        pb.move_to(at(from));
+        pb.cubic_bezier_to(at(to), at((from.0 + k, from.1)), at((to.0 - k, to.1)));
+        if let Ok(path) = pb.build() {
+            window.paint_path(path, color);
+        }
+    }
+}
+
 /// Colour family for a node status (see the mapping table in docs/thread-view-spec.md).
 pub fn node_style<'a>(status: &str, th: &'a Theme) -> &'a Status {
     match status {
@@ -74,7 +110,10 @@ impl ThreadsView {
         let area = div().relative().w(px(cols as f32 * COL_W + 24.)).h(px(TOP + LANE_H * 3.));
         let rules = (1..3).map(|i| lane_rule(i, th));
         let chips: Vec<AnyElement> = slots.iter().map(|s| self.placed_chip(t, s, th, cx)).collect();
-        area.children(rules).child(now_line(now, th)).children(chips).into_any_element()
+        let (lines, color) = (edges(&t.nodes, &slots), th.fg.opacity(0.28));
+        let links = canvas(|_, _, _| (), move |b, _, window, _| paint_edges(b, &lines, color, window));
+        let area = area.children(rules).child(links.absolute().top_0().left_0().size_full());
+        area.child(now_line(now, th)).children(chips).into_any_element()
     }
 
     fn placed_chip(&self, t: &Thread, s: &Slot, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -151,6 +190,17 @@ mod tests {
         assert_eq!(planned, [false, false, false, true, true]);
         assert_eq!(slots.iter().map(|s| s.lane).collect::<Vec<_>>(), [0, 1, 2, 1, 2]);
         assert_eq!(slots.iter().map(|s| s.col).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn after_edges_join_chip_sides() {
+        let mut b = node("b", "work", "running", "2026-11-18 10:05:00");
+        b.after = vec!["a".into(), "missing".into()];
+        let nodes = vec![node("a", "in", "done", "2026-11-18 10:00:00"), b];
+        let (slots, _) = layout(&nodes);
+        let e = edges(&nodes, &slots);
+        assert_eq!(e, vec![((8. + CHIP_W, TOP + 8. + CHIP_MID), (COL_W + 8., TOP + LANE_H + 8. + CHIP_MID))]);
+        assert!(edges(&nodes[..1], &layout(&nodes[..1]).0).is_empty());
     }
 
     #[test]

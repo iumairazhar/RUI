@@ -7,6 +7,8 @@ mod team_view;
 mod teams;
 mod timeline;
 
+pub use timeline::local_offset;
+
 use super::live::live_action;
 use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files};
 use super::character::{char_state, character};
@@ -18,6 +20,7 @@ use teams::can_stop;
 use super::section::{Sec, section_top};
 use super::status::{self, Word, thread_word, word_of};
 use super::{chip, markdown, primary_button, tag};
+use super::decision::{self, CardEvent, Cards};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
 use crate::store::{self, Store};
@@ -317,6 +320,8 @@ pub struct ThreadsView {
     inspect: Option<inspector::Inspect>,
     /// Note sent with "Hand back".
     note: Entity<TextInput>,
+    /// Decision cards for the Home strip and the inspector.
+    cards: Cards,
 }
 
 impl ThreadsView {
@@ -332,7 +337,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default() }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -358,6 +363,45 @@ impl ThreadsView {
             s.watch_thread(top.then_some(id), cx);
         });
         cx.notify();
+    }
+
+    /// A decision card asked to open its thread, on its node or on the Changes tab.
+    fn on_card(&mut self, ev: &CardEvent, cx: &mut Context<Self>) {
+        match ev {
+            CardEvent::Open { thread_id, node_id } => {
+                self.open_thread(*thread_id, cx);
+                self.inspect(*thread_id, node_id.clone(), cx);
+            }
+            CardEvent::Review { thread_id } => self.show_changes(*thread_id, cx),
+        }
+    }
+
+    /// Open a task page on its Changes tab.
+    pub fn show_changes(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_thread(id, cx);
+        self.set_tab(Tab::Changes);
+    }
+
+    /// Every needs-you decision across threads, highest risk first, plus answers still being sent.
+    fn needs_cards(&self, cx: &Context<Self>) -> Vec<decision::CardData> {
+        let s = self.store.read(cx);
+        let ids: Vec<i64> = s.threads.iter().filter(|t| t.needs_you_count > 0).map(|t| t.id).collect();
+        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).collect();
+        let mut cards = decision::with_sending(cards, s, |_| true);
+        decision::sort_cards(&mut cards);
+        cards
+    }
+
+    /// The Home strip above the board: one compact card per decision.
+    fn needs_strip(&mut self, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let data = self.needs_cards(cx);
+        if data.is_empty() {
+            return None;
+        }
+        let cards: Vec<AnyElement> = data.iter().map(|d| self.cards.get(d, true, &self.store, Self::on_card, cx).into_any_element()).collect();
+        let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child("Needs you");
+        let row = div().flex().flex_wrap().gap(px(10.)).children(cards);
+        Some(div().id("needs-strip").flex().flex_col().gap(px(8.)).pt(px(16.)).mr(px(40.)).child(head).child(row).into_any_element())
     }
 
     fn toggle_row(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -1132,7 +1176,8 @@ impl Render for ThreadsView {
             return self.task_page(&t, &threads, now, &th, cx);
         }
         let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
-        let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll();
+        let strip = self.needs_strip(&th, cx);
+        let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll().children(strip);
         // Tasks first; the four-hour chart sits below them.
         let body = body.child(board).child(timeline::view(chart, &th));
         let confirm = self.confirm_view(&th, cx);

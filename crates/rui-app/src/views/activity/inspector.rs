@@ -4,6 +4,7 @@ use super::flow::node_style;
 use super::{ThreadsView, mono, section, summarize};
 use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
+use crate::views::decision::{CardData, first_line};
 use crate::views::library::{after_slide, close_button, scrim, slide_overlay};
 use crate::views::status::thread_word;
 use crate::views::{chip, primary_button, tag};
@@ -170,14 +171,29 @@ impl ThreadsView {
     }
 
     /// The sliding panel over the task page, when a node is open.
-    pub(super) fn inspector_view(&self, thread: Option<&Thread>, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn inspector_view(&mut self, thread: Option<&Thread>, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = thread?;
+        let node = self.inspected_node(t, cx)?;
+        let card = CardData::from_node(t, &node).map(|d| self.cards.get(&d, false, &self.store, Self::on_card, cx).into_any_element());
         let i = self.inspect.as_ref()?;
-        let node = thread?.nodes.iter().find(|n| n.id == i.node_id)?;
         let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).pb(px(20.));
-        let body = body.flex().flex_col().gap(px(18.)).children(self.controls(node, i, th, cx)).children(self.sections(node, i, th, cx));
-        let panel = panel_shell(th).child(self.inspector_head(node, th, cx)).child(body);
+        let body = body.flex().flex_col().gap(px(18.)).children(card).children(self.controls(&node, i, th, cx));
+        let body = body.children(self.sections(&node, i, th, cx));
+        let panel = panel_shell(th).child(self.inspector_head(&node, th, cx)).child(body);
         let back = scrim("inspector-scrim", Self::close_inspector, cx);
         Some(slide_overlay("inspector", back, panel.into_any_element(), i.closing))
+    }
+
+    /// The open node; a question just answered is gone from the thread, so it comes from the held answer.
+    fn inspected_node(&self, t: &Thread, cx: &Context<Self>) -> Option<Node> {
+        let id = &self.inspect.as_ref()?.node_id;
+        if let Some(n) = t.nodes.iter().find(|n| &n.id == id) {
+            return Some(n.clone());
+        }
+        let held = self.store.read(cx).sending.values().find(|s| s.card.thread_id == t.id && &s.card.node_id == id)?;
+        let d = held.card.decision.clone();
+        let title = first_line(&d.ask);
+        Some(Node { id: id.clone(), kind: "decision".into(), status: "needs_you".into(), title, decision: Some(d), ..Default::default() })
     }
 
     fn inspector_head(&self, n: &Node, th: &Theme, cx: &mut Context<Self>) -> AnyElement {

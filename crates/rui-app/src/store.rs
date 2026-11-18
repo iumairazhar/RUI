@@ -1,7 +1,8 @@
 //! Shared app state, refreshed from the daemon once a second.
 
-use crate::api::{self, AppInfo, Change, InboxItem, LiveSnapshot, OwnerState, ResultFile, RoleInfo, SkillInfo, ThreadSummary};
+use crate::api::{self, AppInfo, Change, InboxItem, LiveSnapshot, OwnerState, ResultFile, RoleInfo, SkillInfo, ThreadSummary, Undo};
 use crate::notify;
+use crate::views::decision::CardData;
 use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity, Global};
 use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Task, TaskRun};
@@ -23,6 +24,22 @@ type Snapshot = (Core, Extras);
 pub struct ResultRequest {
     pub task_id: i64,
     pub path: String,
+}
+
+/// An owner answer held in its undo window, with the card it was given on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sending {
+    pub undo: Undo,
+    pub card: CardData,
+}
+
+/// An inbox item's identity: (kind, id).
+pub type ItemKey = (String, i64);
+
+/// Unix seconds now.
+pub fn now_secs() -> i64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// The app's store as a global, so click handlers without a view can reach it.
@@ -90,6 +107,14 @@ pub struct Store {
     pub tabs: HashMap<&'static str, usize>,
     /// Toast confirming the last owner action; hides after a few seconds.
     pub toast: Option<Toast>,
+    /// Answers still inside their undo window, by question id.
+    pub sending: HashMap<i64, Sending>,
+    /// Inbox items hidden until a unix time. Kept in memory only: the app has no saved prefs yet.
+    pub snoozed: HashMap<ItemKey, i64>,
+    /// Set with `open_task` to show the task page's Changes tab; the root clears it.
+    pub open_changes: bool,
+    /// (updated_at, needs-you count) of each needs-you thread when it was last loaded.
+    needs_marks: HashMap<i64, (String, usize)>,
     /// Task whose changes and events are reloaded on every poll.
     watched: Option<i64>,
     /// Thread reloaded into `thread_cache` on every poll (the open task page's).
@@ -215,6 +240,10 @@ impl Store {
             open_task: None,
             tabs: HashMap::new(),
             toast: None,
+            sending: HashMap::new(),
+            snoozed: HashMap::new(),
+            open_changes: false,
+            needs_marks: HashMap::new(),
             watched: None,
             watched_thread: None,
             seen_inbox: HashSet::new(),
@@ -340,6 +369,9 @@ impl Store {
             }
         }
         self.reload_changes(cx);
+        self.load_needs_you(cx);
+        let now = now_secs();
+        self.sending.retain(|_, s| s.undo.run_at > now);
         if let Some(id) = self.watched_thread {
             self.load_thread(id, cx);
         }
@@ -433,6 +465,17 @@ impl Store {
         .detach();
     }
 
+    /// Load every thread that needs the owner and changed since it was last loaded (for Home).
+    fn load_needs_you(&mut self, cx: &mut Context<Self>) {
+        let mark = |t: &ThreadSummary| (t.updated_at.clone(), t.needs_you_count);
+        let due: Vec<(i64, (String, usize))> = self.threads.iter().filter(|t| t.needs_you_count > 0)
+            .filter(|t| self.needs_marks.get(&t.id) != Some(&mark(t))).map(|t| (t.id, mark(t))).collect();
+        for (id, m) in due {
+            self.needs_marks.insert(id, m);
+            self.load_thread(id, cx);
+        }
+    }
+
     /// Run a daemon call in the background, record any failure, then refresh.
     fn act(&mut self, call: impl FnOnce() -> anyhow::Result<()> + Send + 'static, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -517,6 +560,30 @@ impl Store {
     pub fn drop_task(&mut self, id: i64, cx: &mut Context<Self>) {
         self.show_toast("Dropped", vec![format!("Thread {id}")], cx);
         self.act(move || api::drop_task(id), cx);
+    }
+
+    /// Release a step held at a checkpoint, then refresh.
+    pub fn release_step(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Released this step", vec![format!("Task {id}")], cx);
+        self.act(move || api::set_checkpoint(id, false), cx);
+    }
+
+    /// Ask the root to open a task page on its Changes tab.
+    pub fn open_changes(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_changes = true;
+        self.open_thread(id, cx);
+    }
+
+    /// Hide an inbox item until `until` (unix seconds).
+    pub fn snooze(&mut self, key: ItemKey, until: i64, cx: &mut Context<Self>) {
+        self.snoozed.insert(key, until);
+        self.show_toast("Snoozed", vec![], cx);
+    }
+
+    /// Show a snoozed inbox item again.
+    pub fn unsnooze(&mut self, key: &ItemKey, cx: &mut Context<Self>) {
+        self.snoozed.remove(key);
+        cx.notify();
     }
 
     /// Retry a stuck task, then refresh.
@@ -632,6 +699,48 @@ impl Store {
 }
 
 impl Store {
+    /// Answer a decision card's question; a held answer is kept in `sending` until its undo window ends.
+    pub fn answer_decision(&mut self, card: CardData, text: String, why: Option<String>, cx: &mut Context<Self>) {
+        let Some(qid) = card.decision.question_id else { return };
+        cx.spawn(async move |this, cx| {
+            let call = async move { api::post_answer(qid, &text, why.as_deref()) };
+            let res = cx.background_executor().spawn(call).await;
+            this.update(cx, |s, cx| s.answered(qid, card, res, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn answered(&mut self, qid: i64, card: CardData, res: anyhow::Result<Option<Undo>>, cx: &mut Context<Self>) {
+        self.action_error = res.as_ref().err().map(|e| format!("Request failed: {e}"));
+        match res {
+            Ok(Some(undo)) => {
+                self.sending.insert(qid, Sending { undo, card });
+                self.show_toast("Sending your answer\u{2026}", vec!["You can still undo it".into()], cx);
+            }
+            Ok(None) => self.show_toast("Sent down", vec![], cx),
+            Err(e) => self.show_toast("Couldn't send your answer", vec![short(&e.to_string())], cx),
+        }
+        self.refresh(cx);
+    }
+
+    /// Take back a held answer by its event id; the question opens again.
+    pub fn undo_answer(&mut self, event_id: i64, cx: &mut Context<Self>) {
+        self.sending.retain(|_, s| s.undo.event_id != event_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { api::cancel_approval(event_id) }).await;
+            this.update(cx, |s, cx| {
+                match res {
+                    Ok(_) => s.show_toast("Answer undone", vec!["The question is open again".into()], cx),
+                    Err(e) => s.show_toast("Too late to undo", vec![short(&e.to_string())], cx),
+                }
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Answer one of Rui's asks, then refresh. A failure lands in `action_error`.
     pub fn answer_ask(&mut self, ask_id: i64, text: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -655,6 +764,11 @@ pub fn pickup_who(q: &Question) -> String {
         Some(rung) => rung.who.clone(),
         None => q.asked_by.as_str().to_string(),
     }
+}
+
+/// Error text cut to fit a toast chip.
+fn short(e: &str) -> String {
+    e.chars().take(80).collect()
 }
 
 fn file_text(res: anyhow::Result<api::TaskFile>) -> Result<String, String> {

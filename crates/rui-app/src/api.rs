@@ -476,7 +476,6 @@ pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
 
 /// How to undo a held owner answer before `run_at` (unix seconds).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)] // read by the decision card's "Sending… Undo" (thread page step)
 pub struct Undo {
     pub event_id: i64,
     #[serde(default)]
@@ -729,7 +728,6 @@ pub fn hand_back(id: i64, note: &str, force: bool) -> Result<HandBack> {
 }
 
 /// Undo a held owner answer inside its window; returns the reopened question.
-#[allow(dead_code)] // used by the decision card's "Sending… Undo" (next step)
 pub fn cancel_approval(event_id: i64) -> Result<Question> {
     Ok(serde_json::from_value(library("POST", &format!("/approvals/{event_id}/cancel"), None)?)?)
 }

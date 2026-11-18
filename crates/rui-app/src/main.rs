@@ -22,6 +22,7 @@ use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
     activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, clients,
+    inbox::{InboxPanel, PanelEvent},
     library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
 };
 
@@ -145,6 +146,9 @@ struct Root {
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
     results: Entity<ResultsView>,
+    /// The Inbox slide-over, shown over the current page while `inbox_open`.
+    inbox: Entity<InboxPanel>,
+    inbox_open: bool,
 }
 
 impl Root {
@@ -166,7 +170,8 @@ impl Root {
                 this.select(Nav::Work, cx);
             }
             if let Some(id) = store.update(cx, |s, _| s.open_task.take()) {
-                this.activity.update(cx, |v, cx| v.open_thread(id, cx));
+                let changes = store.update(cx, |s, _| std::mem::take(&mut s.open_changes));
+                this.activity.update(cx, |v, cx| if changes { v.show_changes(id, cx) } else { v.open_thread(id, cx) });
             }
             if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
                 this.results.update(cx, |v, cx| v.open(req, cx));
@@ -174,7 +179,11 @@ impl Root {
             cx.notify();
         })
         .detach();
+        let inbox = cx.new(|cx| InboxPanel::new(store.clone(), cx));
+        cx.subscribe(&inbox, |this, _, ev: &PanelEvent, cx| this.panel_event(ev, cx)).detach();
         Self {
+            inbox,
+            inbox_open: false,
             nav: Nav::from_env(),
             pill_from: Nav::from_env(),
             pill_seq: 0,
@@ -283,9 +292,32 @@ impl Root {
             .children(error.map(|e| e.text_size(px(12.))))
     }
 
+    /// Inbox items that are not snoozed.
     fn open_questions(&self, cx: &Context<Self>) -> usize {
         let s = self.store.read(cx);
-        s.inbox.len()
+        views::inbox::awake_count(&s.inbox, &s.snoozed, store::now_secs())
+    }
+
+    /// The rail's Inbox item opens the slide-over over the current page, or closes it.
+    fn toggle_inbox(&mut self, cx: &mut Context<Self>) {
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
+            return;
+        }
+        self.inbox_open = true;
+        self.inbox.update(cx, |p, cx| p.opened(cx));
+        cx.notify();
+    }
+
+    fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {
+        self.inbox_open = false;
+        if let PanelEvent::OpenFull(item) = ev {
+            self.select(Nav::Inbox, cx);
+            if let Some((kind, id)) = item.clone() {
+                self.questions.update(cx, |q, cx| q.open_kind(&kind, id, cx));
+            }
+        }
+        cx.notify();
     }
 
     fn badge(&self, th: &Theme, count: usize) -> impl IntoElement + use<> {
@@ -333,7 +365,10 @@ impl Root {
             .justify_center()
             .cursor_pointer()
             .child(icon)
-            .on_click(cx.listener(move |this, _, _, cx| this.select(nav, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| match nav {
+                Nav::Inbox => this.toggle_inbox(cx),
+                _ => this.select(nav, cx),
+            }))
             .tooltip(move |_, cx| cx.new(|_| Tooltip(label.into())).into());
         let item = if active { item } else { item.hover(move |s| s.bg(hairline)) };
         let count = if nav == Nav::Inbox { self.open_questions(cx) } else { 0 };
@@ -432,6 +467,7 @@ impl Render for Root {
             .child(self.rail(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
             .children(self.results.read(cx).is_open().then(|| self.results.clone()))
+            .children(self.inbox_open.then(|| self.inbox.clone()))
     }
 }
 
