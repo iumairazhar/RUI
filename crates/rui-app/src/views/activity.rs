@@ -1,5 +1,7 @@
 //! Threads: the board of agent threads, with a full task page for the open one.
 
+mod flow;
+mod inspector;
 mod task_page;
 mod team_view;
 mod teams;
@@ -256,6 +258,7 @@ fn board_word(task_word: Word, state: &str) -> Word {
 /// Tab of the task page.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
+    Flow,
     Trace,
     Changes,
     Files,
@@ -310,6 +313,10 @@ pub struct ThreadsView {
     stopping: HashMap<i64, Instant>,
     /// The "Stop every running team?" confirm is open.
     confirm_all: bool,
+    /// The Flow node open in the inspector.
+    inspect: Option<inspector::Inspect>,
+    /// Note sent with "Hand back".
+    note: Entity<TextInput>,
 }
 
 impl ThreadsView {
@@ -323,7 +330,9 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
+        let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
+        cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -337,12 +346,17 @@ impl ThreadsView {
         self.stop_open = false;
         self.abandon_armed = false;
         self.why.update(cx, |i, cx| i.clear(cx));
-        self.set_tab(Tab::Trace);
+        let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
+        self.set_tab(if top { Tab::Flow } else { Tab::Trace });
         self.file = None;
+        self.inspect = None;
         self.auto_results = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.status == TaskStatus::Done);
         self.expanded.clear();
         self.input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.load_changes(Some(id), cx));
+        self.store.update(cx, |s, cx| {
+            s.load_changes(Some(id), cx);
+            s.watch_thread(top.then_some(id), cx);
+        });
         cx.notify();
     }
 
@@ -385,7 +399,11 @@ impl ThreadsView {
         self.open = None;
         self.stop_open = false;
         self.abandon_armed = false;
-        self.store.update(cx, |s, cx| s.load_changes(None, cx));
+        self.inspect = None;
+        self.store.update(cx, |s, cx| {
+            s.load_changes(None, cx);
+            s.watch_thread(None, cx);
+        });
         cx.notify();
     }
 
@@ -511,8 +529,9 @@ impl ThreadsView {
         ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
-    fn tabs(&self, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = vec![(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")];
+    fn tabs(&self, has_flow: bool, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut tabs = if has_flow { vec![(Tab::Flow, "Flow")] } else { vec![] };
+        tabs.extend([(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
         if has_results {
             tabs.push((Tab::Results, "Results"));
         }

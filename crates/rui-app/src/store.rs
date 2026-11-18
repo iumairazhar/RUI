@@ -55,7 +55,6 @@ pub struct Store {
     /// Threads for the Work board, needs-you first; refreshed every poll.
     pub threads: Vec<ThreadSummary>,
     /// Full threads loaded on demand by id (see `load_thread`).
-    #[allow(dead_code)] // read by the thread page (next step)
     pub thread_cache: HashMap<i64, api::Thread>,
     /// Newest events, oldest first (at most 300).
     pub events: Vec<Event>,
@@ -93,6 +92,8 @@ pub struct Store {
     pub toast: Option<Toast>,
     /// Task whose changes and events are reloaded on every poll.
     watched: Option<i64>,
+    /// Thread reloaded into `thread_cache` on every poll (the open task page's).
+    watched_thread: Option<i64>,
     /// (kind, id) of inbox items already seen, so only new ones notify.
     seen_inbox: HashSet<(String, i64)>,
     /// The inbox has loaded once; the first load never notifies.
@@ -215,6 +216,7 @@ impl Store {
             tabs: HashMap::new(),
             toast: None,
             watched: None,
+            watched_thread: None,
             seen_inbox: HashSet::new(),
             inbox_loaded: false,
         }
@@ -338,6 +340,9 @@ impl Store {
             }
         }
         self.reload_changes(cx);
+        if let Some(id) = self.watched_thread {
+            self.load_thread(id, cx);
+        }
         cx.notify();
     }
 
@@ -404,8 +409,15 @@ impl Store {
         .detach();
     }
 
+    /// Load a thread now and reload it on every poll; `None` stops reloading.
+    pub fn watch_thread(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        self.watched_thread = id;
+        if let Some(id) = id {
+            self.load_thread(id, cx);
+        }
+    }
+
     /// Fetch one full thread into `thread_cache`; keep the old copy on error.
-    #[allow(dead_code)] // called by the thread page (next step)
     pub fn load_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move { api::get_thread(id) }).await;

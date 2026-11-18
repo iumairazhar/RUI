@@ -491,7 +491,6 @@ pub fn post_answer(question_id: i64, answer: &str, why: Option<&str>) -> Result<
 }
 
 // ---- threads: mirrors of crates/rui-daemon/src/thread.rs ----
-// Items marked dead_code are read by the thread page and inspector, built in the next step.
 
 /// A thread's client: id and name.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -523,7 +522,6 @@ pub struct ThreadSummary {
 
 /// Loops a subtask used out of its maximum.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Attempts {
     #[serde(default)]
     pub used: i64,
@@ -533,7 +531,6 @@ pub struct Attempts {
 
 /// Where to review the change behind a decision.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct ReviewRef {
     #[serde(default)]
     pub kind: String,
@@ -545,7 +542,6 @@ pub struct ReviewRef {
 
 /// What a node asks the owner to decide.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Decision {
     #[serde(default)]
     pub source: String,
@@ -575,7 +571,6 @@ pub struct Decision {
 
 /// What a node produced: tests, a pull request, a file.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Output {
     #[serde(default)]
     pub kind: String,
@@ -591,7 +586,6 @@ pub struct Output {
 
 /// One step of a thread, in lane `in`, `work` or `out`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Node {
     pub id: String,
     #[serde(default)]
@@ -628,7 +622,6 @@ pub struct Node {
 
 /// One thread with all its nodes, from `GET /threads/{id}`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Thread {
     pub id: i64,
     #[serde(default)]
@@ -653,7 +646,6 @@ pub struct Thread {
 
 /// One run of a done check.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct DoneCheck {
     #[serde(default)]
     pub passed: bool,
@@ -663,7 +655,6 @@ pub struct DoneCheck {
 
 /// One page of a node's events, its cost and done checks.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct Inspector {
     #[serde(default)]
     pub node_id: String,
@@ -679,7 +670,6 @@ pub struct Inspector {
 
 /// Reply to a take-over: the worktree and branch the owner works in.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct TakeOver {
     #[serde(default)]
     pub worktree: Option<String>,
@@ -689,7 +679,6 @@ pub struct TakeOver {
 
 /// Reply to a hand-back: the check result and the step's new status.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct HandBack {
     #[serde(default)]
     pub status: String,
@@ -719,32 +708,28 @@ fn node_path(id: i64, node_id: &str, after_id: Option<i64>) -> String {
 }
 
 /// Fetch one page of a node's events, cost and done checks.
-#[allow(dead_code)]
 pub fn get_thread_node(id: i64, node_id: &str, after_id: Option<i64>) -> Result<Inspector> {
     Ok(serde_json::from_value(get(&node_path(id, node_id, after_id))?)?)
 }
 
 /// Hold a subtask that has not started (`on`), or release it. Errors carry the daemon's text.
-#[allow(dead_code)]
 pub fn set_checkpoint(id: i64, on: bool) -> Result<()> {
     library("POST", &format!("/tasks/{id}/checkpoint"), Some(serde_json::json!({ "on": on }))).map(|_| ())
 }
 
 /// Stop a subtask's agent so the owner can do the step by hand.
-#[allow(dead_code)]
 pub fn take_over(id: i64) -> Result<TakeOver> {
     Ok(serde_json::from_value(library("POST", &format!("/tasks/{id}/take-over"), None)?)?)
 }
 
 /// Give a taken-over step back with a note; `force` lands it even if its check fails.
-#[allow(dead_code)]
 pub fn hand_back(id: i64, note: &str, force: bool) -> Result<HandBack> {
     let body = serde_json::json!({ "note": note, "force": force });
     Ok(serde_json::from_value(library("POST", &format!("/tasks/{id}/hand-back"), Some(body))?)?)
 }
 
 /// Undo a held owner answer inside its window; returns the reopened question.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by the decision card's "Sending… Undo" (next step)
 pub fn cancel_approval(event_id: i64) -> Result<Question> {
     Ok(serde_json::from_value(library("POST", &format!("/approvals/{event_id}/cancel"), None)?)?)
 }
