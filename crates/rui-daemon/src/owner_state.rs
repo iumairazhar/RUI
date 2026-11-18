@@ -8,8 +8,6 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Landed work finished before this moment counts as already reviewed.
-const REVIEW_SINCE: &str = "2026-11-18 00:00:00";
 /// The reason line of a finished task that waits for the owner's review.
 pub const REVIEW_REASON: &str = "Finished, review the result";
 const CAUSES: [&str; 7] = ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit"];
@@ -189,21 +187,17 @@ fn file_count(files: &Value) -> usize {
     files.as_array().map(Vec::len).or_else(|| files.as_u64().map(|n| n as usize)).unwrap_or(0)
 }
 
-/// Time as "YYYY-MM-DD HH:MM:SS..." so stored ISO times compare with `REVIEW_SINCE`.
-fn normalized(ts: &str) -> String {
-    ts.replacen('T', " ", 1)
-}
-
 fn done_state(t: &Task, ev: &[Event]) -> (&'static str, String) {
     if latest_id(ev, "dropped") > 0 {
         return ("Done", "Dropped by you".into());
     }
-    let reviewed = ev.iter().any(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok");
-    if reviewed {
-        return ("Done", "Reviewed by you".into());
-    }
-    if t.parent_id.is_none() && normalized(&t.updated_at).as_str() >= REVIEW_SINCE {
+    let approved = ev.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
+    let forwarded = latest_id(ev, "forwarded");
+    if t.parent_id.is_none() && forwarded > approved {
         return ("Needs you", REVIEW_REASON.into());
+    }
+    if approved > 0 {
+        return ("Done", "Reviewed by you".into());
     }
     ("Done", "Finished".into())
 }
@@ -281,7 +275,6 @@ mod tests {
     }
 
     const NEW: &str = "2026-11-19T10:00:00.000Z";
-    const OLD: &str = "2026-11-10T10:00:00.000Z";
 
     fn word(t: &Task, events: &[Event], all: &[Task]) -> (&'static str, String) {
         let s = state(t, events, all, None);
@@ -340,17 +333,20 @@ mod tests {
     }
 
     #[test]
-    fn finished_work_needs_review_only_when_recent() {
-        let recent = task(1, None, TaskStatus::Done, NEW);
-        let old = task(2, None, TaskStatus::Done, OLD);
+    fn finished_work_needs_review_only_when_forwarded() {
+        let top = task(1, None, TaskStatus::Done, NEW);
         let member = task(3, Some(1), TaskStatus::Done, NEW);
-        assert_eq!(word(&recent, &[], &[]), ("Needs you", REVIEW_REASON.into()));
-        assert_eq!(word(&old, &[], &[]), ("Done", "Finished".into()));
-        assert_eq!(word(&member, &[], &[]), ("Done", "Finished".into()));
-        let ok = [ev(1, 1, "reviewed", json!({"verdict": "ok"}))];
-        assert_eq!(word(&recent, &ok, &[]), ("Done", "Reviewed by you".into()));
-        let changes = [ev(1, 1, "reviewed", json!({"verdict": "changes"}))];
-        assert_eq!(word(&recent, &changes, &[]).0, "Needs you");
+        let fwd = ev(1, 1, "forwarded", json!({"remarks": "ok"}));
+        assert_eq!(word(&top, &[], &[]), ("Done", "Finished".into()));
+        assert_eq!(word(&top, &[fwd.clone()], &[]), ("Needs you", REVIEW_REASON.into()));
+        let member_fwd = [ev(1, 3, "forwarded", json!({}))];
+        assert_eq!(word(&member, &member_fwd, &[]), ("Done", "Finished".into()));
+        let ok = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "ok"}))];
+        assert_eq!(word(&top, &ok, &[]), ("Done", "Reviewed by you".into()));
+        let changes = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "changes"}))];
+        assert_eq!(word(&top, &changes, &[]).0, "Needs you");
+        let again = [fwd, ev(2, 1, "reviewed", json!({"verdict": "ok"})), ev(3, 1, "forwarded", json!({}))];
+        assert_eq!(word(&top, &again, &[]), ("Needs you", REVIEW_REASON.into()));
     }
 
     #[test]
