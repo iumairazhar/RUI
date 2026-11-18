@@ -1,5 +1,6 @@
 //! The drop folder `<data_dir>/drop/`: `.eml` and `.ics` files placed there are read on the
-//! heartbeat, stored as events, then moved to `drop/done/`. A file that fails stays put and is retried.
+//! heartbeat. Each file is first renamed into `drop/processing/` (so it is never read twice), then
+//! stored as events and moved to `drop/done/`, or to `drop/failed/` when it cannot be stored.
 
 use crate::db::Db;
 use crate::{email, meeting};
@@ -29,12 +30,26 @@ pub fn scan(db: &Db, data_dir: &Path) -> Result<usize> {
     Ok(n)
 }
 
-/// Stores one file and moves it to done. False for files that are not .eml or .ics.
+/// Claims one file into processing/, stores it, then moves it to done/ or failed/.
+/// False for files that are not .eml or .ics.
 fn handle(db: &Db, data_dir: &Path, path: &Path) -> Result<bool> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
     if ext != "eml" && ext != "ics" {
         return Ok(false);
     }
+    let drop = dir(data_dir);
+    let claimed = move_into(path, &drop.join("processing"))?;
+    match ingest(db, data_dir, &claimed, &ext) {
+        Ok(()) => move_into(&claimed, &drop.join("done")).map(|_| true),
+        Err(e) => {
+            move_into(&claimed, &drop.join("failed"))?;
+            Err(e)
+        }
+    }
+}
+
+/// Reads one claimed file and stores its email or meetings.
+fn ingest(db: &Db, data_dir: &Path, path: &Path, ext: &str) -> Result<()> {
     let raw = String::from_utf8_lossy(&fs::read(path)?).into_owned();
     if ext == "eml" {
         email::receive(db, data_dir, &email::parse_eml(&raw), None, "drop")?;
@@ -42,20 +57,19 @@ fn handle(db: &Db, data_dir: &Path, path: &Path) -> Result<bool> {
     for m in if ext == "ics" { meeting::parse_ics(&raw) } else { vec![] } {
         meeting::receive(db, data_dir, &m, None, "drop")?;
     }
-    move_done(path)?;
-    Ok(true)
+    Ok(())
 }
 
-/// Moves a file into `done/`, prefixing a timestamp when the name is taken.
-fn move_done(path: &Path) -> Result<()> {
-    let done = path.parent().unwrap_or(Path::new(".")).join("done");
-    fs::create_dir_all(&done)?;
+/// Renames a file into `folder` (one atomic rename), prefixing a timestamp when the name is taken.
+fn move_into(path: &Path, folder: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(folder)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let mut to = done.join(&name);
+    let mut to = folder.join(&name);
     if to.exists() {
-        to = done.join(format!("{}-{name}", chrono::Utc::now().format("%Y%m%d%H%M%S%3f")));
+        to = folder.join(format!("{}-{name}", chrono::Utc::now().format("%Y%m%d%H%M%S%3f")));
     }
-    Ok(fs::rename(path, to)?)
+    fs::rename(path, &to)?;
+    Ok(to)
 }
 
 #[cfg(test)]
@@ -94,5 +108,20 @@ mod tests {
         fs::write(drop.join("a.eml"), "From: x@y.z\n\nagain").unwrap();
         assert_eq!(scan(&db, d.path()).unwrap(), 1);
         assert_eq!(fs::read_dir(drop.join("done")).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn a_failed_file_goes_to_failed_and_is_never_read_again() {
+        let (db, d, _) = setup();
+        let drop = dir(d.path());
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(drop.join("bad.eml"), "Subject: no sender\n\nbody").unwrap();
+        assert_eq!(scan(&db, d.path()).unwrap(), 0);
+        assert!(drop.join("failed/bad.eml").exists() && !drop.join("bad.eml").exists());
+        assert!(fs::read_dir(drop.join("processing")).unwrap().next().is_none());
+        assert_eq!(scan(&db, d.path()).unwrap(), 0);
+        fs::write(drop.join("processing/left.eml"), "From: bob@acme.com\n\nhi").unwrap();
+        assert_eq!(scan(&db, d.path()).unwrap(), 0, "a file left in processing is never re-ingested");
+        assert!(email::open_emails(&db).unwrap().is_empty());
     }
 }

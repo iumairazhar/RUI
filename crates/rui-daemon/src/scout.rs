@@ -28,6 +28,10 @@ const RUN_KEY_BASE: i64 = 1 << 40;
 /// Event kinds too noisy for the Scout's events tail.
 const QUIET: [&str; 7] = ["assistant", "toolresult", "result", "init", "other", "skill_used", "tool_call"];
 const TAIL_EVENTS: usize = 25;
+/// How long one Scout turn may run.
+pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// The fallback report of a Scout turn that ran over its limit.
+pub const TIMED_OUT: &str = "Scout timed out";
 
 /// The running-set key of the Scout turn for one request.
 pub fn run_key(request_id: i64) -> i64 {
@@ -131,7 +135,7 @@ pub fn report_text(p: &Value) -> String {
 /// Runs one Scout turn. A turn that ends without a report gets a short one, so it is never re-run.
 pub async fn run(db: &Db, cfg: &Config, live: &Live, task_id: i64, request_id: i64) -> Result<()> {
     let res = match scout_run(db, cfg, task_id, request_id) {
-        Ok(run) => scheduler::run_logged(db, cfg, live, "scout", task_id, run).await.map(|_| ()),
+        Ok(run) => scheduler::within(LIMIT, scheduler::run_logged(db, cfg, live, "scout", task_id, run)).await.map(|_| ()),
         Err(e) => Err(e),
     };
     close_unanswered(db, request_id, res.as_ref().err())?;
@@ -145,6 +149,7 @@ pub fn close_unanswered(db: &Db, request_id: i64, err: Option<&anyhow::Error>) -
         return Ok(());
     }
     let summary = match err {
+        Some(e) if e.is::<scheduler::TimedOut>() => TIMED_OUT.to_string(),
         Some(e) => format!("The Scout could not finish: {e:#}"),
         None => "The Scout finished without a report.".to_string(),
     };
@@ -386,6 +391,14 @@ mod tests {
         close_unanswered(&db, id, None).unwrap();
         assert!(scout_plans(&db).is_empty());
         assert_eq!(inbox_items(&db).unwrap()[0].reason, "The Scout finished without a report.");
+    }
+
+    #[test]
+    fn a_timed_out_turn_gets_the_timeout_report() {
+        let (db, t) = setup();
+        let id = request(&db, t.id, "Q", "owner").unwrap();
+        close_unanswered(&db, id, Some(&anyhow::Error::new(scheduler::TimedOut))).unwrap();
+        assert_eq!(inbox_items(&db).unwrap()[0].reason, TIMED_OUT);
     }
 
     #[test]

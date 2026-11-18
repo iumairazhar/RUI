@@ -190,16 +190,26 @@ fn poll_one(db: &Db, data_dir: &Path, runs: &Runs, gh: GhView, task: &Task, url:
 
 static POLLING: AtomicBool = AtomicBool::new(false);
 
+/// Clears a busy flag when dropped, so a panic cannot leave it set forever.
+struct ClearOnDrop(&'static AtomicBool);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Starts one poll on a blocking thread, unless the last one is still running.
 pub fn spawn_poll(db: Arc<Db>, data_dir: PathBuf, runs: Runs) {
     if POLLING.swap(true, Ordering::SeqCst) {
         return;
     }
+    let guard = ClearOnDrop(&POLLING);
     tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         if let Err(e) = poll(&db, &data_dir, &runs, gh_view) {
             crate::scheduler::report_error(&db, None, &e);
         }
-        POLLING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -418,6 +428,17 @@ mod tests {
         poll(&db, dir.path(), &runs, gh_failing).unwrap();
         assert_eq!(kinds(&db, top.id, "ci_failed").len(), 2);
         assert!(kinds(&db, top.id, "pr_feedback_routed").is_empty(), "busy task: findings wait");
+    }
+
+    #[test]
+    fn a_panicking_poll_still_clears_the_busy_flag() {
+        static BUSY: AtomicBool = AtomicBool::new(true);
+        let res = std::panic::catch_unwind(|| {
+            let _guard = ClearOnDrop(&BUSY);
+            panic!("gh blew up");
+        });
+        assert!(res.is_err());
+        assert!(!BUSY.load(Ordering::SeqCst));
     }
 
     #[test]

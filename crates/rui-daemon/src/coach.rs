@@ -92,12 +92,20 @@ pub fn plan(db: &Db, running: &HashSet<i64>) -> Result<Vec<Action>> {
 /// Runs one Coach turn, then marks the task reviewed whatever happened, so it runs once.
 pub async fn run(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
     let res = match coach_run(db, cfg, task_id) {
-        Ok(run) => scheduler::run_logged(db, cfg, live, "coach", task_id, run).await.map(|_| ()),
+        Ok(run) => scheduler::within(LIMIT, scheduler::run_logged(db, cfg, live, "coach", task_id, run)).await.map(|_| ()),
         Err(e) => Err(e),
     };
-    let error = res.as_ref().err().map(|e| format!("{e:#}"));
-    db.add_event(Some(task_id), "coach", "coach_reviewed", &json!({"error": error}))?;
+    db.add_event(Some(task_id), "coach", "coach_reviewed", &json!({"error": review_error(&res)}))?;
     res
+}
+
+/// How long one Coach turn may run.
+pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The `coach_reviewed` error: "timeout" for a turn that ran over, else the error text.
+pub fn review_error(res: &Result<()>) -> Option<String> {
+    let e = res.as_ref().err()?;
+    Some(if e.is::<scheduler::TimedOut>() { "timeout".into() } else { format!("{e:#}") })
 }
 
 fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
@@ -301,6 +309,13 @@ pub fn with_lesson(old: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timed_out_turn_is_reviewed_with_a_timeout_error() {
+        assert_eq!(review_error(&Err(anyhow::Error::new(scheduler::TimedOut))).as_deref(), Some("timeout"));
+        assert_eq!(review_error(&Err(anyhow::anyhow!("boom"))).as_deref(), Some("boom"));
+        assert_eq!(review_error(&Ok(())), None);
+    }
     use crate::db::NewTask;
     use rui_core::SourceKind;
 
