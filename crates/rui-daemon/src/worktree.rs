@@ -166,6 +166,18 @@ pub fn restore_files(wt: &Path, branch: &str, paths: &[String]) -> anyhow::Resul
     Ok(())
 }
 
+/// Drops files the member added: unstages each one, then deletes it from disk.
+pub fn remove_new_files(wt: &Path, paths: &[String]) -> anyhow::Result<()> {
+    for path in paths {
+        git_stdout(wt, &["rm", "-q", "--cached", "--ignore-unmatch", "--", path])?;
+        let file = wt.join(path);
+        if file.is_file() {
+            std::fs::remove_file(file).context("remove new file")?;
+        }
+    }
+    Ok(())
+}
+
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 
 /// What the branch in `wt` changed relative to main (or master), capped at 60 KB.

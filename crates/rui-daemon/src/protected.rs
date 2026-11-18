@@ -14,18 +14,23 @@ pub struct Protected {
     pub explicit: Vec<String>,
     pub files: HashSet<String>,
     pub check_patterns: bool,
+    /// Test config files (pytest.ini, package.json, ...) are protected too.
+    pub config: bool,
+    /// The done_command runs `make`, so a Makefile counts as a config file.
+    pub make_used: bool,
 }
 
 const TEST_DIRS: [&str; 7] = ["test", "tests", "__tests__", "spec", "specs", "eval", "evals"];
 
 /// Builds the protected set for `sub`. Testers only get the pod's explicit entries.
-pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod, task_branch: &str) -> Result<Protected> {
-    let _ = task_branch;
+pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod) -> Result<Protected> {
     let mut p = Protected { explicit: pod.protected.clone(), ..Protected::default() };
     if sub.agent.as_deref() == Some("tester") {
         return Ok(p);
     }
     p.check_patterns = true;
+    p.config = true;
+    p.make_used = uses_make(sub.done_command.as_deref().unwrap_or(""));
     for sib in siblings {
         if sib.status == TaskStatus::Done && sib.agent.as_deref() == Some("tester") {
             p.files.extend(branch_files(repo_wt, &branch_name(sib.id))?);
@@ -33,6 +38,10 @@ pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod, t
     }
     p.files.extend(done_command_files(repo_wt, sub.done_command.as_deref().unwrap_or("")));
     Ok(p)
+}
+
+fn uses_make(cmd: &str) -> bool {
+    cmd.split_whitespace().any(|t| t == "make" || t == "gmake")
 }
 
 /// Existing files named by a done command (pytest node ids and `./` prefixes are cleaned up).
@@ -77,11 +86,26 @@ fn looks_like_test(path: &str) -> bool {
     py || suffix || infix || name == "conftest.py"
 }
 
-/// True when the path must not be modified or deleted.
+fn is_test_config(path: &str, make_used: bool) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let known = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "package.json"];
+    known.contains(&name)
+        || name.starts_with("jest.config.")
+        || name.starts_with("vitest.config.")
+        || (make_used && name == "Makefile")
+}
+
+/// True when an EXISTING file must not be modified or deleted.
 pub fn is_protected(path: &str, p: &Protected) -> bool {
     p.files.contains(path)
         || p.explicit.iter().any(|e| matches_entry(path, e))
         || (p.check_patterns && looks_like_test(path))
+        || (p.config && is_test_config(path, p.make_used))
+}
+
+/// True when a NEW file must not be added. Config names are allowed when new.
+pub fn is_protected_new(path: &str, p: &Protected) -> bool {
+    p.explicit.iter().any(|e| matches_entry(path, e)) || (p.check_patterns && looks_like_test(path))
 }
 
 /// Files that exist on `task_branch` and that the member modified or deleted in `wt`.
@@ -91,6 +115,19 @@ pub fn touched_existing(wt: &Path, task_branch: &str) -> Result<Vec<String>> {
     for path in out.split('\0').filter(|s| !s.is_empty()) {
         let spec = format!("{task_branch}:{path}");
         if worktree::git(wt, &["cat-file", "-e", &spec])?.status.success() {
+            files.push(path.to_string());
+        }
+    }
+    Ok(files)
+}
+
+/// Files that are not on `task_branch` but exist now: untracked ones plus ones the member added or staged.
+pub fn added_files(wt: &Path, task_branch: &str) -> Result<Vec<String>> {
+    let untracked = worktree::git_stdout(wt, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let added = worktree::git_stdout(wt, &["diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", task_branch])?;
+    let mut files: Vec<String> = Vec::new();
+    for path in untracked.split('\0').chain(added.split('\0')).filter(|s| !s.is_empty()) {
+        if !files.iter().any(|f| f == path) {
             files.push(path.to_string());
         }
     }
@@ -107,6 +144,8 @@ mod tests {
             explicit: explicit.iter().map(|s| s.to_string()).collect(),
             files: files.iter().map(|s| s.to_string()).collect(),
             check_patterns: check,
+            config: false,
+            make_used: false,
         }
     }
 
@@ -167,10 +206,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("run.sh"), "x").unwrap();
         let pod = Pod { roles: vec![], protected: vec!["src/db.rs".into()] };
-        let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod, "b").unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod).unwrap();
         assert!(!tester.check_patterns && tester.files.is_empty());
         assert!(is_protected("src/db.rs", &tester) && !is_protected("tests/a.py", &tester));
-        let member = protected_set(d.path(), &task(None, "./run.sh"), &[], &pod, "b").unwrap();
+        let member = protected_set(d.path(), &task(None, "./run.sh"), &[], &pod).unwrap();
         assert!(member.check_patterns && member.files.contains("run.sh"));
     }
 
@@ -198,5 +237,57 @@ mod tests {
         worktree::restore_files(&wt, &tb, &touched).unwrap();
         assert_eq!(std::fs::read_to_string(wt.join("tests/test_a.py")).unwrap(), "orig");
         assert!(wt.join("src/new.py").exists());
+    }
+
+    fn member(done: &str) -> Protected {
+        let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
+        let d = tempfile::tempdir().unwrap();
+        protected_set(d.path(), &task(None, done), &[], &pod).unwrap()
+    }
+
+    #[test]
+    fn new_files_reject_tests_not_config() {
+        let m = member("pytest");
+        for f in ["tests/test_x.py", "conftest.py", "pkg/conftest.py", "evals/x.json"] {
+            assert!(is_protected_new(f, &m), "{f}");
+        }
+        assert!(!is_protected_new("src/new.py", &m));
+        assert!(!is_protected_new("package.json", &m));
+    }
+
+    #[test]
+    fn existing_config_files_are_protected() {
+        let m = member("pytest");
+        for f in ["package.json", "web/package.json", "pyproject.toml", "jest.config.ts", "vitest.config.mjs", "setup.cfg", "tox.ini", "pytest.ini"] {
+            assert!(is_protected(f, &m), "{f}");
+        }
+        assert!(!is_protected("Makefile", &m));
+        assert!(is_protected("Makefile", &member("make test")));
+        assert!(is_protected("sub/Makefile", &member("gmake")));
+        let pod = Pod { roles: vec![], protected: vec![] };
+        let d = tempfile::tempdir().unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod).unwrap();
+        for f in ["package.json", "pytest.ini", "Makefile", "jest.config.ts"] {
+            assert!(!is_protected(f, &tester), "{f}");
+        }
+    }
+
+    #[test]
+    fn added_files_lists_untracked_and_committed_only() {
+        let (repo, wts) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        git(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("a.py"), "orig").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (wt, _) = worktree::create_worktree(repo.path(), wts.path(), 2, Some(&tb)).unwrap();
+        std::fs::write(wt.join("committed.py"), "c").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "m"]);
+        std::fs::write(wt.join("untracked.py"), "u").unwrap();
+        std::fs::write(wt.join("a.py"), "edited").unwrap();
+        let mut added = added_files(&wt, &tb).unwrap();
+        added.sort();
+        assert_eq!(added, ["committed.py", "untracked.py"]);
     }
 }

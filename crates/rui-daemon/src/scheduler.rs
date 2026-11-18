@@ -1132,7 +1132,7 @@ async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_comm
     Ok(())
 }
 
-/// Undoes edits to protected files. True when something was rejected (the failed loop is counted).
+/// Undoes edits to protected files and removes new protected files. True when something was rejected (the failed loop is counted).
 fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<bool> {
     let client = client_for(db, task)?;
     let parent_id = task.parent_id.context("subtask has no parent")?;
@@ -1140,22 +1140,32 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
     let (task_wt, task_branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), parent_id)?;
     let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
     let siblings = db.subtasks(parent_id)?;
-    let set = protected::protected_set(&task_wt, task, &siblings, &pod, &task_branch)?;
+    let set = protected::protected_set(&task_wt, task, &siblings, &pod)?;
     let mut bad = protected::touched_existing(wt, &task_branch)?;
     bad.retain(|f| protected::is_protected(f, &set));
-    if bad.is_empty() {
+    let mut bad_new = protected::added_files(wt, &task_branch)?;
+    bad_new.retain(|f| protected::is_protected_new(f, &set));
+    if bad.is_empty() && bad_new.is_empty() {
         return Ok(false);
     }
     crate::worktree::restore_files(wt, &task_branch, &bad)?;
-    let files = bad.join(", ");
-    db.add_event(Some(task.id), "scheduler", "protected_rejected", &json!({"files": bad}))?;
+    crate::worktree::remove_new_files(wt, &bad_new)?;
+    record_rejection(db, cfg, task, &bad, &bad_new)?;
+    Ok(true)
+}
+
+/// Records the rejection events and counts the failed loop.
+fn record_rejection(db: &Db, cfg: &Config, task: &Task, bad: &[String], bad_new: &[String]) -> Result<()> {
+    let all: Vec<&String> = bad.iter().chain(bad_new).collect();
+    let files = all.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ");
+    db.add_event(Some(task.id), "scheduler", "protected_rejected", &json!({"files": all, "new": bad_new}))?;
     let text = format!(
         "Your changes to protected files were rejected and undone: {files}. Tests, eval files and files the done_command uses must not be edited, deleted or skipped. Make the done_command pass by doing the job."
     );
     db.add_event(Some(task.id), "scheduler", "instruction", &json!({"text": text}))?;
     let status = count_failed_loop(db, &cfg.data_dir, task, &format!("changed protected files: {files}"))?;
     db.set_task_status(task.id, status)?;
-    Ok(true)
+    Ok(())
 }
 
 /// Commits the worktree; false when there was nothing to commit.
@@ -1339,6 +1349,56 @@ mod tests {
         assert!(events.iter().any(|e| e.kind == "instruction"));
         let after = db.get_task(sub.id).unwrap().unwrap();
         assert_eq!((after.loops_used, after.status), (1, TaskStatus::Open));
+    }
+
+    fn rejected(db: &Db, id: i64) -> bool {
+        db.list_events(Some(id), 50).unwrap().iter().any(|e| e.kind == "protected_rejected")
+    }
+
+    #[test]
+    fn reject_protected_removes_new_conftest() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        std::fs::write(wt.join("conftest.py"), "x").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert!(!wt.join("conftest.py").exists());
+        assert!(rejected(&db, sub.id));
+    }
+
+    #[test]
+    fn reject_protected_restores_edited_package_json() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir_all(repo.path()).unwrap();
+        std::fs::write(repo.path().join("package.json"), "{\"scripts\":{\"test\":\"jest\"}}").unwrap();
+        let (db, cfg, sub, wt) = {
+            let r = repo.path();
+            git_in(r, &["init", "-b", "main"]);
+            git_in(r, &["add", "."]);
+            git_in(r, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "pj"]);
+            let db = Db::open_test();
+            let client = db.create_client("acme", &r.to_string_lossy(), None, &[]).unwrap();
+            let parent = mk(&db, client.id, None, TaskStatus::Split);
+            let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
+            let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+            let worktrees = data.path().join("worktrees");
+            let (_, tb) = ensure_task_worktree(r, &worktrees, parent.id).unwrap();
+            let (wt, _) = create_worktree(r, &worktrees, sub.id, Some(&tb)).unwrap();
+            (db, cfg, sub, wt)
+        };
+        std::fs::write(wt.join("package.json"), "{\"scripts\":{\"test\":\"true\"}}").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("package.json")).unwrap(), "{\"scripts\":{\"test\":\"jest\"}}");
+        assert!(rejected(&db, sub.id));
+    }
+
+    #[test]
+    fn reject_protected_allows_plain_new_source_file() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/new.py"), "x").unwrap();
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert!(wt.join("src/new.py").exists());
     }
 
     #[test]
