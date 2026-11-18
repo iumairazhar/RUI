@@ -4,6 +4,7 @@ goes up through escalate.
 
 You wake for one event at a time: {event}. Start by reading:
 - Client brief history and decisions log: {client_log}
+- Owner knowledge (always wins over anything inferred): {owner_knowledge}
 - Client Playbook: {client_playbook}
 - The client's Pod: {pod_roles_and_skills}
 - The repo (read-only)

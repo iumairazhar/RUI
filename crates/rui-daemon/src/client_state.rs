@@ -14,6 +14,9 @@ pub struct ClientFile {
     pub internal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Email domains that belong to this client, like "acme.com". Used to match emails and meetings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -56,11 +59,12 @@ pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<boo
     fs::create_dir_all(&d)?;
     let old = read_client(data_dir, name)?;
     let kept = old.as_ref().is_some_and(|c| c.internal);
+    let domains = old.as_ref().map(|c| c.domains.clone()).unwrap_or_default();
     let base = old.and_then(|c| c.base);
-    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base };
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains };
     fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
     create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
-    for f in ["briefs.md", "decisions.log", "playbook.md"] {
+    for f in ["briefs.md", "decisions.log", "playbook.md", "knowledge.md"] {
         create_if_missing(&d.join(f), "")?;
     }
     Ok(file)
@@ -142,6 +146,20 @@ pub fn append_playbook(data_dir: &Path, name: &str, text: &str) -> Result<()> {
     append(data_dir, name, "playbook.md", &bullet(text))
 }
 
+/// What the owner told RUI about this client. It always wins over anything inferred.
+pub fn read_knowledge(data_dir: &Path, name: &str) -> Result<String> {
+    read_or_empty(data_dir, name, "knowledge.md")
+}
+
+/// Appends one dated bullet to the client's owner knowledge. Existing lines are never touched.
+pub fn append_knowledge(data_dir: &Path, name: &str, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("text must not be empty");
+    }
+    let day = chrono::Utc::now().format("%Y-%m-%d");
+    append(data_dir, name, "knowledge.md", &bullet(&format!("{day}: {}", text.trim())))
+}
+
 /// The Global Playbook every client shares: `<data_dir>/playbook.md`.
 pub fn global_playbook_path(data_dir: &Path) -> PathBuf {
     data_dir.join("playbook.md")
@@ -176,7 +194,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         ensure(t.path(), "Acme Co", "/r", Some(true)).unwrap();
         let d = dir(t.path(), "Acme Co");
-        for f in ["client.json", "pod.json", "briefs.md", "decisions.log", "playbook.md"] {
+        for f in ["client.json", "pod.json", "briefs.md", "decisions.log", "playbook.md", "knowledge.md"] {
             assert!(d.join(f).exists(), "{f}");
         }
         append_decision(t.path(), "Acme Co", "kept").unwrap();
@@ -202,7 +220,7 @@ mod tests {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"]);
         ensure(t.path(), "A", "/r", None).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "main");
-        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()) };
+        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![] };
         fs::write(dir(t.path(), "A").join("client.json"), serde_json::to_string(&file).unwrap()).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "release");
     }
@@ -234,6 +252,23 @@ mod tests {
         let b = read_briefs(t.path(), "A").unwrap();
         assert!(b.contains("task 7: Title") && b.contains("Body text"));
         assert_eq!(read_playbook(t.path(), "A").unwrap(), "");
+    }
+
+    #[test]
+    fn knowledge_appends_dated_bullets_and_domains_survive_ensure() {
+        let t = tempfile::tempdir().unwrap();
+        ensure(t.path(), "A", "/r", None).unwrap();
+        append_knowledge(t.path(), "A", "Prefers Postgres").unwrap();
+        append_knowledge(t.path(), "A", "Never deploy\non Fridays").unwrap();
+        assert!(append_knowledge(t.path(), "A", "  ").is_err());
+        let k = read_knowledge(t.path(), "A").unwrap();
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!(k, format!("- {day}: Prefers Postgres\n- {day}: Never deploy on Fridays\n"));
+        let path = dir(t.path(), "A").join("client.json");
+        let with = fs::read_to_string(&path).unwrap().replace("\"internal\": false", "\"internal\": false, \"domains\": [\"a.com\"]");
+        fs::write(&path, with).unwrap();
+        assert_eq!(ensure(t.path(), "A", "/r", None).unwrap().domains, vec!["a.com".to_string()]);
+        assert_eq!(read_knowledge(t.path(), "A").unwrap(), k);
     }
 
     #[test]

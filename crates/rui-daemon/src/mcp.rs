@@ -947,10 +947,7 @@ pub mod logic {
     /// Lead changes a subtask's loop limit.
     pub fn set_limit(db: &Db, ctx: &Ctx, a: SetLimitArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
-        if !(1..=20).contains(&a.max_loops) {
-            anyhow::bail!("max_loops must be between 1 and 20");
-        }
-        db.set_max_loops(task.id, a.max_loops)?;
+        crate::control::apply_limit(db, task.id, a.max_loops)?;
         record(db, ctx, Role::Lead, "set_limit", &a)?;
         Ok(json!({"ok": true, "task_id": task.id, "max_loops": a.max_loops}))
     }

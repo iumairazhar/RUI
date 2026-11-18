@@ -5,16 +5,19 @@
 /// Placeholders filled in `builder.md`.
 pub const BUILDER_VARS: [&str; 6] = ["role", "title", "job", "done_command", "progress_file", "playbook"];
 /// Placeholders filled in `decide.md`.
-pub const DECIDE_VARS: [&str; 8] =
-    ["question", "member_role", "subtask_title", "lead_why", "brief", "client_playbook", "global_playbook", "prior_rulings"];
+pub const DECIDE_VARS: [&str; 9] = [
+    "question", "member_role", "subtask_title", "lead_why", "brief", "owner_knowledge", "client_playbook", "global_playbook",
+    "prior_rulings",
+];
 /// Placeholders filled in `rui.md`.
 pub const RUI_VARS: [&str; 1] = ["role_catalog"];
 
 /// Placeholders filled in `account_lead.md`.
-pub const ACCOUNT_LEAD_VARS: [&str; 5] = ["client", "event", "client_log", "client_playbook", "pod_roles_and_skills"];
+pub const ACCOUNT_LEAD_VARS: [&str; 6] =
+    ["client", "event", "client_log", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
 
 /// Placeholders filled in `scout.md`.
-pub const SCOUT_VARS: [&str; 5] = ["question", "asked_by", "brief", "last_check", "events_tail"];
+pub const SCOUT_VARS: [&str; 6] = ["question", "asked_by", "brief", "last_check", "events_tail", "context"];
 
 /// Placeholders filled in `coach.md`.
 pub const COACH_VARS: [&str; 6] = ["title", "brief", "lessons", "client_playbook", "global_playbook", "library"];

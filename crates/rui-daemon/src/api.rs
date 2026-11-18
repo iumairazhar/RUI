@@ -109,6 +109,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::library_api::routes())
         .merge(crate::seats_api::routes())
         .merge(crate::support_api::routes())
+        .merge(crate::inputs_api::routes())
         .with_state(state)
 }
 

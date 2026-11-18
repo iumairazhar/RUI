@@ -515,6 +515,15 @@ fn beat(db: &Db, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
     if let Err(e) = crate::heartbeat::heartbeat(db, &cfg.data_dir, running, snapshot, now) {
         report_error(db, None, &e);
     }
+    inputs_beat(db, &cfg.data_dir, now);
+}
+
+/// Reads the drop folder and asks the Scout for briefs of meetings about to start; errors are logged.
+fn inputs_beat(db: &Db, data_dir: &Path, now: i64) {
+    let res = crate::drop::scan(db, data_dir).and_then(|_| crate::meeting::prep_due(db, data_dir, now));
+    if let Err(e) = res {
+        report_error(db, None, &e);
+    }
 }
 
 pub(crate) fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
@@ -958,6 +967,7 @@ fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Ve
         ("client", client.name.clone()),
         ("event", event.to_string()),
         ("client_log", format!("Briefs:\n{briefs}\n\nDecisions log (latest last):\n{log}")),
+        ("owner_knowledge", client_state::read_knowledge(data_dir, &client.name)?),
         ("client_playbook", client_state::read_playbook(data_dir, &client.name)?),
         ("pod_roles_and_skills", pod_roles_and_skills(data_dir, client)?),
     ])
@@ -1139,6 +1149,7 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
     let mut vars = decide_vars(db, &q, &member, &parent, playbook)?;
     vars.push(("global_playbook", client_state::read_global_playbook(&cfg.data_dir)?));
+    vars.push(("owner_knowledge", client_state::read_knowledge(&cfg.data_dir, &client.name)?));
     let system = prompts::fill(DECIDE_PROMPT, &vars);
     run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
@@ -1642,6 +1653,7 @@ mod tests {
         client_state::ensure(data.path(), "acme", "/repo", None).unwrap();
         client_state::append_brief(data.path(), "acme", 1, "Title", "the brief").unwrap();
         client_state::append_decision(data.path(), "acme", "picked sqlite").unwrap();
+        client_state::append_knowledge(data.path(), "acme", "Owner says: no Docker").unwrap();
         let pod = client_state::Pod {
             roles: vec![client_state::PodRole { role: "backend".into(), skills: vec!["extra-skill".into()] }],
             protected: vec![],
@@ -1652,7 +1664,10 @@ mod tests {
         assert!(get("client_log").contains("the brief") && get("client_log").contains("picked sqlite"));
         assert!(get("pod_roles_and_skills").contains("backend") && get("pod_roles_and_skills").contains("extra-skill"));
         assert_eq!(get("event"), "a new task");
-        assert!(prompts::unfilled(&prompts::fill(ACCOUNT_LEAD_PROMPT, &vars)).is_empty());
+        assert!(get("owner_knowledge").contains("Owner says: no Docker"));
+        let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &vars);
+        assert!(prompts::unfilled(&filled).is_empty());
+        assert!(filled.find("no Docker").unwrap() < filled.find("Client Playbook").unwrap());
     }
 
     #[test]

@@ -34,11 +34,20 @@ pub fn run_key(request_id: i64) -> i64 {
 
 /// Records a `scout_requested` event on the task and returns its id. `by` is "lead" or "owner".
 pub fn request(db: &Db, task_id: i64, question: &str, by: &str) -> Result<i64> {
+    request_with(db, task_id, question, by, json!({}))
+}
+
+/// `request` with extra payload fields, like a meeting's `context` and `meeting_title`.
+pub fn request_with(db: &Db, task_id: i64, question: &str, by: &str, extra: Value) -> Result<i64> {
     let question = question.trim();
     if question.is_empty() {
         bail!("question must not be empty");
     }
-    db.add_event(Some(task_id), by, "scout_requested", &json!({"question": question, "by": by}))
+    let mut payload = json!({"question": question, "by": by});
+    if let (Some(p), Value::Object(more)) = (payload.as_object_mut(), extra) {
+        p.extend(more);
+    }
+    db.add_event(Some(task_id), by, "scout_requested", &payload)
 }
 
 /// Requests with no `scout_report` yet, oldest first.
@@ -83,6 +92,7 @@ pub fn report(db: &Db, request_id: i64, task_id: Option<i64>, r: Report) -> Resu
     let payload = json!({
         "request_event_id": request_id, "question": req.payload["question"], "by": by,
         "summary": r.summary.trim(), "findings": r.findings, "sources": r.sources,
+        "meeting_title": req.payload["meeting_title"],
     });
     let id = db.add_event(req.task_id, "scout", "scout_report", &payload)?;
     if by == "lead" {
@@ -114,6 +124,7 @@ pub async fn run(db: &Db, cfg: &Config, live: &Live, task_id: i64, request_id: i
         Err(e) => Err(e),
     };
     close_unanswered(db, request_id, res.as_ref().err())?;
+    crate::meeting::file_brief(db, &cfg.data_dir, request_id)?;
     res
 }
 
@@ -176,6 +187,7 @@ pub fn scout_vars(db: &Db, task: &Task, req: &Event) -> Result<Vec<(&'static str
         ("brief", brief(db, task)?),
         ("last_check", last_check(db, &ids)?),
         ("events_tail", events_tail(db, &ids)?),
+        ("context", req.payload["context"].as_str().unwrap_or("(none)").to_string()),
     ])
 }
 
@@ -226,21 +238,31 @@ pub fn clip(text: &str, max: usize) -> String {
     format!("{}\u{2026}", text.chars().take(max).collect::<String>())
 }
 
-/// Owner-requested reports not yet dismissed, as Inbox items.
+/// Owner-requested reports and meeting briefs not yet dismissed, as Inbox items.
 pub fn inbox_items(db: &Db) -> Result<Vec<InboxItem>> {
     let evs = db.events_of_kinds(&["scout_report", "scout_report_dismissed"])?;
     let gone: HashSet<i64> = evs.iter().filter_map(|e| e.payload["event_id"].as_i64()).collect();
-    let open = evs.iter().filter(|e| e.kind == "scout_report" && e.payload["by"] == "owner" && !gone.contains(&e.id));
+    let shown = |e: &&Event| e.payload["by"] == "owner" || e.payload["by"] == "meeting";
+    let open = evs.iter().filter(|e| e.kind == "scout_report" && !gone.contains(&e.id)).filter(shown);
     Ok(open.map(inbox_item).collect())
+}
+
+/// "scout" for a diagnosis, "meeting_brief" for a meeting brief, with its title.
+fn kind_and_title(e: &Event) -> (&'static str, String) {
+    match e.payload["meeting_title"].as_str() {
+        Some(t) if e.payload["by"] == "meeting" => ("meeting_brief", format!("Meeting brief: {t}")),
+        _ => ("scout", "Scout diagnosis ready".into()),
+    }
 }
 
 fn inbox_item(e: &Event) -> InboxItem {
     let summary = e.payload["summary"].as_str().unwrap_or_default();
+    let (kind, title) = kind_and_title(e);
     InboxItem {
-        kind: "scout",
+        kind,
         id: e.id,
         task_id: e.task_id,
-        title: "Scout diagnosis ready".into(),
+        title,
         reason: summary.lines().next().unwrap_or_default().to_string(),
         actions: vec!["dismiss".into()],
         created_at: e.created_at.clone(),

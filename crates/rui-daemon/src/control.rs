@@ -199,6 +199,37 @@ pub fn resume_chain(db: &Db, id: i64, by: &str) -> Res<Vec<Task>> {
     Ok(changed)
 }
 
+/// Checks the range and stores a subtask's new loop limit. Shared by the Lead's tool and the owner's button.
+pub fn apply_limit(db: &Db, task_id: i64, max_loops: i64) -> anyhow::Result<()> {
+    if !(1..=20).contains(&max_loops) {
+        anyhow::bail!("max_loops must be between 1 and 20");
+    }
+    db.set_max_loops(task_id, max_loops)
+}
+
+/// True when the newest cause that stopped the task is its loop limit.
+fn stuck_on_limit(db: &Db, task: &Task) -> Res<bool> {
+    const CAUSES: [&str; 5] = ["loop_limit", "stopped", "agent_error", "scheduler_error", "land_failed"];
+    let evs = db.events_for_tasks(&[task.id], &CAUSES, 0, i64::MAX)?;
+    Ok(task.status == TaskStatus::Stuck && evs.last().is_some_and(|e| e.kind == "loop_limit"))
+}
+
+/// The owner raises or lowers a subtask's loop limit. A subtask stuck on its limit that now has
+/// loops left goes back to open, and its stuck team is resumed.
+pub fn set_limit(db: &Db, id: i64, max_loops: i64) -> Res<Task> {
+    let task = load(db, id)?;
+    if task.parent_id.is_none() {
+        return Err(ControlError::Conflict("only a subtask has a loop limit".into()));
+    }
+    apply_limit(db, id, max_loops).map_err(|e| ControlError::Conflict(e.to_string()))?;
+    db.add_event(Some(id), "owner", "limit_set", &json!({"max_loops": max_loops, "by": "owner"}))?;
+    if stuck_on_limit(db, &task)? && max_loops > task.loops_used {
+        db.set_task_status(id, TaskStatus::Open)?;
+        resume_chain(db, id, "owner")?;
+    }
+    load(db, id)
+}
+
 /// "Resuming A and B so C can continue.", or None when nothing was resumed.
 fn resume_note(changed: &[Task], task: &Task) -> Option<String> {
     let names: Vec<&str> = changed.iter().map(|t| t.title.as_str()).collect();
