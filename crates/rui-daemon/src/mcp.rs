@@ -767,7 +767,9 @@ pub mod logic {
         let repo = expand_home(&client.repo_path);
         let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
         let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id, &base)?;
-        crate::worktree::require_failing(&wt, cmd)
+        let checked = crate::worktree::require_failing(&wt, cmd);
+        crate::worktree::reset_worktree(&wt)?;
+        checked
     }
 
     /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
@@ -1682,6 +1684,18 @@ mod tests {
         let mut bad = sub_args("backend", "c");
         bad.depends_on = Some(vec![9999]);
         assert!(logic::create_subtask(&db, data.path(), &ctx, bad).is_err());
+    }
+
+    #[test]
+    fn create_subtask_precheck_leaves_no_side_files() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "touch side.txt; false".into();
+        logic::create_subtask(&db, data.path(), &ctx, a).unwrap();
+        let wt = data.path().join("worktrees").join(format!("task-{}", ctx.task_id.unwrap()));
+        assert!(wt.exists());
+        assert!(!wt.join("side.txt").exists());
     }
 
     #[test]

@@ -392,9 +392,13 @@ pub async fn run_done_command(cwd: &Path, cmd: &str) -> anyhow::Result<DoneCheck
     Ok(DoneCheck { passed: out.status.success(), output_tail: tail(&all, 4096) })
 }
 
-/// Runs `cmd` with `sh -c` in `wt` (5 minute limit). Errors if it exits 0:
-/// a done_command that already passes proves nothing.
+/// Runs `cmd` with `sh -c` in `wt` (5 minute limit). Errors if it exits 0
+/// (it proves nothing) or times out (inconclusive).
 pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
+    require_failing_within(wt, cmd, Duration::from_secs(300))
+}
+
+fn require_failing_within(wt: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
     let mut child = StdCommand::new("sh")
         .args(["-c", cmd])
         .current_dir(wt)
@@ -403,17 +407,25 @@ pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("run done command")?;
-    for _ in 0..3000 {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
         if let Some(status) = child.try_wait()? {
             if status.success() {
                 bail!("done_command already passes; write one that proves the job");
             }
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
     let _ = child.kill();
     let _ = child.wait();
+    bail!("done_command timed out: inconclusive; write a faster check")
+}
+
+/// Discards edits and untracked files left in `wt` (ignored files stay).
+pub fn reset_worktree(wt: &Path) -> anyhow::Result<()> {
+    git_stdout(wt, &["reset", "--hard", "-q"])?;
+    git_stdout(wt, &["clean", "-fd"])?;
     Ok(())
 }
 
@@ -503,6 +515,36 @@ mod tests {
         assert!(require_failing(d.path(), "false").is_ok());
         let e = require_failing(d.path(), "true").unwrap_err();
         assert!(e.to_string().contains("already passes"));
+    }
+
+    #[test]
+    fn require_failing_times_out_as_inconclusive() {
+        let d = tempfile::tempdir().unwrap();
+        let e = require_failing_within(d.path(), "sleep 5", Duration::from_millis(200)).unwrap_err();
+        assert!(e.to_string().contains("inconclusive"));
+        let e = require_failing_within(d.path(), "true", Duration::from_secs(5)).unwrap_err();
+        assert!(e.to_string().contains("already passes"));
+        assert!(require_failing_within(d.path(), "false", Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn reset_worktree_keeps_ignored_files() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        std::fs::write(p.join(".gitignore"), "ign.txt\n").unwrap();
+        std::fs::create_dir_all(p.join(".git/info")).unwrap();
+        std::fs::write(p.join(".git/info/exclude"), ".claude/skills/\n").unwrap();
+        std::fs::create_dir_all(p.join(".claude/skills/x")).unwrap();
+        std::fs::write(p.join(".claude/skills/x/SKILL.md"), "s").unwrap();
+        std::fs::write(p.join("ign.txt"), "i").unwrap();
+        std::fs::write(p.join("junk.txt"), "j").unwrap();
+        std::fs::write(p.join("a.txt"), "edited").unwrap();
+        reset_worktree(p).unwrap();
+        assert!(!p.join("junk.txt").exists());
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "a");
+        assert!(p.join(".claude/skills/x/SKILL.md").exists());
+        assert!(p.join("ign.txt").exists());
     }
 
     #[test]
