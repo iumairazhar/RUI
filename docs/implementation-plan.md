@@ -20,7 +20,8 @@ Still open:
 - **Real run:** there's been no real chat → PR run with the real `claude` CLI.
 - **Gmail/calendar:** no connectors. Email and meetings come in through `<data_dir>/drop/` (.eml/.ics files) or `POST /inputs/*`.
 - **Deploy config:** there's no GET for it, so the app's form opens empty.
-- **Codex:** it runs builder turns only, with no session resume.
+- **Codex:** it runs builder turns only, with no session resume. Codex can't deny reads, so members on Codex are refused unless `RUI_ALLOW_CODEX_UNSANDBOXED_READS=1` is set.
+- **Agent isolation:** agents run as the same OS user as the daemon. MCP calls now need a per-run token tied to one server and one task. Account Lead and member runs on Claude are sandboxed (Bash) and denied the data folder (Read/Edit). Rui chat, Rui decision, Scout and Coach turns aren't sandboxed yet, and can still read `<data_dir>/owner.token` with the Read tool. The full fix for unattended runs is a separate OS user or a container per run. The earlier commit "Require an owner token on the owner HTTP API" said the token is "never given to an agent". That was true of prompts and environments, but any same-user process could read the file until these fixes.
 
 Written 2026-11-18 against branch `feat/per-client-account-lead` (PR #1). It covers every item in the RUI spec that is not built yet.
 

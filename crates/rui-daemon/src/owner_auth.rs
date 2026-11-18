@@ -1,6 +1,16 @@
 //! Owner token for the HTTP API. A fresh random token is written to `<data_dir>/owner.token`
 //! (mode 0600) at every boot; every owner route requires it in the `x-rui-owner` header.
-//! The MCP routes under /mcp are not covered: agents use those and never see the token.
+//!
+//! What this protects, and what it doesn't:
+//! - Routes under /mcp don't use this token. They need a per-run token instead (run_tokens.rs),
+//!   which only works on that run's own MCP server and only while the run is alive.
+//! - The token is never put into an agent's prompt, environment or MCP config. But the file is
+//!   readable by any process running as the same OS user. Account Lead and member runs on Claude
+//!   are kept away from it by the sandbox and deny rules in sandbox.rs. Rui chat, Rui decision,
+//!   Scout and Coach turns, and Codex runs with RUI_ALLOW_CODEX_UNSANDBOXED_READS set, aren't.
+//! - `touches_owner_api` only applies where the approve permission tool runs (Rui chat). It is not
+//!   a guard for member runs.
+//! - The full fix for unattended runs is to run agents as a separate OS user or in a container.
 
 use axum::{
     extract::{Request, State},
