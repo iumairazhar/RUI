@@ -17,6 +17,9 @@ pub struct InboxItem {
     pub reason: String,
     pub actions: Vec<String>,
     pub created_at: String,
+    /// Longer text for the item, like the Account Lead's remarks on a review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 fn first_line(s: &str) -> String {
@@ -41,6 +44,7 @@ fn question_items(db: &Db) -> Result<Vec<InboxItem>> {
             reason: q.ladder.last().map(|r| r.why.clone()).unwrap_or_else(|| q.asked_by.as_str().to_string()),
             actions: vec![],
             created_at: q.created_at,
+            detail: None,
         })
         .collect())
 }
@@ -58,6 +62,7 @@ fn ask_items(db: &Db) -> Result<Vec<InboxItem>> {
             reason: format!("Rui asked in chat: {}", a.chat_title),
             actions: a.options,
             created_at: a.created_at,
+            detail: None,
         })
         .collect())
 }
@@ -77,18 +82,29 @@ fn task_items(db: &Db, questioned: &HashSet<i64>) -> Result<Vec<InboxItem>> {
         if t.parent_id.is_some() || s.word != "Needs you" || questioned.contains(&t.id) {
             continue;
         }
-        items.extend(task_item(t, s));
+        items.extend(task_item(db, t, s)?);
     }
     Ok(items)
 }
 
-fn task_item(t: &Task, s: &OwnerState) -> Option<InboxItem> {
+fn task_item(db: &Db, t: &Task, s: &OwnerState) -> Result<Option<InboxItem>> {
     let (kind, actions) = match (t.status, s.reason.as_str()) {
         (TaskStatus::Done, REVIEW_REASON) => ("review", strings(&["Looks good", "Ask for changes"])),
         (TaskStatus::Stuck, _) => ("stuck", strings(&["Retry", "New instructions", "Drop it"])),
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(InboxItem { kind, id: t.id, task_id: Some(t.id), title: t.title.clone(), reason: s.reason.clone(), actions, created_at: s.since.clone() })
+    let detail = if kind == "review" { review_detail(db, t.id)? } else { None };
+    Ok(Some(InboxItem { kind, id: t.id, task_id: Some(t.id), title: t.title.clone(), reason: s.reason.clone(), actions, created_at: s.since.clone(), detail }))
+}
+
+/// The Account Lead's remarks from the latest `forwarded` event, plus the PR link if there is one.
+fn review_detail(db: &Db, task_id: i64) -> Result<Option<String>> {
+    let Some(f) = crate::scheduler::latest_forwarded(db, task_id)? else { return Ok(None) };
+    let mut text = f["remarks"].as_str().unwrap_or_default().to_string();
+    if let Some(url) = f["pr_url"].as_str() {
+        text.push_str(&format!("\nPR: {url}"));
+    }
+    Ok(Some(text))
 }
 
 /// All inbox items, newest first.
@@ -151,7 +167,20 @@ mod tests {
         let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
         let done = make(&db, c.id, None, TaskStatus::Done);
         let state = OwnerState { task_id: done.id, word: "Needs you", reason: REVIEW_REASON.into(), since: done.updated_at.clone() };
-        let item = task_item(&done, &state).unwrap();
+        let item = task_item(&db, &done, &state).unwrap().unwrap();
+        assert_eq!(item.detail, None);
         assert_eq!((item.kind, item.actions), ("review", ["Looks good", "Ask for changes"].map(String::from).to_vec()));
+    }
+
+    #[test]
+    fn review_item_carries_the_account_leads_remarks() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let done = make(&db, c.id, None, TaskStatus::Done);
+        let payload = json!({"remarks": "Check the migration", "pr_url": "https://example.test/pr/1"});
+        db.add_event(Some(done.id), "lead", "forwarded", &payload).unwrap();
+        let state = OwnerState { task_id: done.id, word: "Needs you", reason: REVIEW_REASON.into(), since: done.updated_at.clone() };
+        let item = task_item(&db, &done, &state).unwrap().unwrap();
+        assert_eq!(item.detail.as_deref(), Some("Check the migration\nPR: https://example.test/pr/1"));
     }
 }

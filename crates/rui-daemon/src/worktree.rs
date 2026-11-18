@@ -241,6 +241,37 @@ pub fn changes(wt: &Path, done: bool) -> anyhow::Result<Vec<Change>> {
     Ok(list)
 }
 
+/// Read-only list of what the branch in `wt` changed relative to the base branch.
+pub fn changes_vs_base(wt: &Path) -> anyhow::Result<Vec<Change>> {
+    let range = format!("{}...HEAD", base_branch(wt)?);
+    let mut list = parse_numstat(&git_stdout(wt, &["diff", "--no-renames", "--numstat", &range])?);
+    for c in &mut list {
+        c.diff = git_stdout(wt, &["diff", "--no-renames", &range, "--", &c.file])?;
+    }
+    Ok(list)
+}
+
+/// Pushes a task branch and opens a PR with the gh CLI; returns the PR url.
+/// Only `rui/task-*` branches are ever pushed, never a base branch.
+pub fn open_pr(wt: &Path, base: &str, branch: &str, title: &str, body: &str) -> anyhow::Result<String> {
+    if !branch.starts_with("rui/task-") {
+        bail!("refusing to push branch '{branch}': only rui/task-* branches are pushed");
+    }
+    git_stdout(wt, &["push", "-u", "origin", &format!("{branch}:{branch}")])?;
+    let gh = std::env::var("RUI_GH").unwrap_or_else(|_| "gh".into());
+    let out = StdCommand::new(gh)
+        .args(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body])
+        .current_dir(wt)
+        .output()
+        .context("run gh")?;
+    if !out.status.success() {
+        bail!("gh pr create failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let url = stdout.lines().rev().map(str::trim).find(|l| !l.is_empty());
+    url.map(String::from).context("gh printed no PR url")
+}
+
 fn tail(bytes: &[u8], max: usize) -> String {
     let start = bytes.len().saturating_sub(max);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
@@ -472,5 +503,28 @@ mod tests {
         let got = merge_into(&task_wt, &branches[1], "m2").unwrap();
         assert_eq!(got, LandResult::Conflict(vec!["a.txt".into()]));
         assert!(git_stdout(&task_wt, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changes_vs_base_lists_files_committed_on_the_task_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let (wt, _) = ensure_task_worktree(repo.path(), wts.path(), 3).unwrap();
+        std::fs::write(wt.join("new.txt"), "n\n").unwrap();
+        assert!(commit_all(&wt, "work").unwrap());
+        let got = changes_vs_base(&wt).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].file.as_str(), got[0].added), ("new.txt", 1));
+        assert!(got[0].diff.contains("+n"));
+    }
+
+    #[test]
+    fn open_pr_refuses_a_branch_outside_rui_task() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let err = open_pr(repo.path(), "main", "main", "t", "b").unwrap_err();
+        assert!(err.to_string().contains("rui/task-"));
+        assert!(open_pr(repo.path(), "main", "rui/5", "t", "b").is_err());
     }
 }

@@ -534,12 +534,16 @@ async fn retry_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult
 /// Files changed by a task: committed diff when done, else the live worktree diff.
 async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Change>>> {
     let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    let dir = s.data_dir.join("worktrees").join(id.to_string());
+    let top = task.parent_id.is_none();
+    let name = if top { format!("task-{id}") } else { id.to_string() };
+    let dir = s.data_dir.join("worktrees").join(name);
     if !dir.exists() {
         return Ok(Json(vec![]));
     }
     let done = task.status == TaskStatus::Done;
-    let list = tokio::task::spawn_blocking(move || worktree::changes(&dir, done))
+    let list = tokio::task::spawn_blocking(move || {
+        if top { worktree::changes_vs_base(&dir) } else { worktree::changes(&dir, done) }
+    })
         .await
         .map_err(anyhow::Error::from)??;
     Ok(Json(list))

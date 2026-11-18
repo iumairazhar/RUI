@@ -22,7 +22,7 @@ const ACCOUNT_LEAD_PROMPT: &str = include_str!("../prompts/account_lead.md");
 const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
-mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision";
+mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -41,6 +41,8 @@ pub enum Action {
     StartLead { task_id: i64, answers: Vec<(String, String)> },
     StartBuilder { task_id: i64 },
     Rollup { task_id: i64, status: TaskStatus },
+    /// All subtasks are done: wake the Account Lead to review the work.
+    Review { task_id: i64 },
     /// Run a Lead or Rui decision turn for an open question at `level`.
     Decide { question_id: i64, level: String },
 }
@@ -113,12 +115,30 @@ fn plan_rollup(db: &Db, t: &Task) -> Result<Option<Action>> {
     }
     let rollup = |status| Some(Action::Rollup { task_id: t.id, status });
     if subs.iter().all(|s| s.status == TaskStatus::Done) {
-        return Ok(rollup(TaskStatus::Done));
+        if forwarded_since_done(db, t.id, &subs)? {
+            return Ok(rollup(TaskStatus::Done));
+        }
+        return Ok(Some(Action::Review { task_id: t.id }));
     }
     if subs.iter().any(|s| s.status == TaskStatus::Stuck) {
         return Ok(rollup(TaskStatus::Stuck));
     }
     Ok(None)
+}
+
+/// True when the Account Lead forwarded the task after the last subtask finished.
+fn forwarded_since_done(db: &Db, task_id: i64, subs: &[Task]) -> Result<bool> {
+    let Some(ev) = latest_event(db, task_id, "forwarded")? else { return Ok(false) };
+    Ok(subs.iter().all(|s| ev.created_at.as_str() >= s.updated_at.as_str()))
+}
+
+fn latest_event(db: &Db, task_id: i64, kind: &str) -> Result<Option<rui_core::Event>> {
+    Ok(db.list_events(Some(task_id), 100_000)?.into_iter().rev().find(|e| e.kind == kind))
+}
+
+/// Payload of the task's latest `forwarded` event: the Account Lead's remarks and PR url.
+pub fn latest_forwarded(db: &Db, task_id: i64) -> Result<Option<Value>> {
+    Ok(latest_event(db, task_id, "forwarded")?.map(|e| e.payload))
 }
 
 /// After a lead turn: a lead that neither asked nor split gets the task marked stuck.
@@ -350,6 +370,12 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
                 lead_turn(&db, &cfg, &live, task_id, answers).await
             });
         }
+        Action::Review { task_id } => {
+            let lock = lock_for_task(db, locks, task_id);
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, lock, move |db, cfg, live| async move {
+                review_turn(&db, &cfg, &live, task_id).await
+            });
+        }
         Action::StartBuilder { task_id } => {
             spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, None, move |db, cfg, live| async move {
                 builder_turn(&db, &cfg, &live, task_id).await
@@ -424,8 +450,19 @@ fn post_done_notice(db: &Db, task: &Task, repo: &str, infos: &[AppInfo]) -> Resu
     let Some(source) = task.source_ref.as_deref() else { return Ok(()) };
     let Some(chat_id) = db.chat_id_for_source_ref(source)? else { return Ok(()) };
     let files = crate::results::collect(db, task).unwrap_or_default();
-    db.add_chat_message(chat_id, ChatRole::Rui, &done_message(task, repo, infos, &files))?;
+    let text = format!("{}{}", done_message(task, repo, infos, &files), lead_note(db, task.id)?);
+    db.add_chat_message(chat_id, ChatRole::Rui, &text)?;
     Ok(())
+}
+
+/// The Account Lead's remarks (and PR link) for a forwarded task, or an empty string.
+fn lead_note(db: &Db, task_id: i64) -> Result<String> {
+    let Some(f) = latest_forwarded(db, task_id)? else { return Ok(String::new()) };
+    let mut note = format!("\n\n**Account Lead:** {}", f["remarks"].as_str().unwrap_or_default());
+    if let Some(url) = f["pr_url"].as_str() {
+        note.push_str(&format!("\n\nPR: {url}"));
+    }
+    Ok(note)
 }
 
 const STOPPED_MARK: &str = " stopped: ";
@@ -741,6 +778,45 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     }
     after_lead_turn(db, task_id)?;
     Ok(())
+}
+
+/// The Account Lead reviews a task whose subtasks are all done and calls send_back or forward_pr.
+async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
+    let task = db.get_task(task_id)?.context("task not found")?;
+    let client = client_for(db, &task)?;
+    let prompt = review_prompt(db, &task, &client)?;
+    let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
+    if let Err(e) = run_logged(db, live, "lead", task_id, &run).await {
+        return agent_failed(db, task_id, &e);
+    }
+    if after_lead_turn(db, task_id)? == TaskStatus::Stuck {
+        raise_stuck_question(db, task_id, "the Account Lead finished its review without send_back or forward_pr")?;
+    }
+    Ok(())
+}
+
+fn review_prompt(db: &Db, task: &Task, client: &Client) -> Result<String> {
+    let lines: Vec<String> = db
+        .subtasks(task.id)?
+        .iter()
+        .map(|s| {
+            format!(
+                "- #{} {} [{}] done_command: {}",
+                s.id,
+                s.title,
+                s.agent.as_deref().unwrap_or("any"),
+                s.done_command.as_deref().unwrap_or("(none)")
+            )
+        })
+        .collect();
+    let base = crate::worktree::base_branch(&expand_home(&client.repo_path)).unwrap_or_else(|_| "main".into());
+    Ok(format!(
+        "{}\n\nAll subtasks are done. Review the work on branch {} (compare with `git diff {base}...HEAD`).\nSubtasks:\n{}\n\nCall send_back(task_id={id}, remarks) or forward_pr(task_id={id}, remarks).",
+        lead_prompt(task, client, &[]),
+        crate::worktree::task_branch_name(task.id),
+        lines.join("\n"),
+        id = task.id,
+    ))
 }
 
 fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
@@ -1219,7 +1295,52 @@ mod tests {
         db.set_task_status(b.id, TaskStatus::Stuck).unwrap();
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Stuck }]);
         db.set_task_status(b.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+        forward(&db, p.id);
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Done }]);
+    }
+
+    fn forward(db: &Db, task_id: i64) {
+        std::thread::sleep(Duration::from_millis(5));
+        db.add_event(Some(task_id), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": null})).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    #[test]
+    fn review_wakes_again_when_a_new_subtask_finishes_after_forwarding() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        mk(&db, c, Some(p.id), TaskStatus::Done);
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+        forward(&db, p.id);
+        assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Done }]);
+        let extra = mk(&db, c, Some(p.id), TaskStatus::Open);
+        db.set_task_status(extra.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+    }
+
+    #[test]
+    fn review_prompt_lists_subtasks_and_tools() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        let sub = mk(&db, c, Some(p.id), TaskStatus::Done);
+        let client = db.get_client(c).unwrap().unwrap();
+        let text = review_prompt(&db, &p, &client).unwrap();
+        assert!(text.contains(&format!("rui/task-{}", p.id)) && text.contains(&format!("- #{} ", sub.id)));
+        assert!(text.contains(&format!("send_back(task_id={}", p.id)) && text.contains("forward_pr("));
+    }
+
+    #[test]
+    fn done_notice_includes_the_account_leads_remarks() {
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, ChatRole::User, "make it").unwrap();
+        let task = chat_task(&db, Some(format!("chat:{}", msg.id)));
+        db.add_event(Some(task.id), "lead", "forwarded", &json!({"remarks": "Mind the schema", "pr_url": "https://x.test/pr/2"})).unwrap();
+        post_done_notice(&db, &task, "/tmp/c", &[]).unwrap();
+        let last = db.list_chat(chat.id, 10).unwrap().pop().unwrap();
+        assert!(last.content.contains("**Account Lead:** Mind the schema"));
+        assert!(last.content.contains("PR: https://x.test/pr/2"));
     }
 
     #[test]
@@ -1433,6 +1554,8 @@ mod tests {
         let sub = mk(&db, c, Some(parent.id), TaskStatus::Open);
         assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: sub.id }]);
         db.set_task_status(sub.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: parent.id }]);
+        forward(&db, parent.id);
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: parent.id, status: TaskStatus::Done }]);
     }
 

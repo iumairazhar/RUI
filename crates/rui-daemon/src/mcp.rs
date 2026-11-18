@@ -288,6 +288,30 @@ pub struct LogDecisionArgs {
     pub line: String,
 }
 
+/// Arguments for the Account Lead's `send_back`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SendBackArgs {
+    /// Your own task id.
+    pub task_id: i64,
+    /// What the Pod must change.
+    pub remarks: String,
+    /// Pod role to do the changes; defaults to whoever did the last subtask.
+    pub agent: Option<String>,
+    /// Defaults to all earlier subtasks' done_commands joined with &&.
+    pub done_command: Option<String>,
+}
+
+/// Arguments for the Account Lead's `forward_pr`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ForwardPrArgs {
+    /// Your own task id.
+    pub task_id: i64,
+    /// Your remarks for the owner: what was done and what to look at.
+    pub remarks: String,
+}
+
 // ---- plain tool logic ----
 
 /// Tool logic as plain functions: `(&Db, &Ctx, args) -> Result<Value>`.
@@ -687,37 +711,120 @@ pub mod logic {
     /// Lead creates a member subtask under its own task.
     pub fn create_subtask(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateSubtaskArgs) -> anyhow::Result<Value> {
         let parent = current_task(db, ctx)?;
-        check_agent(data_dir, &parent, &a.agent)?;
+        let deps = a.depends_on.clone().unwrap_or_default();
+        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, a.done_command.clone(), &deps)?;
+        record(db, ctx, Role::Lead, "create_subtask", &a)?;
+        let fresh = db.get_task(task.id)?.unwrap_or(task);
+        Ok(serde_json::to_value(fresh)?)
+    }
+
+    /// Validates and inserts an Open subtask of `parent` for pod member `agent`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: Option<String>, deps: &[i64]) -> anyhow::Result<Task> {
+        check_agent(data_dir, parent, agent)?;
         let client = db
             .get_client(parent.client_id)?
             .ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
-        let done = a.done_command.clone().or(client.test_command);
+        let done = done.or(client.test_command);
         let Some(done) = done.filter(|d| !d.trim().is_empty()) else {
             anyhow::bail!("no done_command given and the client has no test_command");
         };
-        let deps = a.depends_on.clone().unwrap_or_default();
-        check_depends(db, parent.id, &deps)?;
-        let max_loops = roster::load(data_dir, &a.agent).map(|r| r.max_loops).unwrap_or(5);
+        check_depends(db, parent.id, deps)?;
+        let max_loops = roster::load(data_dir, agent).map(|r| r.max_loops).unwrap_or(5);
         let task = db.create_task(&NewTask {
             client_id: parent.client_id,
             parent_id: Some(parent.id),
-            title: a.title.clone(),
-            body: a.job.clone(),
+            title: title.to_string(),
+            body: job.to_string(),
             status: TaskStatus::Open,
             done_command: Some(done),
             max_loops,
             role: Role::Builder,
             source_kind: parent.source_kind,
             source_ref: Some(format!("task:{}", parent.id)),
-            agent: Some(a.agent.clone()),
+            agent: Some(agent.to_string()),
             pod: vec![],
         })?;
-        for d in &deps {
+        for d in deps {
             db.add_task_dep(task.id, *d)?;
         }
-        record(db, ctx, Role::Lead, "create_subtask", &a)?;
-        let fresh = db.get_task(task.id)?.unwrap_or(task);
-        Ok(serde_json::to_value(fresh)?)
+        Ok(task)
+    }
+
+    /// The Account Lead's own task, checked against `task_id`, with non-empty remarks.
+    fn own_task_for_review(db: &Db, ctx: &Ctx, task_id: i64, remarks: &str) -> anyhow::Result<Task> {
+        let task = current_task(db, ctx)?;
+        if task.id != task_id {
+            anyhow::bail!("you can only send back your own task {}", task.id);
+        }
+        if remarks.trim().is_empty() {
+            anyhow::bail!("remarks must not be empty");
+        }
+        Ok(task)
+    }
+
+    /// Done-commands of the earlier subtasks, distinct, in id order, joined with `&&`.
+    fn joined_done_commands(subs: &[Task]) -> String {
+        let mut cmds: Vec<&str> = Vec::new();
+        for c in subs.iter().filter_map(|s| s.done_command.as_deref()).map(str::trim).filter(|c| !c.is_empty()) {
+            if !cmds.contains(&c) {
+                cmds.push(c);
+            }
+        }
+        cmds.join(" && ")
+    }
+
+    /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
+    pub fn send_back(db: &Db, data_dir: &Path, ctx: &Ctx, a: SendBackArgs) -> anyhow::Result<Value> {
+        let parent = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let mut subs = db.subtasks(parent.id)?;
+        subs.sort_by_key(|s| s.id);
+        if subs.iter().any(|s| matches!(s.status, TaskStatus::Open | TaskStatus::InProgress | TaskStatus::WaitingAnswer)) {
+            anyhow::bail!("subtasks are still running");
+        }
+        let agent = match a.agent.clone().or_else(|| subs.last().and_then(|s| s.agent.clone())) {
+            Some(agent) => agent,
+            None => anyhow::bail!("task {} has no subtasks to send back", parent.id),
+        };
+        let done = a.done_command.clone().unwrap_or_else(|| joined_done_commands(&subs));
+        let first: String = a.remarks.lines().next().unwrap_or_default().chars().take(60).collect();
+        let job = format!(
+            "{}\n\nThis follows the Account Lead's review of \"{}\". The earlier work is already on this branch; change only what the remarks ask.",
+            a.remarks, parent.title
+        );
+        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, Some(done), &[])?;
+        db.set_task_status(parent.id, TaskStatus::Split)?;
+        db.add_event(Some(parent.id), "lead", "sent_back", &json!({"subtask_id": sub.id, "remarks": a.remarks}))?;
+        log_client_decision(db, data_dir, &parent, &format!("Task {} sent back: {first}", parent.id))?;
+        record(db, ctx, Role::Lead, "send_back", &a)?;
+        Ok(json!({"subtask_id": sub.id}))
+    }
+
+    fn log_client_decision(db: &Db, data_dir: &Path, task: &Task, line: &str) -> anyhow::Result<()> {
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        crate::client_state::append_decision(data_dir, &client.name, line)
+    }
+
+    /// Account Lead forwards reviewed work: opens a PR when the repo has a remote, then hands it to the owner.
+    pub fn forward_pr(db: &Db, data_dir: &Path, ctx: &Ctx, a: ForwardPrArgs) -> anyhow::Result<Value> {
+        let task = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let subs = db.subtasks(task.id)?;
+        if subs.is_empty() || subs.iter().any(|s| s.status != TaskStatus::Done) {
+            anyhow::bail!("all subtasks must be done before forwarding");
+        }
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        let repo = expand_home(&client.repo_path);
+        let (wt, branch) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), task.id)?;
+        let pr_url = match crate::worktree::has_remote(&repo) {
+            true => Some(crate::worktree::open_pr(&wt, &crate::worktree::base_branch(&repo)?, &branch, &task.title, &a.remarks)?),
+            false => None,
+        };
+        db.add_event(Some(task.id), "lead", "forwarded", &json!({"remarks": a.remarks, "pr_url": pr_url}))?;
+        db.set_task_status(task.id, TaskStatus::Split)?;
+        let suffix = pr_url.as_deref().map(|u| format!(": {u}")).unwrap_or_default();
+        log_client_decision(db, data_dir, &task, &format!("Task {} forwarded to the owner{suffix}", task.id))?;
+        record(db, ctx, Role::Lead, "forward_pr", &a)?;
+        Ok(json!({"pr_url": pr_url}))
     }
 
     /// Lead declares the task split into its subtasks.
@@ -1082,6 +1189,24 @@ impl LeadServer {
         Parameters(a): Parameters<SetDoneArgs>,
     ) -> CallToolResult {
         finish(logic::set_done_command(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "After review: send the work back. The remarks become a new subtask for the Pod.")]
+    async fn send_back(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SendBackArgs>,
+    ) -> CallToolResult {
+        finish(logic::send_back(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "After review: the work is good. Opens a PR (or, for local-only repos, an Inbox review item) with your remarks for the owner.")]
+    async fn forward_pr(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<ForwardPrArgs>,
+    ) -> CallToolResult {
+        finish(logic::forward_pr(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
@@ -1692,6 +1817,101 @@ mod tests {
         assert!(logic::member_status(&db, &bogus, a).is_err());
     }
 
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn set_status(db: &Db, id: i64, status: TaskStatus) {
+        db.set_task_status(id, status).unwrap();
+    }
+
+    fn repo_of(db: &Db, lead: &Ctx) -> PathBuf {
+        let t = db.get_task(lead.task_id.unwrap()).unwrap().unwrap();
+        PathBuf::from(db.get_client(t.client_id).unwrap().unwrap().repo_path)
+    }
+
+    fn send_args(task_id: i64, remarks: &str) -> SendBackArgs {
+        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: None }
+    }
+
+    #[test]
+    fn send_back_creates_a_subtask_and_splits_the_parent() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        logic::create_subtask(&db, data.path(), &lead, CreateSubtaskArgs { done_command: Some("make test".into()), ..sub_args("tester", "t") }).unwrap();
+        let second = db.subtasks(lead_id).unwrap().pop().unwrap();
+        assert!(logic::send_back(&db, data.path(), &lead, send_args(lead_id, "x")).is_err(), "subtasks still running");
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        set_status(&db, second.id, TaskStatus::Done);
+        set_status(&db, lead_id, TaskStatus::Clarifying);
+        let r = logic::send_back(&db, data.path(), &lead, send_args(lead_id, "Fix the tests\nand the docs")).unwrap();
+        let sub = db.get_task(r["subtask_id"].as_i64().unwrap()).unwrap().unwrap();
+        assert_eq!((sub.status, sub.agent.as_deref()), (TaskStatus::Open, Some("tester")));
+        assert_eq!(sub.done_command.as_deref(), Some("true && make test"));
+        assert_eq!(sub.title, "Changes: Fix the tests");
+        assert!(sub.body.starts_with("Fix the tests\nand the docs") && sub.body.contains("change only what the remarks ask"));
+        assert_eq!(status_of(&db, &lead), TaskStatus::Split);
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        assert!(events.iter().any(|e| e.kind == "sent_back" && e.payload["subtask_id"] == sub.id));
+        let client = db.get_client(sub.client_id).unwrap().unwrap();
+        let log = crate::client_state::read_log(data.path(), &client.name, 10).unwrap();
+        assert!(log.contains(&format!("Task {lead_id} sent back: Fix the tests")));
+    }
+
+    #[test]
+    fn send_back_rejects_another_task_and_empty_remarks() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let other = member.task_id.unwrap();
+        let err = logic::send_back(&db, data.path(), &lead, send_args(other, "x")).unwrap_err();
+        assert!(err.to_string().contains("your own task"));
+        assert!(logic::send_back(&db, data.path(), &lead, send_args(lead_id, "  ")).is_err());
+    }
+
+    #[test]
+    fn forward_pr_without_a_remote_forwards_locally() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        let args = || ForwardPrArgs { task_id: lead_id, remarks: "Looks right".into() };
+        assert!(logic::forward_pr(&db, data.path(), &lead, args()).is_err(), "subtask not done");
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let r = logic::forward_pr(&db, data.path(), &lead, args()).unwrap();
+        assert!(r["pr_url"].is_null());
+        assert_eq!(status_of(&db, &lead), TaskStatus::Split);
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        let f = events.iter().find(|e| e.kind == "forwarded").unwrap();
+        assert_eq!((f.payload["remarks"].as_str(), f.payload["pr_url"].is_null()), (Some("Looks right"), true));
+        let client = db.get_client(db.get_task(lead_id).unwrap().unwrap().client_id).unwrap().unwrap();
+        assert!(crate::client_state::read_log(data.path(), &client.name, 10).unwrap().contains("forwarded to the owner"));
+    }
+
+    #[test]
+    fn forward_pr_with_a_remote_pushes_only_the_task_branch() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let repo = repo_of(&db, &lead);
+        let bare = tempfile::tempdir().unwrap();
+        sh(bare.path(), &["init", "--bare"]);
+        sh(&repo, &["remote", "add", "origin", &bare.path().to_string_lossy()]);
+        let gh = bare.path().join("fake-gh.sh");
+        std::fs::write(&gh, "#!/bin/sh\necho 'creating'\necho https://example.test/pr/1\n").unwrap();
+        let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&gh, perms).unwrap();
+        unsafe { std::env::set_var("RUI_GH", &gh) };
+        let r = logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: "ok".into() });
+        unsafe { std::env::remove_var("RUI_GH") };
+        assert_eq!(r.unwrap()["pr_url"], "https://example.test/pr/1");
+        let branch = format!("rui/task-{lead_id}");
+        assert!(!sh(bare.path(), &["rev-parse", "--verify", &branch]).is_empty());
+        let refs = sh(bare.path(), &["for-each-ref", "--format=%(refname)"]);
+        assert!(!refs.contains("refs/heads/main") && !refs.contains("refs/heads/master"), "{refs}");
+    }
+
     async fn post(app: &axum::Router, path: &str, body: Value) -> Value {
         use axum::body::Body;
         use axum::http::Request;
@@ -1731,7 +1951,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["create_subtask", "escalate", "log_decision", "mark_split", "rule", "set_done_command", "set_limit"];
+        let lead = ["create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit"];
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
