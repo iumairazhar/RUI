@@ -1502,17 +1502,43 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
     let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
     let siblings = db.subtasks(parent_id)?;
     let set = protected::protected_set(&task_wt, task, &siblings, &pod, &granted_paths(db, task)?)?;
-    let mut bad = protected::touched_existing(wt, &task_branch)?;
-    bad.retain(|f| protected::is_protected(f, &set));
-    let mut bad_new = protected::added_files(wt, &task_branch)?;
-    bad_new.retain(|f| protected::is_protected_new(f, &set));
-    if bad.is_empty() && bad_new.is_empty() {
+    let v = violations(wt, &task_branch, &set)?;
+    if v.is_empty() {
         return Ok(false);
     }
-    crate::worktree::restore_files(wt, &task_branch, &bad)?;
-    crate::worktree::remove_new_files(wt, &bad_new)?;
-    record_rejection(db, cfg, task, &bad, &bad_new)?;
+    crate::worktree::restore_files(wt, &task_branch, &v.to_restore())?;
+    crate::worktree::remove_new_files(wt, &v.new)?;
+    record_rejection(db, cfg, task, &v)?;
     Ok(true)
+}
+
+/// What a member's turn broke: protected files it edited or added, and files that lost a Tester's lines.
+struct Violations {
+    edited: Vec<String>,
+    new: Vec<String>,
+    tester_lines: Vec<String>,
+}
+
+impl Violations {
+    fn is_empty(&self) -> bool {
+        self.edited.is_empty() && self.new.is_empty() && self.tester_lines.is_empty()
+    }
+
+    /// Existing files to put back from the task branch, each once.
+    fn to_restore(&self) -> Vec<String> {
+        let mut all = self.edited.clone();
+        all.extend(self.tester_lines.iter().filter(|f| !self.edited.contains(f)).cloned());
+        all
+    }
+}
+
+fn violations(wt: &Path, task_branch: &str, set: &protected::Protected) -> Result<Violations> {
+    let mut edited = protected::touched_existing(wt, task_branch)?;
+    edited.retain(|f| protected::is_protected(f, set));
+    let mut new = protected::added_files(wt, task_branch)?;
+    new.retain(|f| protected::is_protected_new(f, set));
+    let tester_lines = protected::missing_tester_lines(wt, set);
+    Ok(Violations { edited, new, tester_lines })
 }
 
 /// Union of the protected paths the Lead granted this subtask.
@@ -1526,17 +1552,31 @@ fn granted_paths(db: &Db, task: &Task) -> Result<Vec<String>> {
 }
 
 /// Records the rejection events and counts the failed loop.
-fn record_rejection(db: &Db, cfg: &Config, task: &Task, bad: &[String], bad_new: &[String]) -> Result<()> {
-    let all: Vec<&String> = bad.iter().chain(bad_new).collect();
-    let files = all.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ");
-    db.add_event(Some(task.id), "scheduler", "protected_rejected", &json!({"files": all, "new": bad_new}))?;
+fn record_rejection(db: &Db, cfg: &Config, task: &Task, v: &Violations) -> Result<()> {
+    let all: Vec<&String> = v.edited.iter().chain(&v.new).collect();
+    let payload = json!({"files": all, "new": v.new, "tester_lines": v.tester_lines});
+    db.add_event(Some(task.id), "scheduler", "protected_rejected", &payload)?;
+    let reason = rejection_reason(&all, &v.tester_lines);
     let text = format!(
-        "Your changes to protected files were rejected and undone: {files}. Tests, eval files and files the done_command uses must not be edited, deleted or skipped. Make the done_command pass by doing the job."
+        "Your changes were rejected and undone: {reason}. Tests, eval files and files the done_command uses must not be edited, deleted or skipped, and lines the Tester added must stay. Make the done_command pass by doing the job."
     );
     db.add_event(Some(task.id), "scheduler", "instruction", &json!({"text": text}))?;
-    let status = count_failed_loop(db, &cfg.data_dir, task, &format!("changed protected files: {files}"))?;
+    let status = count_failed_loop(db, &cfg.data_dir, task, &reason)?;
     db.set_task_status(task.id, status)?;
     Ok(())
+}
+
+/// One line naming the protected files changed and the files whose Tester lines went missing.
+fn rejection_reason(files: &[&String], tester_lines: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !files.is_empty() {
+        let list = files.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ");
+        parts.push(format!("changed protected files: {list}"));
+    }
+    for f in tester_lines {
+        parts.push(format!("{f}: removed or changed tests the Tester wrote"));
+    }
+    parts.join("; ")
 }
 
 /// Commits the worktree; false when there was nothing to commit.
@@ -1828,6 +1868,112 @@ mod tests {
         std::fs::write(wt.join("src/new.py"), "x").unwrap();
         assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
         assert!(wt.join("src/new.py").exists());
+    }
+
+    const LIB: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+    const TESTS: &str = "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(2, 2), 4);\n    }\n}\n";
+
+    fn sub_task(db: &Db, client: i64, parent: i64, agent: Option<&str>, done: &str, status: TaskStatus) -> Task {
+        db.create_task(&NewTask {
+            client_id: client,
+            parent_id: Some(parent),
+            title: "t".into(),
+            body: String::new(),
+            status,
+            done_command: Some(done.into()),
+            max_loops: 2,
+            role: Role::Builder,
+            source_kind: SourceKind::User,
+            source_ref: None,
+            agent: agent.map(String::from),
+            pod: vec![],
+        })
+        .unwrap()
+    }
+
+    /// A Tester that appended tests to existing src/lib.rs and created src/extra.rs, merged into
+    /// the task branch; then a backend subtask (with `done`) and its worktree.
+    fn tester_setup(data: &Path, repo: &Path, done: &str) -> (Db, Config, Task, PathBuf) {
+        git_in(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), LIB).unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Db::open_test();
+        let client = db.create_client("acme", &repo.to_string_lossy(), None, &[]).unwrap();
+        let parent = mk(&db, client.id, None, TaskStatus::Split);
+        let tester = sub_task(&db, client.id, parent.id, Some("tester"), "true", TaskStatus::Done);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.to_path_buf() };
+        let worktrees = data.join("worktrees");
+        let (task_wt, tb) = ensure_task_worktree(repo, &worktrees, parent.id, &crate::worktree::base_branch(repo).unwrap()).unwrap();
+        let (twt, tbr) = create_worktree(repo, &worktrees, tester.id, Some(&tb)).unwrap();
+        std::fs::write(twt.join("src/lib.rs"), format!("{LIB}{TESTS}")).unwrap();
+        std::fs::write(twt.join("src/extra.rs"), "pub fn helper() {}\n").unwrap();
+        assert!(commit_all(&twt, "tests").unwrap());
+        assert_eq!(merge_into(&task_wt, &tbr, "merge tester").unwrap(), LandResult::Merged);
+        let backend = sub_task(&db, client.id, parent.id, None, done, TaskStatus::InProgress);
+        let (wt, _) = create_worktree(repo, &worktrees, backend.id, Some(&tb)).unwrap();
+        (db, cfg, backend, wt)
+    }
+
+    fn fixed_lib(tests: &str) -> String {
+        format!("{}{tests}", LIB.replace("a - b", "a + b"))
+    }
+
+    #[test]
+    fn backend_may_fix_code_in_a_file_the_tester_only_edited() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib(TESTS)).unwrap();
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), fixed_lib(TESTS));
+    }
+
+    #[test]
+    fn removing_or_changing_a_tester_line_is_rejected_and_restored() {
+        let changed = TESTS.replace("2, 2), 4", "2, 2), 0");
+        for tests in ["", changed.as_str()] {
+            let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+            std::fs::write(wt.join("src/lib.rs"), fixed_lib(tests)).unwrap();
+            assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+            assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+            let after = db.get_task(sub.id).unwrap().unwrap();
+            assert_eq!(after.loops_used, 1);
+            let events = db.list_events(Some(sub.id), 50).unwrap();
+            let text = events.iter().find(|e| e.kind == "instruction").unwrap().payload["text"].to_string();
+            assert!(text.contains("src/lib.rs: removed or changed tests the Tester wrote"), "{text}");
+        }
+    }
+
+    #[test]
+    fn tester_created_file_stays_fully_protected() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        std::fs::write(wt.join("src/extra.rs"), "pub fn helper() {}\npub fn more() {}\n").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/extra.rs")).unwrap(), "pub fn helper() {}\n");
+    }
+
+    #[test]
+    fn done_command_file_stays_fully_protected_even_if_tester_only_edited_it() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "cat src/lib.rs");
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib(TESTS)).unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+    }
+
+    #[test]
+    fn a_grant_cannot_lift_tester_protection() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        db.add_event(Some(sub.id), "lead", "paths_granted", &json!({"paths": ["src/"]})).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib("")).unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+        std::fs::write(wt.join("src/extra.rs"), "").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //! tests written by a tester, and files the done_command runs.
 
 use crate::client_state::Pod;
-use crate::worktree::{self, branch_files, branch_name};
+use crate::worktree::{self, branch_file_status, branch_name};
 use anyhow::Result;
 use rui_core::{Task, TaskStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// What one member subtask may not modify or delete.
@@ -20,6 +20,8 @@ pub struct Protected {
     pub runners: Runners,
     /// Protected paths the Account Lead granted this one subtask.
     pub granted: Vec<String>,
+    /// Lines (trimmed) a Tester added to files it edited but did not create; they must stay.
+    pub tester_lines: HashMap<String, Vec<String>>,
 }
 
 /// Which task runners a command invokes.
@@ -43,11 +45,52 @@ pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod, g
     p.runners = runners_in(sub.done_command.as_deref().unwrap_or(""));
     for sib in siblings {
         if sib.status == TaskStatus::Done && sib.agent.as_deref() == Some("tester") {
-            p.files.extend(branch_files(repo_wt, &branch_name(sib.id))?);
+            add_tester_changes(&mut p, repo_wt, &branch_name(sib.id))?;
         }
     }
     p.files.extend(done_command_files(repo_wt, sub.done_command.as_deref().unwrap_or("")));
     Ok(p)
+}
+
+/// Files a Tester created are fully protected; for files it only edited, the lines it added are.
+fn add_tester_changes(p: &mut Protected, repo_wt: &Path, branch: &str) -> Result<()> {
+    for (status, path) in branch_file_status(repo_wt, branch)? {
+        if status != "M" {
+            p.files.insert(path);
+            continue;
+        }
+        let lines = worktree::branch_added_lines(repo_wt, branch, &path)?;
+        p.tester_lines.entry(path).or_default().extend(lines);
+    }
+    Ok(())
+}
+
+/// Files in `wt` that no longer hold every line a Tester added (grants do not apply).
+pub fn missing_tester_lines(wt: &Path, p: &Protected) -> Vec<String> {
+    let mut bad: Vec<String> = p
+        .tester_lines
+        .iter()
+        .filter(|(f, lines)| !contains_all(&wt.join(f), lines))
+        .map(|(f, _)| f.clone())
+        .collect();
+    bad.sort();
+    bad
+}
+
+/// True when the file holds each of `lines` (trimmed), counting repeats.
+fn contains_all(file: &Path, lines: &[String]) -> bool {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let mut have: HashMap<&str, usize> = HashMap::new();
+    for l in text.lines() {
+        *have.entry(l.trim()).or_default() += 1;
+    }
+    lines.iter().all(|l| match have.get_mut(l.as_str()) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    })
 }
 
 /// Finds task runners by the basename of each command token, so `/usr/bin/make` and `(make)` count.
@@ -192,6 +235,7 @@ mod tests {
             config: false,
             runners: Runners::default(),
             granted: vec![],
+            tester_lines: HashMap::new(),
         }
     }
 

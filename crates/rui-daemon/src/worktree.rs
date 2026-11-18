@@ -226,6 +226,23 @@ pub fn branch_files(repo: &Path, branch: &str) -> anyhow::Result<Vec<String>> {
     Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
 }
 
+/// Files touched by the tip commit of `branch` with git's status letter (A, M, D, ...).
+pub fn branch_file_status(repo: &Path, branch: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let args = ["diff-tree", "--no-commit-id", "--no-renames", "--name-status", "-r", "-z", branch];
+    let out = git_stdout(repo, &args)?;
+    let parts: Vec<&str> = out.split('\0').filter(|s| !s.is_empty()).collect();
+    Ok(parts.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].to_string(), c[1].to_string())).collect())
+}
+
+/// Non-blank lines (trimmed) that the tip commit of `branch` added to `path`.
+pub fn branch_added_lines(repo: &Path, branch: &str, path: &str) -> anyhow::Result<Vec<String>> {
+    let args = ["diff-tree", "-p", "-U0", "--no-commit-id", "--no-renames", "--no-color", branch, "--", path];
+    let out = git_stdout(repo, &args)?;
+    let hunks = out.lines().skip_while(|l| !l.starts_with("@@"));
+    let added = hunks.filter_map(|l| l.strip_prefix('+')).map(str::trim);
+    Ok(added.filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
 /// Puts each file back to its state on `branch` (worktree and index).
 pub fn restore_files(wt: &Path, branch: &str, paths: &[String]) -> anyhow::Result<()> {
     for path in paths {
