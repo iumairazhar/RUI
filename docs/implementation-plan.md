@@ -1,5 +1,27 @@
 # RUI implementation plan
 
+## Status (2026-11-18, end of day)
+
+Phases 0–6 are built and pushed on `feat/per-client-account-lead`. 653 tests pass across the workspace.
+
+Defaults picked for the open decisions:
+- **Seats (1):** both subscription and API-key seats are supported, and key values are never stored.
+- **Calendar prep (3):** the brief only shows in the Inbox; nothing is sent.
+- **Thread deadline (4):** not built yet.
+- **Stall limit (5):** 10 minutes for every role; a run is aborted after 30.
+- **Undo (6):** a fixed 10 seconds.
+- **Cost (7):** shown as dollars and tokens, with subscription dollars marked as estimates.
+- **Hand back (8):** the done check must pass, but you can force it.
+
+A security review found 14 issues, and all are fixed. The owner HTTP API now needs the `x-rui-owner` token from `<data_dir>/owner.token`.
+
+Still open:
+- **Screens:** none of the UI has been checked on screen; it's only covered by builds and unit tests.
+- **Real run:** there's been no real chat → PR run with the real `claude` CLI.
+- **Gmail/calendar:** no connectors. Email and meetings come in through `<data_dir>/drop/` (.eml/.ics files) or `POST /inputs/*`.
+- **Deploy config:** there's no GET for it, so the app's form opens empty.
+- **Codex:** it runs builder turns only, with no session resume.
+
 Written 2026-11-18 against branch `feat/per-client-account-lead` (PR #1). It covers every item in the RUI spec that is not built yet.
 
 ## Where things stand
