@@ -206,8 +206,8 @@ pub struct CreateSubtaskArgs {
     pub title: String,
     /// Full instructions for the member.
     pub job: String,
-    /// Command that must pass for the subtask to be done; defaults to the client's test command.
-    pub done_command: Option<String>,
+    /// Shell command that exits 0 only when this job is really done. It must fail now.
+    pub done_command: String,
     /// Ids of sibling subtasks that must finish first.
     pub depends_on: Option<Vec<i64>>,
 }
@@ -298,8 +298,8 @@ pub struct SendBackArgs {
     pub remarks: String,
     /// Pod role to do the changes; defaults to whoever did the last subtask.
     pub agent: Option<String>,
-    /// Defaults to all earlier subtasks' done_commands joined with &&.
-    pub done_command: Option<String>,
+    /// Command that proves the requested changes. It must fail now.
+    pub done_command: String,
 }
 
 /// Arguments for the Account Lead's `forward_pr`.
@@ -712,7 +712,7 @@ pub mod logic {
     pub fn create_subtask(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateSubtaskArgs) -> anyhow::Result<Value> {
         let parent = current_task(db, ctx)?;
         let deps = a.depends_on.clone().unwrap_or_default();
-        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, a.done_command.clone(), &deps)?;
+        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, &a.done_command, &deps)?;
         record(db, ctx, Role::Lead, "create_subtask", &a)?;
         let fresh = db.get_task(task.id)?.unwrap_or(task);
         Ok(serde_json::to_value(fresh)?)
@@ -720,16 +720,14 @@ pub mod logic {
 
     /// Validates and inserts an Open subtask of `parent` for pod member `agent`.
     #[allow(clippy::too_many_arguments)]
-    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: Option<String>, deps: &[i64]) -> anyhow::Result<Task> {
+    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: &str, deps: &[i64]) -> anyhow::Result<Task> {
         check_agent(data_dir, parent, agent)?;
-        let client = db
-            .get_client(parent.client_id)?
-            .ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
-        let done = done.or(client.test_command);
-        let Some(done) = done.filter(|d| !d.trim().is_empty()) else {
-            anyhow::bail!("no done_command given and the client has no test_command");
-        };
+        let done = done.trim();
+        if done.is_empty() {
+            anyhow::bail!("done_command must not be empty");
+        }
         check_depends(db, parent.id, deps)?;
+        precheck_done(db, data_dir, parent, done)?;
         let max_loops = roster::load(data_dir, agent).map(|r| r.max_loops).unwrap_or(5);
         let task = db.create_task(&NewTask {
             client_id: parent.client_id,
@@ -737,7 +735,7 @@ pub mod logic {
             title: title.to_string(),
             body: job.to_string(),
             status: TaskStatus::Open,
-            done_command: Some(done),
+            done_command: Some(done.to_string()),
             max_loops,
             role: Role::Builder,
             source_kind: parent.source_kind,
@@ -763,15 +761,12 @@ pub mod logic {
         Ok(task)
     }
 
-    /// Done-commands of the earlier subtasks, distinct, in id order, joined with `&&`.
-    fn joined_done_commands(subs: &[Task]) -> String {
-        let mut cmds: Vec<&str> = Vec::new();
-        for c in subs.iter().filter_map(|s| s.done_command.as_deref()).map(str::trim).filter(|c| !c.is_empty()) {
-            if !cmds.contains(&c) {
-                cmds.push(c);
-            }
-        }
-        cmds.join(" && ")
+    /// The done_command must fail on the task branch now, or it proves nothing.
+    fn precheck_done(db: &Db, data_dir: &Path, parent: &Task, cmd: &str) -> anyhow::Result<()> {
+        let client = db.get_client(parent.client_id)?.ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
+        let repo = expand_home(&client.repo_path);
+        let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id)?;
+        crate::worktree::require_failing(&wt, cmd)
     }
 
     /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
@@ -786,13 +781,12 @@ pub mod logic {
             Some(agent) => agent,
             None => anyhow::bail!("task {} has no subtasks to send back", parent.id),
         };
-        let done = a.done_command.clone().unwrap_or_else(|| joined_done_commands(&subs));
         let first: String = a.remarks.lines().next().unwrap_or_default().chars().take(60).collect();
         let job = format!(
             "{}\n\nThis follows the Account Lead's review of \"{}\". The earlier work is already on this branch; change only what the remarks ask.",
             a.remarks, parent.title
         );
-        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, Some(done), &[])?;
+        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, &a.done_command, &[])?;
         db.set_task_status(parent.id, TaskStatus::Split)?;
         db.add_event(Some(parent.id), "lead", "sent_back", &json!({"subtask_id": sub.id, "remarks": a.remarks}))?;
         log_client_decision(db, data_dir, &parent, &format!("Task {} sent back: {first}", parent.id))?;
@@ -860,11 +854,13 @@ pub mod logic {
     }
 
     /// Lead narrows or changes a subtask's done command.
-    pub fn set_done_command(db: &Db, ctx: &Ctx, a: SetDoneArgs) -> anyhow::Result<Value> {
+    pub fn set_done_command(db: &Db, data_dir: &Path, ctx: &Ctx, a: SetDoneArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
         if a.done_command.trim().is_empty() {
             anyhow::bail!("done_command must not be empty");
         }
+        let parent = current_task(db, ctx)?;
+        precheck_done(db, data_dir, &parent, a.done_command.trim())?;
         db.set_done_command(task.id, a.done_command.trim())?;
         record(db, ctx, Role::Lead, "set_done_command", &a)?;
         Ok(json!({"ok": true, "task_id": task.id}))
@@ -1137,7 +1133,7 @@ impl LeadServer {
 
 #[tool_router]
 impl LeadServer {
-    #[tool(description = "Create a subtask of this task for one pod member; done_command defaults to the client's test command.")]
+    #[tool(description = "Create a subtask of this task for one pod member; done_command is required and must fail now.")]
     async fn create_subtask(
         &self,
         Extension(parts): Extension<Parts>,
@@ -1188,7 +1184,7 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<SetDoneArgs>,
     ) -> CallToolResult {
-        finish(logic::set_done_command(&self.db, &ctx_from(&parts), a))
+        finish(logic::set_done_command(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "After review: send the work back. The remarks become a new subtask for the Pod.")]
@@ -1286,8 +1282,9 @@ mod tests {
 
     fn git_dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        let ok = Command::new("git").arg("init").arg(d.path()).output().unwrap().status.success();
-        assert!(ok);
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(d.path()).args(args).output().unwrap().status.success();
+        assert!(git(&["init", "-b", "main"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"]));
         d
     }
 
@@ -1344,7 +1341,7 @@ mod tests {
             agent: agent.into(),
             title: title.into(),
             job: "b".into(),
-            done_command: Some("true".into()),
+            done_command: "test -f done.txt".into(),
             depends_on: None,
         }
     }
@@ -1655,7 +1652,7 @@ mod tests {
         let t = db.get_task(member.task_id.unwrap()).unwrap().unwrap();
         let pid = lead.task_id.unwrap();
         assert_eq!((t.agent.as_deref(), t.role, t.status), (Some("backend"), Role::Builder, TaskStatus::Open));
-        assert_eq!((t.parent_id, t.max_loops, t.done_command.as_deref()), (Some(pid), 6, Some("true")));
+        assert_eq!((t.parent_id, t.max_loops, t.done_command.as_deref()), (Some(pid), 6, Some("test -f done.txt")));
         assert_eq!(t.source_ref, Some(format!("task:{pid}")));
     }
 
@@ -1673,7 +1670,7 @@ mod tests {
         let (db, ctx, _d) = setup(None);
         let data = data_with_roles(&["backend"]);
         let mut a = sub_args("backend", "s");
-        a.done_command = None;
+        a.done_command = "  ".into();
         assert!(logic::create_subtask(&db, data.path(), &ctx, a).is_err());
         let first = logic::create_subtask(&db, data.path(), &ctx, sub_args("backend", "a")).unwrap();
         let mut b = sub_args("backend", "b");
@@ -1683,6 +1680,33 @@ mod tests {
         let mut bad = sub_args("backend", "c");
         bad.depends_on = Some(vec![9999]);
         assert!(logic::create_subtask(&db, data.path(), &ctx, bad).is_err());
+    }
+
+    #[test]
+    fn create_subtask_rejects_a_passing_done_command() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "true".into();
+        let err = logic::create_subtask(&db, data.path(), &ctx, a).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
+        let mut ok = sub_args("backend", "s");
+        ok.done_command = "test -f nope.txt".into();
+        assert!(logic::create_subtask(&db, data.path(), &ctx, ok).is_ok());
+    }
+
+    #[test]
+    fn create_subtask_has_no_test_command_fallback() {
+        let v = json!({"agent": "backend", "title": "t", "job": "j"});
+        assert!(serde_json::from_value::<CreateSubtaskArgs>(v).is_err());
+    }
+
+    #[test]
+    fn set_done_command_rejects_a_passing_command() {
+        let (db, data, lead, member) = staffed();
+        let a = SetDoneArgs { task_id: member.task_id.unwrap(), done_command: "true".into() };
+        let err = logic::set_done_command(&db, data.path(), &lead, a).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
     }
 
     #[test]
@@ -1697,19 +1721,19 @@ mod tests {
 
     #[test]
     fn set_limit_and_done_command_edit_own_subtasks() {
-        let (db, _data, lead, member) = staffed();
+        let (db, data, lead, member) = staffed();
         let id = member.task_id.unwrap();
         logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 9 }).unwrap();
-        let a = SetDoneArgs { task_id: id, done_command: " make t ".into() };
-        logic::set_done_command(&db, &lead, a).unwrap();
+        let a = SetDoneArgs { task_id: id, done_command: " test -f t.txt ".into() };
+        logic::set_done_command(&db, data.path(), &lead, a).unwrap();
         let t = db.get_task(id).unwrap().unwrap();
-        assert_eq!((t.max_loops, t.done_command.as_deref()), (9, Some("make t")));
+        assert_eq!((t.max_loops, t.done_command.as_deref()), (9, Some("test -f t.txt")));
         for n in [0, 21] {
             assert!(logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: n }).is_err());
         }
         assert!(logic::set_limit(&db, &lead, SetLimitArgs { task_id: lead.task_id.unwrap(), max_loops: 3 }).is_err());
         let a = SetDoneArgs { task_id: id, done_command: " ".into() };
-        assert!(logic::set_done_command(&db, &lead, a).is_err());
+        assert!(logic::set_done_command(&db, data.path(), &lead, a).is_err());
     }
 
     #[test]
@@ -1833,14 +1857,14 @@ mod tests {
     }
 
     fn send_args(task_id: i64, remarks: &str) -> SendBackArgs {
-        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: None }
+        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into() }
     }
 
     #[test]
     fn send_back_creates_a_subtask_and_splits_the_parent() {
         let (db, data, lead, member) = staffed();
         let lead_id = lead.task_id.unwrap();
-        logic::create_subtask(&db, data.path(), &lead, CreateSubtaskArgs { done_command: Some("make test".into()), ..sub_args("tester", "t") }).unwrap();
+        logic::create_subtask(&db, data.path(), &lead, CreateSubtaskArgs { done_command: "make test".into(), ..sub_args("tester", "t") }).unwrap();
         let second = db.subtasks(lead_id).unwrap().pop().unwrap();
         assert!(logic::send_back(&db, data.path(), &lead, send_args(lead_id, "x")).is_err(), "subtasks still running");
         set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
@@ -1849,7 +1873,7 @@ mod tests {
         let r = logic::send_back(&db, data.path(), &lead, send_args(lead_id, "Fix the tests\nand the docs")).unwrap();
         let sub = db.get_task(r["subtask_id"].as_i64().unwrap()).unwrap().unwrap();
         assert_eq!((sub.status, sub.agent.as_deref()), (TaskStatus::Open, Some("tester")));
-        assert_eq!(sub.done_command.as_deref(), Some("true && make test"));
+        assert_eq!(sub.done_command.as_deref(), Some("test -f changes.txt"));
         assert_eq!(sub.title, "Changes: Fix the tests");
         assert!(sub.body.starts_with("Fix the tests\nand the docs") && sub.body.contains("change only what the remarks ask"));
         assert_eq!(status_of(&db, &lead), TaskStatus::Split);
@@ -1858,6 +1882,17 @@ mod tests {
         let client = db.get_client(sub.client_id).unwrap().unwrap();
         let log = crate::client_state::read_log(data.path(), &client.name, 10).unwrap();
         assert!(log.contains(&format!("Task {lead_id} sent back: Fix the tests")));
+    }
+
+    #[test]
+    fn send_back_requires_a_done_command() {
+        assert!(serde_json::from_value::<SendBackArgs>(json!({"task_id": 1, "remarks": "x"})).is_err());
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let args = SendBackArgs { done_command: "true".into(), ..send_args(lead_id, "x") };
+        let err = logic::send_back(&db, data.path(), &lead, args).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
     }
 
     #[test]

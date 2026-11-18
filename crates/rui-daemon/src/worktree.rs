@@ -302,6 +302,31 @@ pub async fn run_done_command(cwd: &Path, cmd: &str) -> anyhow::Result<DoneCheck
     Ok(DoneCheck { passed: out.status.success(), output_tail: tail(&all, 4096) })
 }
 
+/// Runs `cmd` with `sh -c` in `wt` (5 minute limit). Errors if it exits 0:
+/// a done_command that already passes proves nothing.
+pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
+    let mut child = StdCommand::new("sh")
+        .args(["-c", cmd])
+        .current_dir(wt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("run done command")?;
+    for _ in 0..3000 {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                bail!("done_command already passes; write one that proves the job");
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +405,14 @@ mod tests {
         let r = run_done_command(d.path(), "echo hi; exit 1").await.unwrap();
         assert!(!r.passed);
         assert!(r.output_tail.contains("hi"));
+    }
+
+    #[test]
+    fn require_failing_rejects_only_a_passing_command() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(require_failing(d.path(), "false").is_ok());
+        let e = require_failing(d.path(), "true").unwrap_err();
+        assert!(e.to_string().contains("already passes"));
     }
 
     #[test]
