@@ -47,6 +47,8 @@ pub struct AgentRun {
     pub partial: bool,
     /// Seat to run on; None runs on the default login with the daemon's own environment.
     pub seat: Option<crate::seats::Seat>,
+    /// Sandbox for Lead and member runs on Claude; the run's `cwd` is the worktree it fences in.
+    pub sandbox: Option<crate::sandbox::Sandbox>,
 }
 
 /// Final result of a turn.
@@ -75,8 +77,8 @@ pub fn mcp_config_json(url: &str) -> Value {
     json!({"mcpServers": {"rui": {"type": "http", "url": url, "headers": {crate::run_tokens::HEADER: token}}}})
 }
 
-/// Builds the CLI argument list for a run.
-pub fn build_args(run: &AgentRun, mcp_config_path: &Path) -> Vec<String> {
+/// Builds the CLI argument list for a run; `settings` is the per-run sandbox settings file.
+pub fn build_args(run: &AgentRun, mcp_config_path: &Path, settings: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-p".into(),
         run.prompt.clone(),
@@ -115,6 +117,10 @@ pub fn build_args(run: &AgentRun, mcp_config_path: &Path) -> Vec<String> {
     if run.partial {
         a.push("--include-partial-messages".into());
     }
+    if let Some(p) = settings {
+        a.push("--settings".into());
+        a.push(p.to_string_lossy().into_owned());
+    }
     a
 }
 
@@ -137,14 +143,6 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         },
         _ => ParsedLine::Other(v),
     })
-}
-
-fn temp_config_path() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("rui-mcp-{}-{}.json", std::process::id(), nanos))
 }
 
 /// Runs the Claude CLI once, calling `on_line` for every parsed line.
@@ -174,22 +172,16 @@ async fn run_claude(
     token: &str,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
-    let cfg = temp_config_path();
-    let json = mcp_config_json(&run.mcp_url);
-    std::fs::write(&cfg, serde_json::to_vec(&json)?).context("write mcp config")?;
-    let res = run_with_config(run, &cfg, token, on_line).await;
-    let _ = std::fs::remove_file(&cfg);
-    res
-}
-
-async fn run_with_config(
-    run: &AgentRun,
-    cfg: &Path,
-    token: &str,
-    on_line: impl FnMut(&ParsedLine),
-) -> anyhow::Result<RunOutcome> {
+    // Removed when this future ends or is dropped, so an aborted run leaves no files behind.
+    let dir = crate::sandbox::RunDir::create()?;
+    let cfg = dir.path().join("mcp.json");
+    std::fs::write(&cfg, serde_json::to_vec(&mcp_config_json(&run.mcp_url))?).context("write mcp config")?;
+    let settings = match &run.sandbox {
+        Some(sb) => Some(crate::sandbox::write_settings(&dir, sb, &run.cwd)?),
+        None => None,
+    };
     let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    let mut cmd = command(&bin, run, cfg)?;
+    let mut cmd = command(&bin, run, &cfg, settings.as_deref())?;
     cmd.env(crate::run_tokens::ENV, token);
     stream(cmd, &bin, "claude", parse_line, on_line).await
 }
@@ -252,14 +244,14 @@ pub(crate) async fn stream(
 
 /// The CLI command for a run: every secret variable removed, then the seat's environment applied
 /// (ANTHROPIC_API_KEY only for an active api_key seat).
-fn command(bin: &str, run: &AgentRun, cfg: &Path) -> anyhow::Result<Command> {
+fn command(bin: &str, run: &AgentRun, cfg: &Path, settings: Option<&Path>) -> anyhow::Result<Command> {
     let env = match &run.seat {
         Some(seat) => crate::seats::seat_env(seat)?,
         None => vec![],
     };
     let mut cmd = Command::new(bin);
     crate::seats::scrub_env(cmd.as_std_mut(), &crate::state::data_dir());
-    cmd.args(build_args(run, cfg))
+    cmd.args(build_args(run, cfg, settings))
         .envs(env)
         .current_dir(&run.cwd)
         .stdin(Stdio::null())
@@ -304,6 +296,7 @@ mod tests {
             resume: None,
             partial: false,
             seat: None,
+            sandbox: None,
         }
     }
 
@@ -345,7 +338,7 @@ mod tests {
     fn args_without_and_with_optionals() {
         let d = tempfile::tempdir().unwrap();
         let mut r = run(d.path());
-        let a = build_args(&r, Path::new("/x.json"));
+        let a = build_args(&r, Path::new("/x.json"), None);
         assert_eq!(a[..2], ["-p", "hello"]);
         assert!(a.contains(&"--strict-mcp-config".to_string()));
         assert!(a.contains(&"--disable-slash-commands".to_string()));
@@ -356,12 +349,14 @@ mod tests {
         assert!(!a.contains(&"--resume".to_string()));
         assert!(!a.contains(&"--tools".to_string()));
         assert!(!a.contains(&"--permission-prompt-tool".to_string()));
+        assert!(!a.contains(&"--settings".to_string()));
+        assert!(!a.contains(&"--add-dir".to_string()), "never widens the working directories");
         r.allowed_tools = vec!["Read".into(), "Bash".into()];
         r.permission_mode = Some("acceptEdits".into());
         r.resume = Some("abc".into());
         r.builtin_tools = Some(String::new());
         r.permission_prompt_tool = Some("mcp__rui__approve".into());
-        let a = build_args(&r, Path::new("/x.json"));
+        let a = build_args(&r, Path::new("/x.json"), None);
         let pos = |k: &str| a.iter().position(|x| x == k).unwrap();
         assert_eq!(a[pos("--allowedTools") + 1], "Read,Bash");
         assert_eq!(a[pos("--permission-mode") + 1], "acceptEdits");
@@ -371,13 +366,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_flag_names_the_run_settings_file() {
+        let d = tempfile::tempdir().unwrap();
+        let a = build_args(&run(d.path()), Path::new("/x.json"), Some(Path::new("/tmp/rui-run-ab/settings.json")));
+        let pos = a.iter().position(|x| x == "--settings").unwrap();
+        assert_eq!(a[pos + 1], "/tmp/rui-run-ab/settings.json");
+        assert!(!a.contains(&"--add-dir".to_string()));
+    }
+
+    #[test]
     fn partial_flag_only_when_set() {
         let d = tempfile::tempdir().unwrap();
         let mut r = run(d.path());
         let flag = "--include-partial-messages".to_string();
-        assert!(!build_args(&r, Path::new("/x.json")).contains(&flag));
+        assert!(!build_args(&r, Path::new("/x.json"), None).contains(&flag));
         r.partial = true;
-        assert!(build_args(&r, Path::new("/x.json")).contains(&flag));
+        assert!(build_args(&r, Path::new("/x.json"), None).contains(&flag));
     }
 
     #[test]
@@ -385,19 +389,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut r = run(d.path());
         let envs = |r: &AgentRun| {
-            let cmd = command("claude", r, Path::new("/x.json")).unwrap();
+            let cmd = command("claude", r, Path::new("/x.json"), None).unwrap();
             let set = cmd.as_std().get_envs().filter(|(_, v)| v.is_some());
             set.map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect::<Vec<_>>()
         };
         assert!(envs(&r).is_empty());
-        let cmd = command("claude", &r, Path::new("/x.json")).unwrap();
+        let cmd = command("claude", &r, Path::new("/x.json"), None).unwrap();
         assert!(cmd.as_std().get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()), "the daemon's key is removed");
         r.seat = Some(crate::seats::Seat { config_dir: Some("/tmp/claude-two".into()), ..crate::seats::default_seat() });
         let want = (std::ffi::OsString::from("CLAUDE_CONFIG_DIR"), Some(std::ffi::OsString::from("/tmp/claude-two")));
         assert_eq!(envs(&r), [want]);
         let missing = Some("RUI_TEST_RUNNER_MISSING_KEY".to_string());
         r.seat = Some(crate::seats::Seat { kind: crate::seats::SeatKind::ApiKey, env_var: missing, ..crate::seats::default_seat() });
-        assert!(command("claude", &r, Path::new("/x.json")).is_err());
+        assert!(command("claude", &r, Path::new("/x.json"), None).is_err());
     }
 
     #[test]
@@ -439,6 +443,20 @@ echo '{"type":"result","result":"hi","is_error":false}'"#,
         unsafe { std::env::set_var("RUI_CLAUDE_BIN", &bad) };
         let err = run_agent(&run(d.path()), |_| {}).await.err().unwrap();
         assert!(err.to_string().contains("boom"));
+        // A sandboxed run gets --settings naming a strict settings file that is gone after the run.
+        let echo = fake(
+            d.path(),
+            "settings.sh",
+            r#"for a; do [ "$prev" = "--settings" ] && f="$a"; prev="$a"; done
+grep -q '"failIfUnavailable": true' "$f" && echo "{\"type\":\"result\",\"result\":\"$f\"}""#,
+        );
+        unsafe { std::env::set_var("RUI_CLAUDE_BIN", &echo) };
+        let mut r = run(d.path());
+        r.sandbox = Some(crate::sandbox::Sandbox { data_dir: "/d".into(), repo: "/r".into(), hosts: vec![] });
+        let out = run_agent(&r, |_| {}).await.unwrap();
+        let file = PathBuf::from(out.result_text.expect("settings file passed and strict"));
+        assert!(file.starts_with(std::env::temp_dir()) && !file.starts_with(d.path()));
+        assert!(!file.exists(), "the run dir is removed when the run ends");
         unsafe { std::env::remove_var("RUI_CLAUDE_BIN") };
     }
 

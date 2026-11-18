@@ -106,6 +106,9 @@ fn task_items(db: &Db, questioned: &HashSet<i64>) -> Result<Vec<InboxItem>> {
         if t.parent_id.is_some() || s.word != "Needs you" || questioned.contains(&t.id) {
             continue;
         }
+        if t.status == TaskStatus::Stuck && crate::sandbox::blocked(db, t)?.is_some() {
+            continue;
+        }
         items.extend(task_item(db, t, s)?);
     }
     Ok(items)
@@ -196,6 +199,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     items.extend(task_items(db, &questioned)?);
     items.extend(checkpoint_items(db, &tasks)?);
     items.extend(seat_items(db)?);
+    items.extend(crate::sandbox::inbox_items(db, &tasks)?);
     items.extend(crate::scout::inbox_items(db)?);
     items.extend(crate::coach::inbox_items(db)?);
     items.extend(crate::email::inbox_items(db)?);

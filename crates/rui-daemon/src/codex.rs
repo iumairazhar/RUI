@@ -216,6 +216,7 @@ mod tests {
             resume: Some("old".into()),
             partial: true,
             seat: None,
+            sandbox: None,
         }
     }
 

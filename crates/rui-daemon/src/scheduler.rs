@@ -1069,6 +1069,7 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
         resume: None,
         partial: true,
         seat: None,
+        sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
     })
 }
 
@@ -1078,7 +1079,11 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
-    if let Err(e) = run_logged(db, cfg, live, "lead", task_id, run).await {
+    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    if sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    if let Err(e) = res {
         return agent_failed(db, task_id, &e);
     }
     after_lead_turn(db, task_id)?;
@@ -1091,7 +1096,11 @@ async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result
     let client = client_for(db, &task)?;
     let prompt = review_prompt(db, &cfg.data_dir, &task, &client)?;
     let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
-    if let Err(e) = run_logged(db, cfg, live, "lead", task_id, run).await {
+    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    if sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    if let Err(e) = res {
         return agent_failed(db, task_id, &e);
     }
     if after_lead_turn(db, task_id)? == TaskStatus::Stuck {
@@ -1122,6 +1131,21 @@ fn review_prompt(db: &Db, data_dir: &Path, task: &Task, client: &Client) -> Resu
         lines.join("\n"),
         id = task.id,
     ))
+}
+
+/// When a Claude run stopped at startup because no sandbox is available, stops the task with
+/// reason "sandbox unavailable" and returns true. The run is never retried unsandboxed.
+fn sandbox_missing(db: &Db, task_id: i64, res: &Result<RunOutcome>) -> Result<bool> {
+    let Some(text) = limit_text(res).filter(|t| crate::sandbox::unavailable_text(t)) else { return Ok(false) };
+    stop_for_sandbox(db, task_id, &text, crate::sandbox::UNAVAILABLE)?;
+    Ok(true)
+}
+
+/// Records an `agent_error` carrying `reason` and sends the task down the stuck path.
+fn stop_for_sandbox(db: &Db, task_id: i64, error: &str, reason: &str) -> Result<()> {
+    db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": error, "reason": reason}))?;
+    db.set_task_status(task_id, TaskStatus::Stuck)?;
+    raise_stuck_question(db, task_id, reason)
 }
 
 fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
@@ -1190,7 +1214,10 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), &answers, tool);
     if level == "lead" {
         let run = account_lead_run(db, cfg, &parent, &client, "a member's question", prompt)?;
-        run_logged(db, cfg, live, "lead", parent.id, run).await?;
+        let res = run_logged(db, cfg, live, "lead", parent.id, run).await;
+        if !sandbox_missing(db, parent.id, &res)? {
+            res?;
+        }
         return Ok(());
     }
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
@@ -1245,6 +1272,7 @@ fn rui_decision_run(cfg: &Config, parent: &Task, prompt: String, system_prompt: 
         resume: None,
         partial: true,
         seat: None,
+        sandbox: None,
     }
 }
 
@@ -1381,9 +1409,18 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         resume,
         partial: true,
         seat: None,
+        sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
     };
     let cli = crate::codex::for_member(&cfg.data_dir, &client.name, task.agent.as_deref().unwrap_or("builder"));
-    match run_logged_on(cli, db, cfg, live, "builder", task_id, run).await {
+    if cli == Cli::Codex && crate::sandbox::codex_refused() {
+        let why = "Codex runs can still read RUI's data folder; use Claude for this client";
+        return stop_for_sandbox(db, task_id, why, crate::sandbox::CODEX_REFUSED);
+    }
+    let res = run_logged_on(cli, db, cfg, live, "builder", task_id, run).await;
+    if cli == Cli::Claude && sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    match res {
         Ok(out) => {
             if let Some(id) = out.session_id {
                 db.set_session(Role::Builder, Some(task_id), &id)?;
@@ -1629,6 +1666,26 @@ mod tests {
     }
     use crate::db::NewTask;
     use rui_core::SourceKind;
+
+    #[test]
+    fn missing_sandbox_stops_the_task_and_other_failures_do_not() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Clarifying);
+        let boom: Result<RunOutcome> = Err(anyhow::anyhow!("claude exited with failure: boom"));
+        assert!(!sandbox_missing(&db, t.id, &boom).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Clarifying);
+        let err = "claude exited with failure: sandbox required but unavailable. Set sandbox.failIfUnavailable=false to allow unsandboxed execution.";
+        assert!(sandbox_missing(&db, t.id, &Err(anyhow::anyhow!(err))).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(t.id), 10).unwrap();
+        let e = events.iter().find(|e| e.kind == "agent_error").unwrap();
+        assert_eq!(e.payload["reason"], crate::sandbox::UNAVAILABLE);
+        assert!(events.iter().any(|e| e.kind == "question_raised"), "goes down the stuck path");
+        let items = crate::inbox::inbox(&db).unwrap();
+        let item = items.iter().find(|i| i.kind == "sandbox_unavailable").unwrap();
+        assert_eq!((item.task_id, item.actions.clone()), (Some(t.id), vec!["retry".to_string()]));
+    }
 
     #[test]
     fn instructions_block_formats_items() {

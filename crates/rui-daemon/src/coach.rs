@@ -127,6 +127,7 @@ fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
         resume: None,
         partial: false,
         seat: None,
+        sandbox: None,
     })
 }
 

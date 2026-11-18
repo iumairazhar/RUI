@@ -30,6 +30,7 @@ pub mod results;
 pub mod roster;
 pub mod run_tokens;
 pub mod runner;
+pub mod sandbox;
 pub mod scheduler;
 pub mod scout;
 pub mod seat;

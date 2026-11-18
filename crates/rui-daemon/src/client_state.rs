@@ -20,6 +20,9 @@ pub struct ClientFile {
     /// How to deploy this client's work. Only the owner sets it; every run needs the owner's yes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeployConfig>,
+    /// Extra hosts this client's sandboxed runs may reach, added to the default list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_hosts: Vec<String>,
 }
 
 /// The owner's deploy command and the environment it deploys to.
@@ -74,8 +77,9 @@ pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<boo
     let kept = old.as_ref().is_some_and(|c| c.internal);
     let domains = old.as_ref().map(|c| c.domains.clone()).unwrap_or_default();
     let deploy = old.as_ref().and_then(|c| c.deploy.clone());
+    let network_hosts = old.as_ref().map(|c| c.network_hosts.clone()).unwrap_or_default();
     let base = old.and_then(|c| c.base);
-    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains, deploy };
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains, deploy, network_hosts };
     fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
     create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
     for f in ["briefs.md", "decisions.log", "playbook.md", "knowledge.md"] {
@@ -234,7 +238,7 @@ mod tests {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"]);
         ensure(t.path(), "A", "/r", None).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "main");
-        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![], deploy: None };
+        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![], deploy: None, network_hosts: vec![] };
         fs::write(dir(t.path(), "A").join("client.json"), serde_json::to_string(&file).unwrap()).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "release");
     }

@@ -178,6 +178,7 @@ fn scout_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64) -> Result<Age
         resume: None,
         partial: false,
         seat: None,
+        sandbox: None,
     })
 }
 

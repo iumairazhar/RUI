@@ -64,6 +64,7 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
         grant: crate::run_tokens::RunGrant { server: crate::run_tokens::Server::Rui, task_id: None, source_ref: Some(format!("chat:{id}")) },
         resume: db.get_rui_session(chat_id)?,
         seat: None,
+        sandbox: None,
         partial: true,
     };
     let key = LiveKey::Chat(chat_id);

@@ -2408,6 +2408,7 @@ mod tests {
             grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None),
             resume: None,
             seat: None,
+            sandbox: None,
             partial: false,
         };
         let out = run_agent(&run, |l| {
