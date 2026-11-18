@@ -10,6 +10,7 @@ mod chat_tools;
 pub mod clients;
 pub mod decision;
 pub mod inbox;
+pub mod inbox_kinds;
 pub mod library;
 pub mod live;
 pub mod markdown;

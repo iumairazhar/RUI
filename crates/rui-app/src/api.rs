@@ -6,6 +6,9 @@ use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Ta
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod support;
+pub use support::*;
+
 /// Base URL of the daemon (`RUI_URL` or the default local address).
 pub fn base_url() -> String {
     std::env::var("RUI_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into())
@@ -88,6 +91,12 @@ pub struct InboxItem {
     pub actions: Vec<String>,
     #[serde(default)]
     pub created_at: String,
+    /// Longer text, like a Scout report or the text a Coach proposal adds.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Where to act outside RUI, like a PR link.
+    #[serde(default)]
+    pub link: Option<String>,
 }
 
 /// A task's owner-facing status word and reason, from `GET /tasks/state`.

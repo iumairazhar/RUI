@@ -9,6 +9,8 @@ use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Ta
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+mod support;
+
 const MAX_EVENTS: usize = 300;
 const FIRST_EVENT_LIMIT: usize = 200;
 /// Answered asks kept for the chat page.
@@ -63,6 +65,10 @@ pub struct Store {
     pub action_error: Option<String>,
     /// Signed-in seat info; `None` until the first successful fetch.
     pub seat: Option<SeatInfo>,
+    /// Every seat with its usage, from `GET /seats`.
+    pub seats: Vec<api::SeatStatus>,
+    /// Set to ask the root to switch to the Seat page.
+    pub open_seats: bool,
     /// Latest run per task id.
     pub runs: HashMap<i64, TaskRun>,
     /// Everything that needs the owner, newest first.
@@ -128,6 +134,7 @@ pub struct Store {
 /// Extra data fetched each poll; each part may fail on its own.
 struct Extras {
     seat: Option<SeatInfo>,
+    seats: Option<Vec<api::SeatStatus>>,
     runs: Option<Vec<TaskRun>>,
     inbox: Option<Vec<InboxItem>>,
     states: Option<Vec<OwnerState>>,
@@ -142,6 +149,7 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
     let limit = FIRST_EVENT_LIMIT;
     Extras {
         seat: api::get_seat().ok(),
+        seats: api::get_seats().ok(),
         runs: api::get_task_runs().ok(),
         inbox: api::get_inbox().ok(),
         states: api::get_task_states().ok(),
@@ -218,6 +226,8 @@ impl Store {
             error: None,
             action_error: None,
             seat: None,
+            seats: vec![],
+            open_seats: false,
             runs: HashMap::new(),
             inbox: vec![],
             states: HashMap::new(),
@@ -323,6 +333,9 @@ impl Store {
         }
         if extras.seat.is_some() {
             self.seat = extras.seat;
+        }
+        if let Some(seats) = extras.seats {
+            self.seats = seats;
         }
         if let Some(runs) = extras.runs {
             self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();

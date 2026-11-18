@@ -24,6 +24,8 @@ pub struct CardData {
     pub decision: Decision,
     /// When the decision came up, for newest-first order.
     pub at: String,
+    /// The step's attempt limit, when known.
+    pub max_loops: Option<i64>,
 }
 
 impl CardData {
@@ -32,7 +34,8 @@ impl CardData {
         let decision = n.decision.clone()?;
         let task_id = n.subtask_id.unwrap_or(t.id);
         let (node_id, at) = (n.id.clone(), n.started_at.clone());
-        Some(Self { thread_id: t.id, task_id, node_id, client: t.client.name.clone(), decision, at })
+        let max_loops = n.attempts.as_ref().map(|a| a.max).filter(|m| *m > 0);
+        Some(Self { thread_id: t.id, task_id, node_id, client: t.client.name.clone(), decision, at, max_loops })
     }
 
     /// A plain card for an open question whose thread has not loaded yet.
@@ -46,7 +49,7 @@ impl CardData {
             risk: "unknown".into(), actions: vec!["answer".into()], ..Default::default()
         };
         let (node_id, at) = (format!("q:{}", q.id), q.created_at.clone());
-        Self { thread_id, task_id: q.task_id, node_id, client: client.unwrap_or_default(), decision, at }
+        Self { thread_id, task_id: q.task_id, node_id, client: client.unwrap_or_default(), decision, at, max_loops: None }
     }
 
     /// Key that keeps one card entity per decision.
@@ -165,6 +168,24 @@ pub fn acts(d: &Decision) -> Vec<Act> {
     d.actions.iter().flat_map(one).collect()
 }
 
+/// Highest attempt limit "+3 tries" may set.
+const LIMIT_CAP: i64 = 20;
+
+/// New limit for "+3 tries": three more, capped at 20. None when unknown or already at the cap.
+pub fn raised_limit(max: Option<i64>) -> Option<i64> {
+    let max = max?;
+    let to = (max + 3).min(LIMIT_CAP);
+    (to > max).then_some(to)
+}
+
+/// "+3 tries" when the limit can be raised; otherwise the retry wording.
+pub fn raise_label(max: Option<i64>) -> String {
+    match (raised_limit(max), max) {
+        (Some(to), Some(m)) => format!("+{} tries", to - m),
+        _ => Act::RaiseLimit.label(),
+    }
+}
+
 /// Seconds left to undo an answer that runs at `run_at`.
 pub fn undo_left(run_at: i64, now: i64) -> i64 {
     (run_at - now).max(0)
@@ -264,8 +285,18 @@ impl DecisionCard {
             Act::Answer => self.send(d, None, cx),
             Act::Approve => self.store.update(cx, |s, cx| s.review_task(review, true, None, cx)),
             Act::SendBack => self.send_back(review, cx),
-            Act::Retry | Act::RaiseLimit => self.store.update(cx, |s, cx| s.retry_task(d.task_id, cx)),
+            Act::Retry => self.store.update(cx, |s, cx| s.retry_task(d.task_id, cx)),
+            Act::RaiseLimit => self.raise_limit(&d, cx),
             Act::Stop => self.store.update(cx, |s, cx| s.stop_task(d.task_id, "Decision card", None, cx)),
+        }
+    }
+
+    /// Raise the step's attempt limit by three; retry when the limit is unknown or capped.
+    fn raise_limit(&mut self, d: &CardData, cx: &mut Context<Self>) {
+        let task = d.task_id;
+        match raised_limit(d.max_loops) {
+            Some(to) => self.store.update(cx, |s, cx| s.set_limit(task, to, cx)),
+            None => self.store.update(cx, |s, cx| s.retry_task(task, cx)),
         }
     }
 
@@ -365,7 +396,10 @@ impl DecisionCard {
     }
 
     fn button(&self, i: usize, act: Act, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let label = act.label();
+        let label = match act {
+            Act::RaiseLimit => raise_label(self.data.as_ref().and_then(|d| d.max_loops)),
+            _ => act.label(),
+        };
         let el = match act {
             Act::Approve | Act::Answer => primary_button(format!("decision-act-{i}"), &label, cx),
             Act::Stop => danger_button(format!("decision-act-{i}"), &label, true, th),
@@ -471,7 +505,7 @@ mod tests {
 
     fn card(risk: &str, at: &str) -> CardData {
         let decision = Decision { risk: risk.into(), ..Default::default() };
-        CardData { thread_id: 1, task_id: 1, node_id: format!("{risk}{at}"), client: String::new(), decision, at: at.into() }
+        CardData { thread_id: 1, task_id: 1, node_id: format!("{risk}{at}"), client: String::new(), decision, at: at.into(), max_loops: None }
     }
 
     #[test]
@@ -504,6 +538,16 @@ mod tests {
         assert_eq!(acts(&d(&["retry"], &[])), [Act::Retry]);
         assert_eq!(Act::SendBack.label(), "Ask for changes");
         assert_eq!(Act::Answer.label(), "Send down");
+    }
+
+    #[test]
+    fn raise_limit_adds_three_capped_at_twenty() {
+        assert_eq!(raised_limit(Some(5)), Some(8));
+        assert_eq!(raised_limit(Some(19)), Some(20));
+        assert_eq!(raised_limit(Some(20)), None);
+        assert_eq!(raised_limit(None), None);
+        assert_eq!(raise_label(Some(5)), "+3 tries");
+        assert_eq!(raise_label(None), "Give it more tries");
     }
 
     #[test]

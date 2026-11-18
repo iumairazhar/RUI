@@ -6,9 +6,11 @@ use super::character::{CharState, character};
 use super::library::{after_slide, close_button, drawer_shell, scroll_body, scrim, slide_overlay};
 use super::motion::rise;
 use super::status::{Word, char_state, style};
+use super::inbox::{is_snoozed, item_key};
+use super::inbox_kinds as kinds;
 use super::{chip, markdown, page_head, primary_button, tag};
 use crate::api::InboxItem;
-use crate::store::{self, Store};
+use crate::store::{self, ItemKey, Store, now_secs};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{
@@ -183,10 +185,32 @@ impl QuestionsView {
         rise(row, (r.rise, n), i).into_any_element()
     }
 
+    /// Drawer rows for kinds that open a drawer; the rest are acted on right in their card.
     fn rows(&self, items: &[InboxItem], cx: &mut Context<Self>) -> Vec<AnyElement> {
         let th = theme(cx).clone();
-        let rows: Vec<Row> = items.iter().filter_map(|it| self.item_row(it, &th, cx)).collect();
-        rows.into_iter().enumerate().map(|(i, r)| self.row(i, r, cx)).collect()
+        let mut out = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            let el = match self.item_row(it, &th, cx) {
+                Some(r) => self.row(i, r, cx),
+                None => self.inline_card(i, it, &th, cx),
+            };
+            out.push(el);
+        }
+        out
+    }
+
+    /// An item with its buttons in the row: undo, checkpoint, seats, Coach, Scout, inputs and unknown kinds.
+    fn inline_card(&self, i: usize, it: &InboxItem, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (word, st) = kinds::tag_of(kinds::kind_of(&it.kind), th);
+        let title = div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis();
+        let title = title.text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(first_line(&it.title));
+        let top = div().flex().items_center().gap(px(8.)).child(title).child(tag(st, word));
+        let reason = (!it.reason.is_empty()).then(|| div().text_size(px(11.5)).text_color(th.muted).child(it.reason.clone()));
+        let buttons = kinds::act_buttons("inbox", i, it, &self.store, cx);
+        let buttons = (!buttons.is_empty()).then(|| div().flex().flex_wrap().gap(px(8.)).children(buttons));
+        let card = div().id(("inbox-item", i)).flex().flex_col().gap(px(8.)).px(px(14.)).py(px(11.)).mb(px(6.));
+        let card = card.rounded(px(10.)).bg(th.surface).child(top).children(reason).children(kinds::body(it, th)).children(buttons);
+        rise(card, ("inbox-item-rise", i), i).into_any_element()
     }
 
     fn item_row(&self, it: &InboxItem, th: &Theme, cx: &Context<Self>) -> Option<Row> {
@@ -208,6 +232,12 @@ fn kind_parts(kind: &str, id: i64) -> Option<(Open, &'static str, &'static str, 
         "review" => (Open::Review(id), "inbox-r", "inbox-r-rise", "Review", Word::Done),
         _ => return None,
     })
+}
+
+/// Items that are not snoozed, as the slide-over shows them.
+fn awake(items: &[InboxItem], snoozed: &HashMap<ItemKey, i64>) -> Vec<InboxItem> {
+    let now = now_secs();
+    items.iter().filter(|it| !is_snoozed(snoozed, &item_key(it), now)).cloned().collect()
 }
 
 /// What one list row shows.
@@ -472,7 +502,7 @@ impl Render for QuestionsView {
         }
         let (questions, asks, inbox) = {
             let s = self.store.read(cx);
-            (s.questions.clone(), s.asks.clone(), s.inbox.clone())
+            (s.questions.clone(), s.asks.clone(), awake(&s.inbox, &s.snoozed))
         };
         let th = theme(cx).clone();
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();

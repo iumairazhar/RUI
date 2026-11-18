@@ -3,10 +3,11 @@
 use super::activity::local_offset;
 use super::decision::{self, CardEvent, Cards};
 use super::library::{after_slide, close_button, scrim, slide_overlay, tab_bar};
-use super::{chip, primary_button, tag};
+use super::inbox_kinds as kinds;
+use super::{chip, tag};
 use crate::api::InboxItem;
 use crate::store::{self, ItemKey, Store, now_secs};
-use crate::theme::{Status, Theme, theme};
+use crate::theme::{Theme, theme};
 use gpui::{AnyElement, Context, Div, Entity, EventEmitter, FontWeight, Stateful, Window, div, prelude::*, px};
 use std::collections::HashMap;
 
@@ -65,19 +66,6 @@ pub fn until_text(until: i64, now: i64, offset: i64) -> String {
     let secs = (until + offset).rem_euclid(86_400);
     let clock = format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
     if day(until) > day(now) { format!("Until tomorrow {clock}") } else { format!("Until {clock}") }
-}
-
-/// Tag text and colour family for an item kind.
-fn kind_tag<'a>(kind: &str, th: &'a Theme) -> (&'static str, &'a Status) {
-    match kind {
-        "question" => ("Question", &th.block),
-        "stuck" => ("Stuck", &th.block),
-        "review" => ("Review", &th.done),
-        "undo" => ("Sending", &th.run),
-        "checkpoint" => ("Ready", &th.wait),
-        "ask" => ("Asked in chat", &th.think),
-        _ => ("Seats", &th.wait),
-    }
 }
 
 /// The slide-over panel with its tabs, rows and snooze menus.
@@ -156,7 +144,7 @@ impl InboxPanel {
 
 impl InboxPanel {
     fn row(&mut self, i: usize, it: &InboxItem, until: Option<i64>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (word, st) = kind_tag(&it.kind, th);
+        let (word, st) = kinds::tag_of(kinds::kind_of(&it.kind), th);
         let title = div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg);
         let top = div().flex().items_center().gap(px(8.)).child(title.child(decision::first_line(&it.title))).child(tag(st, word));
         let reason = (!it.reason.is_empty()).then(|| div().text_size(px(11.5)).text_color(th.muted).child(it.reason.clone()));
@@ -166,8 +154,10 @@ impl InboxPanel {
         };
         let menu = (until.is_none() && self.menu == Some(item_key(it))).then(|| self.snooze_menu(i, it, cx));
         let card = self.row_card(it, until, cx);
+        let body = kinds::body(it, th);
         let row = div().id(("inbox-panel-row", i)).flex().flex_col().gap(px(8.)).p(px(12.)).rounded(px(10.)).bg(th.surface);
-        row.border_1().border_color(th.hairline).child(top).children(reason).child(buttons).children(menu).children(card).into_any_element()
+        let row = row.border_1().border_color(th.hairline).child(top).children(reason).children(body);
+        row.child(buttons).children(menu).children(card).into_any_element()
     }
 
     fn row_card(&mut self, it: &InboxItem, until: Option<i64>, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -182,13 +172,9 @@ impl InboxPanel {
     fn buttons(&self, i: usize, it: &InboxItem, cx: &mut Context<Self>) -> Div {
         let id = it.id;
         let main = match it.kind.as_str() {
-            "question" => Some(chip(format!("inbox-p-answer-{i}"), "Answer", cx).on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx)))),
-            "undo" => Some(primary_button(format!("inbox-p-undo-{i}"), "Undo", cx)
-                .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.undo_answer(id, cx))))),
-            "checkpoint" => Some(primary_button(format!("inbox-p-release-{i}"), "Release", cx)
-                .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.release_step(id, cx))))),
-            "ask" | "stuck" | "review" => Some(self.open_button(i, it, cx)),
-            _ => None,
+            "question" => vec![chip(format!("inbox-p-answer-{i}"), "Answer", cx).on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx)))],
+            "ask" | "stuck" | "review" => vec![self.open_button(i, it, cx)],
+            _ => kinds::act_buttons("inbox-p", i, it, &self.store, cx),
         };
         let key = item_key(it);
         let snooze = chip(format!("inbox-p-snooze-{i}"), "Snooze", cx).on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(key.clone(), cx)));
@@ -269,7 +255,7 @@ mod tests {
     use super::*;
 
     fn item(kind: &str, id: i64) -> InboxItem {
-        InboxItem { kind: kind.into(), id, task_id: None, title: "t".into(), reason: String::new(), actions: vec![], created_at: String::new() }
+        InboxItem { kind: kind.into(), id, task_id: None, title: "t".into(), reason: String::new(), actions: vec![], created_at: String::new(), detail: None, link: None }
     }
 
     #[test]

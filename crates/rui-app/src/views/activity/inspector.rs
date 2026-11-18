@@ -55,6 +55,11 @@ fn node_word(status: &str) -> &'static str {
     if status == "owner" { "You're doing this step" } else { thread_word(status).label() }
 }
 
+/// The Scout can be asked about a step that failed, stalled or needs the owner.
+pub fn can_diagnose(status: &str) -> bool {
+    matches!(status, "failed" | "stalled" | "needs_you")
+}
+
 /// Run a daemon call off the main thread, then hand the result (or error text) back to the view.
 fn call<T: Send + 'static>(
     cx: &mut Context<ThreadsView>,
@@ -247,6 +252,11 @@ impl ThreadsView {
             let retry = chip("inspector-retry", "Retry", cx).on_click(cx.listener(move |this, _, _, cx| this.retry(sid, cx)));
             rows.push(retry.into_any_element());
         }
+        if can_diagnose(&n.status) {
+            let ask = chip("inspector-diagnose", "Ask Scout to diagnose", cx);
+            let ask = ask.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.diagnose(sid, cx))));
+            rows.push(ask.into_any_element());
+        }
         (!rows.is_empty()).then(|| section("Your controls", rows))
     }
 
@@ -362,5 +372,11 @@ mod tests {
         assert_eq!((cost_text(0.0), cost_text(1.256)), ("$0.00".to_string(), "$1.26".to_string()));
         assert_eq!(node_word("owner"), "You're doing this step");
         assert_eq!(node_word("failed"), "Needs you");
+    }
+
+    #[test]
+    fn scout_is_offered_for_failed_stalled_and_needs_you() {
+        assert!(["failed", "stalled", "needs_you"].iter().all(|s| can_diagnose(s)));
+        assert!(!can_diagnose("done") && !can_diagnose("running"));
     }
 }

@@ -169,6 +169,9 @@ impl Root {
                 store.update(cx, |s, _| s.tabs.insert(Sec::Work.key(), 0));
                 this.select(Nav::Work, cx);
             }
+            if store.update(cx, |s, _| std::mem::take(&mut s.open_seats)) {
+                this.go_to_seats(cx);
+            }
             if let Some(id) = store.update(cx, |s, _| s.open_task.take()) {
                 let changes = store.update(cx, |s, _| std::mem::take(&mut s.open_changes));
                 this.activity.update(cx, |v, cx| if changes { v.show_changes(id, cx) } else { v.open_thread(id, cx) });
@@ -307,6 +310,15 @@ impl Root {
         self.inbox_open = true;
         self.inbox.update(cx, |p, cx| p.opened(cx));
         cx.notify();
+    }
+
+    /// Switch to Cost → Seats, closing the Inbox slide-over if it is open.
+    fn go_to_seats(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, _| s.tabs.insert(Sec::Cost.key(), 1));
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
+        }
+        self.select(Nav::Cost, cx);
     }
 
     fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {
