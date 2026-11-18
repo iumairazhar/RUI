@@ -8,7 +8,9 @@
 //! A Codex turn runs `codex exec --json --skip-git-repo-check -C <cwd> --sandbox <mode> <prompt>`
 //! (binary override: `RUI_CODEX_BIN`). Codex has no system prompt flag, so the role's system prompt
 //! goes first in the prompt. The RUI MCP server is passed with `-c mcp_servers.rui.url=...` and
-//! `-c mcp_servers.rui.http_headers={...}`; a Codex build without HTTP MCP support cannot call
+//! `-c mcp_servers.rui.env_http_headers={...}`, which tells Codex to read the run token header from
+//! `RUI_RUN_TOKEN` in its environment, so the token never appears on the command line or in a
+//! file; a Codex build without HTTP MCP support cannot call
 //! report_status or ask_lead, and then the done_command is the only check of its work.
 //! Not supported on Codex: resuming a session (every turn is fresh), allowed-tool lists, live typing,
 //! seat environments, and dollar costs (Codex reports tokens only, so its result has no total_cost_usd).
@@ -51,14 +53,15 @@ fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// `-c` overrides that point Codex at the RUI MCP server with the run's headers.
-pub fn mcp_args(url: &str, headers: &[(String, String)]) -> Vec<String> {
-    let pairs: Vec<String> = headers.iter().map(|(k, v)| format!("{} = {}", toml_str(k), toml_str(v))).collect();
+/// `-c` overrides that point Codex at the RUI MCP server. The run token header names the
+/// environment variable that holds the token, never the token itself.
+pub fn mcp_args(url: &str) -> Vec<String> {
+    let header = format!("{} = {}", toml_str(crate::run_tokens::HEADER), toml_str(crate::run_tokens::ENV));
     vec![
         "-c".into(),
         format!("mcp_servers.rui.url={}", toml_str(url)),
         "-c".into(),
-        format!("mcp_servers.rui.http_headers={{{}}}", pairs.join(", ")),
+        format!("mcp_servers.rui.env_http_headers={{{header}}}"),
     ]
 }
 
@@ -76,7 +79,7 @@ pub fn build_args(run: &AgentRun) -> Vec<String> {
     let mut a: Vec<String> = ["exec", "--json", "--skip-git-repo-check", "-C"].map(String::from).to_vec();
     a.push(run.cwd.to_string_lossy().into_owned());
     a.extend(["--sandbox".to_string(), sandbox.to_string()]);
-    a.extend(mcp_args(&run.mcp_url, &run.mcp_headers));
+    a.extend(mcp_args(&run.mcp_url));
     a.push(prompt(run));
     a
 }
@@ -172,10 +175,11 @@ fn tool_result(id: &str, content: String, is_error: bool) -> ParsedLine {
     ParsedLine::ToolResult(json!({"type": "user", "cli": "codex", "message": {"role": "user", "content": [block]}}))
 }
 
-fn command(bin: &str, run: &AgentRun) -> Command {
+fn command(bin: &str, run: &AgentRun, token: &str) -> Command {
     let mut cmd = Command::new(bin);
     crate::seats::scrub_env(cmd.as_std_mut(), &crate::state::data_dir());
     cmd.args(build_args(run))
+        .env(crate::run_tokens::ENV, token)
         .current_dir(&run.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -185,10 +189,11 @@ fn command(bin: &str, run: &AgentRun) -> Command {
 }
 
 /// Runs Codex once, calling `on_line` for every parsed line.
-pub async fn run(run: &AgentRun, on_line: impl FnMut(&ParsedLine)) -> anyhow::Result<RunOutcome> {
+/// `token` is the run's MCP token; it goes into the process environment only.
+pub async fn run(run: &AgentRun, token: &str, on_line: impl FnMut(&ParsedLine)) -> anyhow::Result<RunOutcome> {
     let bin = std::env::var("RUI_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut parser = Parser::default();
-    crate::runner::stream(command(&bin, run), &bin, "codex", |l| parser.parse(l), on_line).await
+    crate::runner::stream(command(&bin, run, token), &bin, "codex", |l| parser.parse(l), on_line).await
 }
 
 #[cfg(test)]
@@ -207,7 +212,7 @@ mod tests {
             permission_mode: Some("acceptEdits".into()),
             permission_prompt_tool: None,
             mcp_url: "http://127.0.0.1:7/mcp/builder".into(),
-            mcp_headers: vec![("X-Rui-Task-Id".into(), "4".into())],
+            grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Builder, Some(4)),
             resume: Some("old".into()),
             partial: true,
             seat: None,
@@ -222,7 +227,7 @@ mod tests {
         assert_eq!(a[6], "workspace-write");
         assert_eq!(a[7..11], [
             "-c", "mcp_servers.rui.url=\"http://127.0.0.1:7/mcp/builder\"",
-            "-c", "mcp_servers.rui.http_headers={\"X-Rui-Task-Id\" = \"4\"}",
+            "-c", "mcp_servers.rui.env_http_headers={\"x-rui-run-token\" = \"RUI_RUN_TOKEN\"}",
         ]);
         assert_eq!(a.last().unwrap(), "You are a builder\n\n---\n\nFix the bug");
         assert_eq!(a.len(), 12, "no resume or tool flags: Codex does not take them");
@@ -230,6 +235,14 @@ mod tests {
         r.system_prompt = String::new();
         let a = build_args(&r);
         assert_eq!((a[6].as_str(), a.last().unwrap().as_str()), ("read-only", "Fix the bug"));
+    }
+
+    #[test]
+    fn run_token_goes_in_the_environment_only() {
+        let cmd = command("codex", &run(Path::new("/wt/4")), "secret-run-token");
+        let std = cmd.as_std();
+        assert!(std.get_envs().any(|(k, v)| k == "RUI_RUN_TOKEN" && v == Some("secret-run-token".as_ref())));
+        assert!(!std.get_args().any(|a| a.to_string_lossy().contains("secret-run-token")));
     }
 
     const FIXTURE: &str = r#"{"type":"thread.started","thread_id":"th_1"}

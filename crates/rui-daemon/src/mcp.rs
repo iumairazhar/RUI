@@ -2,14 +2,19 @@
 //!
 //! Tool logic lives in plain functions (`logic` module) so it can be unit
 //! tested without MCP. The rmcp handlers below are thin wrappers.
-//! Agent identity comes from HTTP headers (`X-Rui-Task-Id`, `X-Rui-Source-Ref`)
-//! read from the request parts rmcp injects into the tool call.
+//! Every request must carry a live per-run token (`x-rui-run-token`, see `run_tokens.rs`) issued
+//! for that route's server. Agent identity comes only from that token's grant, which the auth
+//! layer puts into the request parts rmcp injects into the tool call.
 
 use crate::apps::{self, AppSpec, Apps};
 use crate::db::{Db, NewTask};
 use crate::roster;
+use crate::run_tokens::{self, RunGrant, Server};
 use crate::scheduler::{self, Runs};
-use axum::http::request::Parts;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, request::Parts};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
@@ -27,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-/// Who is calling: read from the agent's HTTP headers.
+/// Who is calling: taken from the run token's grant.
 #[derive(Debug, Clone, Default)]
 pub struct Ctx {
     pub task_id: Option<i64>,
@@ -35,13 +40,41 @@ pub struct Ctx {
 }
 
 /// Builds the router with `/mcp/rui`, `/mcp/lead`, `/mcp/builder`, `/mcp/scout` and `/mcp/coach`.
+/// Each route only accepts a run token granted for its own server.
 pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axum::Router {
     axum::Router::new()
-        .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs)))
-        .nest_service("/mcp/lead", service(LeadServer::new(db.clone(), data_dir.clone())))
-        .nest_service("/mcp/builder", service(BuilderServer::new(db.clone(), data_dir.clone())))
-        .nest_service("/mcp/scout", service(crate::support_mcp::ScoutServer::new(db.clone())))
-        .nest_service("/mcp/coach", service(crate::support_mcp::CoachServer::new(db, data_dir)))
+        .merge(guarded("/mcp/rui", Server::Rui, service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs))))
+        .merge(guarded("/mcp/lead", Server::Lead, service(LeadServer::new(db.clone(), data_dir.clone()))))
+        .merge(guarded("/mcp/builder", Server::Builder, service(BuilderServer::new(db.clone(), data_dir.clone()))))
+        .merge(guarded("/mcp/scout", Server::Scout, service(crate::support_mcp::ScoutServer::new(db.clone()))))
+        .merge(guarded("/mcp/coach", Server::Coach, service(crate::support_mcp::CoachServer::new(db, data_dir))))
+}
+
+/// `svc` at `path`, behind the run token check for `server`.
+fn guarded<S: ServerHandler + Clone + Send + 'static>(
+    path: &str,
+    server: Server,
+    svc: StreamableHttpService<S, LocalSessionManager>,
+) -> axum::Router {
+    axum::Router::new()
+        .nest_service(path, svc)
+        .layer(middleware::from_fn_with_state(server, require_run_token))
+}
+
+/// 401 unless the request carries a live run token granted for `server`. The grant is stored in
+/// the request extensions, where `ctx_from` reads it.
+async fn require_run_token(State(server): State<Server>, mut req: Request, next: Next) -> Response {
+    let Some(grant) = grant_for(req.headers(), server) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    req.extensions_mut().insert(grant);
+    next.run(req).await
+}
+
+fn grant_for(headers: &axum::http::HeaderMap, server: Server) -> Option<RunGrant> {
+    let token = headers.get(run_tokens::HEADER)?.to_str().ok()?;
+    let grant = run_tokens::global().grant(token)?;
+    (grant.server == server).then_some(grant)
 }
 
 pub(crate) fn service<S: ServerHandler + Clone + Send + 'static>(
@@ -54,15 +87,10 @@ pub(crate) fn service<S: ServerHandler + Clone + Send + 'static>(
     StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config)
 }
 
+/// The caller's identity from the run token's grant. Request headers are never trusted.
 pub(crate) fn ctx_from(parts: &Parts) -> Ctx {
-    let header = |name: &str| {
-        let v = parts.headers.get(name)?.to_str().ok()?.trim();
-        (!v.is_empty()).then(|| v.to_string())
-    };
-    Ctx {
-        task_id: header("x-rui-task-id").and_then(|v| v.parse().ok()),
-        source_ref: header("x-rui-source-ref"),
-    }
+    let Some(grant) = parts.extensions.get::<RunGrant>() else { return Ctx::default() };
+    Ctx { task_id: grant.task_id, source_ref: grant.source_ref.clone() }
 }
 
 /// Runs blocking logic (git, a done_command precheck) off the async runtime.
@@ -375,7 +403,7 @@ pub mod logic {
     }
 
     fn current_task(db: &Db, ctx: &Ctx) -> anyhow::Result<Task> {
-        let id = ctx.task_id.ok_or_else(|| anyhow::anyhow!("missing X-Rui-Task-Id header"))?;
+        let id = ctx.task_id.ok_or_else(|| anyhow::anyhow!("this run has no task"))?;
         db.get_task(id)?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
     }
 
@@ -2066,7 +2094,7 @@ mod tests {
         let (db, _, _d) = setup(None);
         let none = Ctx::default();
         let err = logic::mark_split(&db, &none, NoArgs {}).unwrap_err();
-        assert!(err.to_string().contains("X-Rui-Task-Id"));
+        assert!(err.to_string().contains("no task"));
         let bogus = Ctx { task_id: Some(9999), source_ref: None };
         let a = StatusArgs { status: "DONE".into(), note: "r".into() };
         assert!(logic::member_status(&db, &bogus, a).is_err());
@@ -2241,32 +2269,54 @@ mod tests {
         assert!(log.contains("second remarks") && !log.contains("first remarks"), "{log}");
     }
 
-    async fn post(app: &axum::Router, path: &str, body: Value) -> Value {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-        let req = Request::post(path)
+    fn token(server: Server, task_id: Option<i64>) -> run_tokens::RunToken {
+        run_tokens::global().issue(RunGrant::new(server, task_id)).unwrap()
+    }
+
+    /// A JSON-RPC POST to `path` with `headers` added (the run token among them).
+    fn mcp_request(path: &str, headers: &[(&str, &str)], body: &Value) -> axum::http::Request<axum::body::Body> {
+        let mut req = axum::http::Request::post(path)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("host", "localhost")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
+            .header("host", "localhost");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.body(axum::body::Body::from(body.to_string())).unwrap()
+    }
+
+    fn init_body() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},
+            "clientInfo":{"name":"t","version":"1"}}})
+    }
+
+    async fn status(app: &axum::Router, path: &str, token: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+        let headers: Vec<(&str, &str)> = token.map(|t| (run_tokens::HEADER, t)).into_iter().collect();
+        app.clone().oneshot(mcp_request(path, &headers, &init_body())).await.unwrap().status()
+    }
+
+    async fn post(app: &axum::Router, path: &str, token: &str, body: Value) -> Value {
+        post_with(app, path, &[(run_tokens::HEADER, token)], body).await
+    }
+
+    async fn post_with(app: &axum::Router, path: &str, headers: &[(&str, &str)], body: Value) -> Value {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let resp = app.clone().oneshot(mcp_request(path, headers, &body)).await.unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let data = text.lines().find_map(|l| l.strip_prefix("data:")).unwrap_or(&text);
         serde_json::from_str(data.trim()).unwrap_or_else(|e| panic!("bad body {text:?}: {e}"))
     }
 
-    async fn tool_names(app: &axum::Router, path: &str) -> Vec<String> {
-        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-03-26","capabilities":{},
-            "clientInfo":{"name":"t","version":"1"}}});
-        let r = post(app, path, init).await;
+    async fn tool_names(app: &axum::Router, path: &str, server: Server) -> Vec<String> {
+        let t = token(server, None);
+        let r = post(app, path, t.value(), init_body()).await;
         assert!(r["result"].is_object(), "initialize failed: {r}");
         let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
-        let r = post(app, path, list).await;
+        let r = post(app, path, t.value(), list).await;
         let mut names: Vec<String> = r["result"]["tools"]
             .as_array()
             .unwrap_or_else(|| panic!("no tools: {r}"))
@@ -2281,13 +2331,55 @@ mod tests {
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
         let lead = ["ask_scout", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
-        assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
+        assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
-        assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
+        assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
         let rui = ["approve", "ask_owner", "create_client", "create_task", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "set_up_pod", "stop_apps", "stop_task", "use_repo"];
-        assert_eq!(tool_names(&app, "/mcp/rui").await, rui);
-        assert_eq!(tool_names(&app, "/mcp/scout").await, ["report"]);
-        assert_eq!(tool_names(&app, "/mcp/coach").await, ["done", "propose"]);
+        assert_eq!(tool_names(&app, "/mcp/rui", Server::Rui).await, rui);
+        assert_eq!(tool_names(&app, "/mcp/scout", Server::Scout).await, ["report"]);
+        assert_eq!(tool_names(&app, "/mcp/coach", Server::Coach).await, ["done", "propose"]);
+    }
+
+    fn test_router(db: Arc<Db>) -> axum::Router {
+        mcp_router(db, std::env::temp_dir(), Apps::default(), Runs::default())
+    }
+
+    #[tokio::test]
+    async fn mcp_needs_a_live_token_for_its_own_server() {
+        let app = test_router(Arc::new(Db::open_test()));
+        assert_eq!(status(&app, "/mcp/lead", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/lead", Some("not-a-token")).await, StatusCode::UNAUTHORIZED);
+        let builder = token(Server::Builder, Some(1));
+        assert_eq!(status(&app, "/mcp/lead", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/rui", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/builder", Some(builder.value())).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_stops_working_once_the_run_guard_drops() {
+        let app = test_router(Arc::new(Db::open_test()));
+        let lead = token(Server::Lead, Some(1));
+        let value = lead.value().to_string();
+        assert_eq!(status(&app, "/mcp/lead", Some(&value)).await, StatusCode::OK);
+        drop(lead);
+        assert_eq!(status(&app, "/mcp/lead", Some(&value)).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn forged_task_header_cannot_redirect_a_builder() {
+        let (db, _data, lead, member) = staffed();
+        let db = Arc::new(db);
+        let app = test_router(db.clone());
+        let t = token(Server::Builder, member.task_id);
+        let other = lead.task_id.unwrap().to_string();
+        let forged = [(run_tokens::HEADER, t.value()), ("x-rui-task-id", other.as_str()), ("x-rui-source-ref", "chat:1")];
+        let call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"report_progress","arguments":{"note":"forged"}}});
+        let r = post_with(&app, "/mcp/builder", &forged, call).await;
+        assert!(r["result"].is_object() && r["result"]["isError"] != true, "call failed: {r}");
+        let progress = |id: Option<i64>| db.list_events(id, 50).unwrap().into_iter().filter(|e| e.kind == "progress").count();
+        assert_eq!(progress(member.task_id), 1, "the note lands on the builder's own task");
+        assert_eq!(progress(lead.task_id), 0, "the forged header is ignored");
     }
 
     #[tokio::test]
@@ -2313,7 +2405,7 @@ mod tests {
             permission_mode: None,
             permission_prompt_tool: None,
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
-            mcp_headers: vec![],
+            grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None),
             resume: None,
             seat: None,
             partial: false,

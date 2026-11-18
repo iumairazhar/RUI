@@ -40,7 +40,8 @@ pub struct AgentRun {
     /// MCP tool that decides permission prompts (`--permission-prompt-tool`).
     pub permission_prompt_tool: Option<String>,
     pub mcp_url: String,
-    pub mcp_headers: Vec<(String, String)>,
+    /// The MCP server, task and source this run acts for; bound to a per-run token.
+    pub grant: crate::run_tokens::RunGrant,
     pub resume: Option<String>,
     /// Ask the CLI for partial message events (live typing).
     pub partial: bool,
@@ -67,11 +68,11 @@ pub enum ParsedLine {
     Other(Value),
 }
 
-/// Builds the MCP config JSON pointing at the RUI server.
-pub fn mcp_config_json(url: &str, headers: &[(String, String)]) -> Value {
-    let hdrs: serde_json::Map<String, Value> =
-        headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-    json!({"mcpServers": {"rui": {"type": "http", "url": url, "headers": hdrs}}})
+/// Builds the MCP config JSON pointing at the RUI server. The run token header names the
+/// environment variable; Claude Code expands it, so the token value never lands in the file.
+pub fn mcp_config_json(url: &str) -> Value {
+    let token = format!("${{{}}}", crate::run_tokens::ENV);
+    json!({"mcpServers": {"rui": {"type": "http", "url": url, "headers": {crate::run_tokens::HEADER: token}}}})
 }
 
 /// Builds the CLI argument list for a run.
@@ -155,25 +156,28 @@ pub async fn run_agent(
 }
 
 /// Runs one turn on the chosen agent CLI. Both report through the same `ParsedLine` shape.
+/// The run's MCP token lives exactly as long as this future: dropping it (abort, timeout) revokes it.
 pub async fn run_agent_with(
     cli: Cli,
     run: &AgentRun,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
+    let token = crate::run_tokens::global().issue(run.grant.clone())?;
     match cli {
-        Cli::Claude => run_claude(run, on_line).await,
-        Cli::Codex => crate::codex::run(run, on_line).await,
+        Cli::Claude => run_claude(run, token.value(), on_line).await,
+        Cli::Codex => crate::codex::run(run, token.value(), on_line).await,
     }
 }
 
 async fn run_claude(
     run: &AgentRun,
+    token: &str,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
     let cfg = temp_config_path();
-    let json = mcp_config_json(&run.mcp_url, &run.mcp_headers);
+    let json = mcp_config_json(&run.mcp_url);
     std::fs::write(&cfg, serde_json::to_vec(&json)?).context("write mcp config")?;
-    let res = run_with_config(run, &cfg, on_line).await;
+    let res = run_with_config(run, &cfg, token, on_line).await;
     let _ = std::fs::remove_file(&cfg);
     res
 }
@@ -181,10 +185,13 @@ async fn run_claude(
 async fn run_with_config(
     run: &AgentRun,
     cfg: &Path,
+    token: &str,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
     let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    stream(command(&bin, run, cfg)?, &bin, "claude", parse_line, on_line).await
+    let mut cmd = command(&bin, run, cfg)?;
+    cmd.env(crate::run_tokens::ENV, token);
+    stream(cmd, &bin, "claude", parse_line, on_line).await
 }
 
 /// Spawns `cmd`, parses each stdout line with `parse` and tracks the outcome.
@@ -269,7 +276,7 @@ mod tests {
             permission_mode: None,
             permission_prompt_tool: None,
             mcp_url: "http://127.0.0.1:1/none".into(),
-            mcp_headers: vec![],
+            grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Lead, Some(1)),
             resume: None,
             partial: false,
             seat: None,
@@ -371,10 +378,12 @@ mod tests {
 
     #[test]
     fn mcp_config_shape() {
-        let v = mcp_config_json("http://h/mcp", &[("X-Rui-Task-Id".into(), "5".into())]);
+        let v = mcp_config_json("http://h/mcp");
         assert_eq!(v["mcpServers"]["rui"]["type"], "http");
         assert_eq!(v["mcpServers"]["rui"]["url"], "http://h/mcp");
-        assert_eq!(v["mcpServers"]["rui"]["headers"]["X-Rui-Task-Id"], "5");
+        let headers = v["mcpServers"]["rui"]["headers"].as_object().unwrap();
+        assert_eq!(headers.len(), 1, "only the run token header: {headers:?}");
+        assert_eq!(headers["x-rui-run-token"], "${RUI_RUN_TOKEN}");
     }
 
     fn fake(dir: &Path, name: &str, body: &str) -> PathBuf {

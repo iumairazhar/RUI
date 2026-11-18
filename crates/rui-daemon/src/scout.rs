@@ -174,7 +174,7 @@ fn scout_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64) -> Result<Age
         permission_mode: None,
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/scout", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string()), ("X-Rui-Source-Ref".into(), request_id.to_string())],
+        grant: crate::run_tokens::RunGrant { server: crate::run_tokens::Server::Scout, task_id: Some(task_id), source_ref: Some(request_id.to_string()) },
         resume: None,
         partial: false,
         seat: None,

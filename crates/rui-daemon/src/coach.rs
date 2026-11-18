@@ -123,7 +123,7 @@ fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
         permission_mode: None,
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/coach", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string())],
+        grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Coach, Some(task_id)),
         resume: None,
         partial: false,
         seat: None,

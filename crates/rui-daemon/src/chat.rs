@@ -61,7 +61,7 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
         permission_mode: None,
         permission_prompt_tool: Some("mcp__rui__approve".into()),
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
-        mcp_headers: vec![("X-Rui-Source-Ref".into(), format!("chat:{id}"))],
+        grant: crate::run_tokens::RunGrant { server: crate::run_tokens::Server::Rui, task_id: None, source_ref: Some(format!("chat:{id}")) },
         resume: db.get_rui_session(chat_id)?,
         seat: None,
         partial: true,

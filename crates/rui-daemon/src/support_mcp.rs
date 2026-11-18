@@ -1,6 +1,6 @@
 //! MCP servers for the two support agents: the Scout (`report`) and the Coach (`propose`, `done`).
-//! Each exposes only its own tools. The task comes from `X-Rui-Task-Id`; a Scout run also sends
-//! its request event id as `X-Rui-Source-Ref`.
+//! Each exposes only its own tools. The task comes from the run token's grant; a Scout run's grant
+//! also carries its request event id as the source ref.
 
 use crate::coach::{self, Proposal};
 use crate::db::Db;
@@ -51,10 +51,10 @@ pub mod logic {
     use super::*;
 
     fn task_id(ctx: &Ctx) -> anyhow::Result<i64> {
-        ctx.task_id.context("missing X-Rui-Task-Id header")
+        ctx.task_id.context("this run has no task")
     }
 
-    /// The Scout's answer for the request named in `X-Rui-Source-Ref`.
+    /// The Scout's answer for the request named in the run's source ref.
     pub fn report(db: &Db, ctx: &Ctx, a: ReportArgs) -> anyhow::Result<Value> {
         let request: i64 = ctx.source_ref.as_deref().and_then(|s| s.parse().ok()).context("missing Scout request id")?;
         let r = Report { summary: a.summary, findings: a.findings, sources: a.sources };

@@ -813,18 +813,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_routes_need_the_token_but_mcp_stays_open() {
+    async fn owner_routes_need_the_token_but_mcp_uses_run_tokens() {
         let (app, db, _rx) = setup();
         let app = app.merge(crate::mcp::mcp_router(db, std::env::temp_dir(), Apps::default(), Runs::default()));
         assert_eq!(status_with(&app, "/tasks", None).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status_with(&app, "/tasks", Some("wrong")).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status_with(&app, "/skills", None).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status_with(&app, "/tasks", Some("test-owner-token")).await, StatusCode::OK);
-        let mcp = Request::post("/mcp/rui").header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream").header("host", "localhost")
-            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#))
-            .unwrap();
-        assert_eq!(app.oneshot(mcp).await.unwrap().status(), StatusCode::OK);
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let mcp = |token: Option<&str>| {
+            let mut req = Request::post("/mcp/rui").header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream").header("host", "localhost");
+            if let Some(t) = token {
+                req = req.header(crate::run_tokens::HEADER, t);
+            }
+            req.body(Body::from(init)).unwrap()
+        };
+        assert_eq!(app.clone().oneshot(mcp(Some("test-owner-token"))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let grant = crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None);
+        let run = crate::run_tokens::global().issue(grant).unwrap();
+        assert_eq!(app.oneshot(mcp(Some(run.value()))).await.unwrap().status(), StatusCode::OK);
     }
 
     fn seed_task_for(db: &Db, client_id: i64) -> i64 {
