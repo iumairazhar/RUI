@@ -339,7 +339,7 @@ pub fn changes_vs_base(wt: &Path) -> anyhow::Result<Vec<Change>> {
     Ok(list)
 }
 
-fn gh_command() -> String {
+pub(crate) fn gh_command() -> String {
     std::env::var("RUI_GH").unwrap_or_else(|_| "gh".into())
 }
 

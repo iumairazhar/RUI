@@ -57,7 +57,11 @@ pub fn receive(db: &Db, data_dir: &Path, email: &Email, client_id: Option<i64>, 
         "from": email.from.trim(), "subject": email.subject.trim(), "body": clip(&email.body, MAX_BODY),
         "client_id": client_id, "source": source,
     });
-    db.add_event(None, "inputs", "email_received", &payload)
+    let id = db.add_event(None, "inputs", "email_received", &payload)?;
+    if let Err(e) = crate::triggers::on_email(db, data_dir, id, &payload) {
+        eprintln!("email trigger failed: {e:#}");
+    }
+    Ok(id)
 }
 
 /// Emails the owner has not yet turned into a task or dismissed.

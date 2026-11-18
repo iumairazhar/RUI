@@ -181,9 +181,13 @@ fn plan_rollup(db: &Db, t: &Task) -> Result<Option<Action>> {
     Ok(None)
 }
 
-/// True when the Account Lead forwarded the task after the last subtask finished.
+/// True when the Account Lead forwarded the task after the last subtask finished, and after
+/// any PR feedback was routed to it (so a Lead handling feedback is not closed early).
 fn forwarded_since_done(db: &Db, task_id: i64, subs: &[Task]) -> Result<bool> {
     let Some(ev) = latest_event(db, task_id, "forwarded")? else { return Ok(false) };
+    if latest_event(db, task_id, "pr_feedback_routed")?.is_some_and(|r| r.id > ev.id) {
+        return Ok(false);
+    }
     Ok(subs.iter().all(|s| ev.created_at.as_str() >= s.updated_at.as_str()))
 }
 
@@ -509,19 +513,25 @@ pub fn hold_turns(actions: Vec<Action>, seat_free: bool) -> Vec<Action> {
     actions.into_iter().filter(keep).collect()
 }
 
-/// Runs the heartbeat once; errors are logged.
-fn beat(db: &Db, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
+/// Runs the heartbeat once; errors are logged. PR polling runs on a blocking thread.
+fn beat(db: &Arc<Db>, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
     let now = crate::thread::now_secs();
     if let Err(e) = crate::heartbeat::heartbeat(db, &cfg.data_dir, running, snapshot, now) {
         report_error(db, None, &e);
     }
     inputs_beat(db, &cfg.data_dir, now);
+    crate::pr_watch::spawn_poll(db.clone(), cfg.data_dir.clone(), running.clone());
 }
 
-/// Reads the drop folder and asks the Scout for briefs of meetings about to start; errors are logged.
+/// Reads the drop folder, asks the Scout for briefs of meetings about to start and fires due
+/// schedule triggers; errors are logged.
 fn inputs_beat(db: &Db, data_dir: &Path, now: i64) {
     let res = crate::drop::scan(db, data_dir).and_then(|_| crate::meeting::prep_due(db, data_dir, now));
     if let Err(e) = res {
+        report_error(db, None, &e);
+    }
+    let local = chrono::Local::now().naive_local();
+    if let Err(e) = crate::triggers::fire_scheduled(db, data_dir, local) {
         report_error(db, None, &e);
     }
 }

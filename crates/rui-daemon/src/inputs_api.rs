@@ -2,10 +2,11 @@
 //! POST /tasks/{id}/limit (change a subtask's loop limit),
 //! GET/POST /clients/{id}/knowledge (owner knowledge, append-only),
 //! POST /inputs/email and POST /inputs/email/{event_id} (make_task or dismiss),
-//! POST /inputs/meeting (a meeting to prepare a brief for).
+//! POST /inputs/meeting (a meeting to prepare a brief for),
+//! GET/POST /clients/{id}/triggers (the client's triggers; POST replaces the whole list).
 
 use crate::api::ApiState;
-use crate::{client_state, control, email, meeting};
+use crate::{client_state, control, email, meeting, triggers};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -38,6 +39,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/inputs/email", post(post_email))
         .route("/inputs/email/{event_id}", post(act_on_email))
         .route("/inputs/meeting", post(post_meeting))
+        .route("/clients/{id}/triggers", get(get_triggers).post(set_triggers))
 }
 
 #[derive(Deserialize)]
@@ -138,6 +140,20 @@ async fn post_meeting(State(s): State<ApiState>, Json(b): Json<MeetingBody>) -> 
     let m = meeting::Meeting { title: b.title, starts_at: start.to_utc(), attendees: b.attendees };
     let id = meeting::receive(&s.db, &s.data_dir, &m, Some(b.client_id), "api").map_err(bad)?;
     Ok(Json(json!({ "event_id": id })))
+}
+
+async fn get_triggers(State(s): State<ApiState>, Path(id): Path<i64>) -> Reply {
+    let name = client_name(&s, id)?;
+    let list = triggers::read(&s.data_dir, &name).map_err(internal)?;
+    Ok(Json(json!(list)))
+}
+
+/// Replaces the client's whole trigger list after checking every entry.
+async fn set_triggers(State(s): State<ApiState>, Path(id): Path<i64>, Json(list): Json<Vec<triggers::Trigger>>) -> Reply {
+    let name = client_name(&s, id)?;
+    triggers::validate(&list).map_err(bad)?;
+    triggers::write(&s.data_dir, &name, &list).map_err(internal)?;
+    Ok(Json(json!(list)))
 }
 
 #[cfg(test)]
@@ -262,5 +278,25 @@ mod tests {
         assert_eq!(call(&app, "POST", "/inputs/meeting", bad_time).await.0, StatusCode::BAD_REQUEST);
         let no_client = json!({"client_id": 999, "title": "K", "starts_at": "2026-11-18T15:00:00Z"});
         assert_eq!(call(&app, "POST", "/inputs/meeting", no_client).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn triggers_replace_and_validate() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _db, cid) = app(d.path());
+        let uri = format!("/clients/{cid}/triggers");
+        assert_eq!(call(&app, "GET", &uri, json!({})).await.1, json!([]));
+        let good = json!([{"id": "daily", "on": "schedule", "cron": "09:00 daily", "title": "Standup"}, {"id": "m", "on": "email", "title": "Answer"}]);
+        let (code, v) = call(&app, "POST", &uri, good).await;
+        assert_eq!((code, v.as_array().map(Vec::len)), (StatusCode::OK, Some(2)));
+        let bad = json!([{"id": "x", "on": "schedule", "cron": "whenever", "title": "T"}]);
+        assert_eq!(call(&app, "POST", &uri, bad).await.0, StatusCode::BAD_REQUEST);
+        let dup = json!([{"id": "x", "on": "email", "title": "T"}, {"id": "x", "on": "pr_merged", "title": "U"}]);
+        assert_eq!(call(&app, "POST", &uri, dup).await.0, StatusCode::BAD_REQUEST);
+        let (_, v) = call(&app, "GET", &uri, json!({})).await;
+        assert_eq!(v[0]["cron"], "09:00 daily");
+        assert_eq!(call(&app, "POST", &uri, json!([])).await.0, StatusCode::OK);
+        assert_eq!(call(&app, "GET", &uri, json!({})).await.1, json!([]));
+        assert_eq!(call(&app, "GET", "/clients/999/triggers", json!({})).await.0, StatusCode::NOT_FOUND);
     }
 }

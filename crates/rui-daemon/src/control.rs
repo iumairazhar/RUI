@@ -264,6 +264,17 @@ pub fn instruct(db: &Db, runs: &Runs, id: i64, text: &str, by: &str) -> Res<(Tas
     Ok((load(db, id)?, resume_note(&changed, &task)))
 }
 
+/// Wakes the Lead of a finished top-level task with an instruction, like feedback on its PR.
+/// Same path as `instruct`, but a done task is allowed: it goes back to new for a Lead turn.
+pub fn wake_lead(db: &Db, runs: &Runs, id: i64, text: &str, by: &str) -> Res<Task> {
+    let task = load(db, id)?;
+    if task.parent_id.is_some() || task.role != Role::Lead {
+        return Err(ControlError::Conflict("only a top-level Lead task can be woken".into()));
+    }
+    queue_instruction(db, runs, &task, text, by)?;
+    load(db, id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

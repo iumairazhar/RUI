@@ -14,10 +14,10 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 18] = [
+const KINDS: [&str; 20] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
     "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
-    "handed_back",
+    "handed_back", "pr_merged", "pr_closed",
 ];
 const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
 const TAKEOVER_REASON: &str = "You're doing this step";
@@ -210,7 +210,8 @@ fn pending_review<'a>(ctx: &'a Ctx) -> Option<&'a Event> {
     let evs = ctx.evs(ctx.top.id);
     let fwd = latest(&evs, "forwarded")?;
     let approved = evs.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
-    (fwd.id > approved && fwd.id > max_id(&evs, "landed")).then_some(fwd)
+    let settled = max_id(&evs, "landed").max(max_id(&evs, "pr_merged")).max(max_id(&evs, "pr_closed"));
+    (fwd.id > approved && fwd.id > settled).then_some(fwd)
 }
 
 fn last_is_failure(evs: &[&Event]) -> bool {
@@ -491,6 +492,23 @@ fn forward_node(ctx: &Ctx) -> Option<Node> {
     }
 }
 
+/// A merged PR is a done "pr" output; one closed without a merge is a failed one.
+fn pr_outcome_nodes(ctx: &Ctx) -> Vec<Node> {
+    let evs = ctx.evs(ctx.top.id);
+    let outcome = |e: &&Event| e.kind == "pr_merged" || e.kind == "pr_closed";
+    evs.into_iter().filter(outcome).map(pr_outcome_node).collect()
+}
+
+fn pr_outcome_node(e: &Event) -> Node {
+    let merged = e.kind == "pr_merged";
+    let label = if merged { "PR merged" } else { "PR closed without merge" };
+    let url = e.payload["url"].as_str().filter(|u| !u.is_empty()).map(String::from);
+    let out = Output { kind: "pr", label: label.into(), url, preview: None, output_tail: None };
+    let mut n = out_node(e, "pr", label, out);
+    n.status = if merged { "done" } else { "failed" };
+    n
+}
+
 fn app_nodes(ctx: &Ctx) -> Vec<Node> {
     let started = ctx.events.iter().filter(|e| e.kind == "apps_started" && e.task_id == Some(ctx.top.id));
     started.filter_map(|e| app_node(e)).collect()
@@ -519,6 +537,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     v.extend(land_decisions(ctx));
     v.extend(review_decision(ctx));
     v.extend(forward_node(ctx));
+    v.extend(pr_outcome_nodes(ctx));
     v.extend(app_nodes(ctx));
     v
 }
@@ -898,6 +917,23 @@ mod tests {
         let th = get(&db, top, real_now());
         assert!(kinds(&th).contains(&"diff"));
         assert!(th.nodes.iter().all(|n| n.kind != "decision"));
+    }
+
+    #[test]
+    fn pr_merged_and_closed_are_out_nodes() {
+        let (db, top, _) = setup(TaskStatus::Done);
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": "https://x.test/pr/1"})).unwrap();
+        db.add_event(Some(top), "github", "pr_merged", &json!({"url": "https://x.test/pr/1", "merged_at": "t"})).unwrap();
+        let th = get(&db, top, real_now());
+        let merged = th.nodes.iter().find(|n| n.title == "PR merged").unwrap();
+        assert_eq!((merged.lane, merged.kind, merged.status), ("out", "pr", "done"));
+        assert!(th.nodes.iter().all(|n| n.kind != "decision"), "a merged PR needs no review");
+        let (db, top, _) = setup(TaskStatus::Stuck);
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": "https://x.test/pr/2"})).unwrap();
+        db.add_event(Some(top), "github", "pr_closed", &json!({"url": "https://x.test/pr/2"})).unwrap();
+        let th = get(&db, top, real_now());
+        let closed = th.nodes.iter().find(|n| n.title == "PR closed without merge").unwrap();
+        assert_eq!((closed.lane, closed.kind, closed.status), ("out", "pr", "failed"));
     }
 
     #[test]

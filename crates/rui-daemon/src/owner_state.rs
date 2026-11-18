@@ -10,10 +10,13 @@ use std::collections::HashMap;
 
 /// The reason line of a finished task that waits for the owner's review.
 pub const REVIEW_REASON: &str = "Finished, review the result";
-const CAUSES: [&str; 7] = ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit"];
-const KINDS: [&str; 10] = [
+/// The reason line of a task whose PR was closed on GitHub without a merge.
+pub const PR_CLOSED_REASON: &str = "PR closed without merge";
+const CAUSES: [&str; 8] =
+    ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "pr_closed"];
+const KINDS: [&str; 13] = [
     "stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "resumed", "dropped",
-    "reviewed",
+    "reviewed", "pr_closed", "pr_merged", "forwarded",
 ];
 
 /// What the owner sees for one task.
@@ -179,6 +182,7 @@ fn cause_reason(e: &Event) -> String {
         "lead_no_outcome" => "The Lead stopped without a plan".into(),
         "rollup" => "A teammate is stuck".into(),
         "loop_limit" => "Hit its loop limit".into(),
+        "pr_closed" => PR_CLOSED_REASON.into(),
         _ => "Stuck".into(),
     }
 }
@@ -193,6 +197,9 @@ fn done_state(t: &Task, ev: &[Event]) -> (&'static str, String) {
     }
     let approved = ev.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
     let forwarded = latest_id(ev, "forwarded");
+    if t.parent_id.is_none() && latest_id(ev, "pr_merged") > forwarded && forwarded > 0 {
+        return ("Done", "Merged on GitHub".into());
+    }
     if t.parent_id.is_none() && forwarded > approved {
         return ("Needs you", REVIEW_REASON.into());
     }
