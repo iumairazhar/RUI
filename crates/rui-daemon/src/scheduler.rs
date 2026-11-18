@@ -224,7 +224,7 @@ pub fn after_done_check(db: &Db, data_dir: &Path, task_id: i64, check: &DoneChec
 }
 
 /// Counts a failed attempt. Open to try again; at the loop limit the member waits on a Lead question.
-fn count_failed_loop(db: &Db, data_dir: &Path, task: &Task, reason: &str) -> Result<TaskStatus> {
+pub(crate) fn count_failed_loop(db: &Db, data_dir: &Path, task: &Task, reason: &str) -> Result<TaskStatus> {
     let used = db.increment_loops(task.id)?;
     if used < task.max_loops {
         return Ok(TaskStatus::Open);
@@ -465,10 +465,15 @@ pub fn client_lock(locks: &ClientLocks, client_id: i64) -> Arc<tokio::sync::Mute
 
 /// Runs forever: every tick, plan and execute. Never exits on error.
 pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, live: Live, apps: Apps) {
+    let mut last_beat = std::time::Instant::now();
     loop {
         tokio::time::sleep(cfg.tick).await;
         let snapshot: HashSet<i64> =
             running.lock().map(|r| r.keys().copied().collect()).unwrap_or_default();
+        if last_beat.elapsed() >= Duration::from_secs(crate::heartbeat::HEARTBEAT_SECS) {
+            last_beat = std::time::Instant::now();
+            beat(&db, &cfg, &running, &snapshot);
+        }
         match plan_tick(&db, &snapshot) {
             Ok(actions) => {
                 for a in actions {
@@ -480,7 +485,15 @@ pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, li
     }
 }
 
-fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
+/// Runs the heartbeat once; errors are logged.
+fn beat(db: &Db, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
+    let now = crate::thread::now_secs();
+    if let Err(e) = crate::heartbeat::heartbeat(db, &cfg.data_dir, running, snapshot, now) {
+        report_error(db, None, &e);
+    }
+}
+
+pub(crate) fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
     eprintln!("scheduler error: {e:#}");
     let _ = db.add_event(task_id, "scheduler", "scheduler_error", &json!({"error": format!("{e:#}")}));
 }
@@ -612,7 +625,7 @@ const STOPPED_MARK: &str = " stopped: ";
 
 /// For a top-level task that got stuck by an error, asks the owner (shows in the Inbox) what to do.
 /// Does nothing for subtasks, owner stops, or when such a question is already open.
-fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
+pub(crate) fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
     let Some(task) = db.get_task(task_id)? else { return Ok(()) };
     if task.parent_id.is_some() {
         return Ok(());
@@ -1172,7 +1185,7 @@ fn builder_prompt(task: &Task, done_command: &str, last_output: Option<&str>) ->
 }
 
 /// A clarifying top-level task that already has subtasks was split; it must not get a "new task" wake again.
-fn recovered_status(db: &Db, t: &Task, to: TaskStatus) -> Result<TaskStatus> {
+pub(crate) fn recovered_status(db: &Db, t: &Task, to: TaskStatus) -> Result<TaskStatus> {
     if to == TaskStatus::New && t.parent_id.is_none() && !db.subtasks(t.id)?.is_empty() {
         return Ok(TaskStatus::Split);
     }

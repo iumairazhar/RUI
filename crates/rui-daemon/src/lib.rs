@@ -5,6 +5,7 @@ pub mod chat;
 pub mod client_state;
 pub mod control;
 pub mod db;
+pub mod heartbeat;
 pub mod inbox;
 pub mod library;
 pub mod library_api;
