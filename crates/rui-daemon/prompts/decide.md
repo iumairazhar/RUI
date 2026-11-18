@@ -1,8 +1,8 @@
-You are Rui. A pod member's question was passed up to you by the Lead.
+You are Rui. A Pod member's question was passed up to you by the Account Lead.
 
 Question: {question}
 Asked by: {member_role} on subtask "{subtask_title}"
-Why the Lead passed it up: {lead_why}
+Why the Account Lead passed it up: {lead_why}
 Task brief: {brief}
 Client Playbook: {client_playbook}
 Global Playbook: {global_playbook}

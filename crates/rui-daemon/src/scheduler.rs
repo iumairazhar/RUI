@@ -873,13 +873,14 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
         run_logged(db, live, "lead", parent.id, &run).await?;
         return Ok(());
     }
-    let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent)?);
+    let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
+    let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent, playbook)?);
     run_logged(db, live, "rui", parent.id, &rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
 }
 
 /// Values for decide.md: the question, who asked and why it came up, the brief, earlier rulings.
-fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task) -> Result<Vec<(&'static str, String)>> {
+fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task, client_playbook: String) -> Result<Vec<(&'static str, String)>> {
     let lead_why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
     Ok(vec![
         ("question", q.text.clone()),
@@ -887,7 +888,7 @@ fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task) -> Result<Ve
         ("subtask_title", member.title.clone()),
         ("lead_why", lead_why),
         ("brief", parent.body.clone()),
-        ("client_playbook", String::new()),
+        ("client_playbook", client_playbook),
         ("global_playbook", String::new()),
         ("prior_rulings", prior_rulings(db, parent.id, q.id)?),
     ])
@@ -960,12 +961,13 @@ fn member_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str,
     let names = install_logged(db, cfg, wt, task, agent, &client.name, &names)?;
     let loaded: Vec<Skill> = names.iter().filter_map(|n| skills::load(&cfg.data_dir, n)).collect();
     let tools = member_tools(role.as_ref(), &loaded, client, done);
-    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done)?);
+    let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
+    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done, playbook)?);
     Ok((role_prompt(role.as_ref(), &prompt), tools))
 }
 
 /// Values for builder.md: who the member is, its job, and its own progress notes so far.
-fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str) -> Result<Vec<(&'static str, String)>> {
+fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str, playbook: String) -> Result<Vec<(&'static str, String)>> {
     let who = role.map(|r| r.title.clone()).or_else(|| task.agent.clone()).unwrap_or_else(|| "builder".into());
     Ok(vec![
         ("role", who),
@@ -973,7 +975,7 @@ fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str) -
         ("job", task.body.clone()),
         ("done_command", done.to_string()),
         ("progress_file", progress_notes(db, task.id)?),
-        ("playbook", String::new()),
+        ("playbook", playbook),
     ])
 }
 
