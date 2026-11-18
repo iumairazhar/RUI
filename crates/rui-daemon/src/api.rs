@@ -390,7 +390,19 @@ async fn answer_question(
         return Err(conflict("question is already answered"));
     }
     let why = b.why.as_deref().map(str::trim).filter(|w| !w.is_empty());
-    Ok(Json(crate::scheduler::answer_question(&s.db, id, &b.answer, why, "owner")?))
+    let answered = crate::scheduler::answer_question(&s.db, id, &b.answer, why, "owner")?;
+    log_owner_answer(&s, &answered)?;
+    Ok(Json(answered))
+}
+
+/// Writes the owner's answer to the client's decisions log, where the Account Lead reads it.
+fn log_owner_answer(s: &ApiState, q: &Question) -> ApiResult<()> {
+    let Some(task) = s.db.get_task(q.task_id)? else { return Ok(()) };
+    let Some(client) = s.db.get_client(task.client_id)? else { return Ok(()) };
+    let answer: String = q.answer.as_deref().unwrap_or_default().chars().take(300).collect();
+    let line = format!("Owner answered Q{} (task {}): {answer}", q.id, task.id);
+    crate::client_state::append_decision(&s.data_dir, &client.name, &line)?;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1291,5 +1303,21 @@ mod tests {
         assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "task not found"})));
         let (st, v) = call(&app, "GET", &format!("/tasks/{tid}/results"), None).await;
         assert_eq!((st, v), (StatusCode::OK, json!([])));
+    }
+
+    #[tokio::test]
+    async fn owner_answer_is_logged_for_the_account_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default() };
+        let app = router(state);
+        let (_, tid) = seed_task(&db);
+        crate::client_state::ensure(dir.path(), "acme", "/repo", None).unwrap();
+        let q = db.create_question(tid, Role::Lead, "why?").unwrap();
+        let uri = format!("/questions/{}/answer", q.id);
+        assert_eq!(call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await.0, StatusCode::OK);
+        let log = std::fs::read_to_string(dir.path().join("clients/acme/decisions.log")).unwrap();
+        assert!(log.contains(&format!("Owner answered Q{} (task {tid}): because", q.id)), "{log}");
     }
 }

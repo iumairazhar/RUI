@@ -12,9 +12,11 @@ use std::collections::HashMap;
 const REVIEW_SINCE: &str = "2026-11-18 00:00:00";
 /// The reason line of a finished task that waits for the owner's review.
 pub const REVIEW_REASON: &str = "Finished, review the result";
-const CAUSES: [&str; 6] = ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup"];
-const KINDS: [&str; 9] =
-    ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "resumed", "dropped", "reviewed"];
+const CAUSES: [&str; 7] = ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit"];
+const KINDS: [&str; 10] = [
+    "stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "resumed", "dropped",
+    "reviewed",
+];
 
 /// What the owner sees for one task.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -178,6 +180,7 @@ fn cause_reason(e: &Event) -> String {
         "land_failed" => format!("Couldn't merge: conflicts in {} files", file_count(&e.payload["files"])),
         "lead_no_outcome" => "The Lead stopped without a plan".into(),
         "rollup" => "A teammate is stuck".into(),
+        "loop_limit" => "Hit its loop limit".into(),
         _ => "Stuck".into(),
     }
 }
@@ -433,5 +436,19 @@ mod tests {
         let states = all_states(&db).unwrap();
         assert_eq!((states[0].word, states[0].reason.as_str()), ("Stopped", "Stopped by you from Task page"));
         assert_eq!((states[1].word, states[1].reason.as_str()), ("Needs you", "Pick one"));
+    }
+
+    #[test]
+    fn loop_limit_on_a_subtask_needs_you() {
+        let parent = task(1, None, TaskStatus::Stuck, NEW);
+        let sub = task(2, Some(1), TaskStatus::Stuck, NEW);
+        let events = [ev(1, 1, "rollup", json!({"status": "stuck"})), ev(2, 2, "loop_limit", json!({"loops_used": 5, "max_loops": 5}))];
+        let mut facts = Facts::default();
+        for e in &events {
+            facts.events.entry(e.task_id.unwrap()).or_default().push(e.clone());
+        }
+        let s = state_in(&parent, &facts, &[parent.clone(), sub]);
+        assert_eq!(s.word, "Needs you");
+        assert!(s.reason.contains("loop limit"), "{}", s.reason);
     }
 }

@@ -234,10 +234,17 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
         text.push_str(&format!("\nWhy: {why}"));
     }
     db.add_event(Some(task.id), by, "instruction", &json!({"text": text}))?;
-    if task.status == TaskStatus::WaitingAnswer {
-        db.set_task_status(task.id, TaskStatus::Open)?;
+    if task.status != TaskStatus::WaitingAnswer {
+        return Ok(());
     }
-    Ok(())
+    // The Lead may have raised the limit before answering, so read the task again.
+    let fresh = db.get_task(task.id)?.unwrap_or(task);
+    if fresh.loops_used < fresh.max_loops {
+        return db.set_task_status(fresh.id, TaskStatus::Open);
+    }
+    let payload = json!({"loops_used": fresh.loops_used, "max_loops": fresh.max_loops, "by": by});
+    db.add_event(Some(fresh.id), by, "loop_limit", &payload)?;
+    db.set_task_status(fresh.id, TaskStatus::Stuck)
 }
 
 /// The owner's reply to a "stopped" question on a top-level task: cancel leaves it stuck,
@@ -267,7 +274,12 @@ pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
         return Ok(vec![]);
     }
     let mut ids = vec![id];
+    let mut raised = vec![];
     for sub in db.subtasks(id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
+        if sub.loops_used >= sub.max_loops {
+            db.set_max_loops(sub.id, sub.loops_used + 3)?;
+            raised.push(sub.id);
+        }
         db.set_task_status(sub.id, TaskStatus::Open)?;
         ids.push(sub.id);
     }
@@ -278,7 +290,7 @@ pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
         (_, false) => TaskStatus::New,
     };
     db.set_task_status(id, next)?;
-    db.add_event(Some(id), by, "resumed", &json!({"ids": ids, "by": by}))?;
+    db.add_event(Some(id), by, "resumed", &json!({"ids": ids, "by": by, "raised_limit": raised}))?;
     Ok(ids)
 }
 
@@ -491,15 +503,21 @@ fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
 fn stuck_reason(db: &Db, parent_id: i64) -> Result<Option<String>> {
     for sub in db.subtasks(parent_id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
         let events = db.list_events(Some(sub.id), 30)?;
-        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped"].contains(&e.kind.as_str()));
+        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped", "loop_limit"].contains(&e.kind.as_str()));
         let Some(e) = last else { continue };
         match e.kind.as_str() {
             "land_failed" => return Ok(Some(format!("{} could not be merged (conflict in {})", sub.title, e.payload["files"]))),
             "stopped" => {}
+            "loop_limit" => return Ok(Some(loop_limit_reason(sub, e))),
             _ => return Ok(Some(format!("{}: {}", sub.title, e.payload["error"].as_str().unwrap_or("error")))),
         }
     }
     Ok(None)
+}
+
+fn loop_limit_reason(sub: &Task, e: &rui_core::Event) -> String {
+    let (used, max) = (&e.payload["loops_used"], &e.payload["max_loops"]);
+    format!("{} hit its loop limit ({used}/{max}) and was not given more attempts", sub.title)
 }
 
 /// The chat message announcing a finished task, its apps and the files it produced.
@@ -827,13 +845,14 @@ fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
 }
 
 /// The prompt a Lead or Rui gets to decide one escalated question.
-pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: Option<&str>, escalate_tool: &str) -> String {
+pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: Option<&str>, owner_answers: &str, escalate_tool: &str) -> String {
     let ladder: Vec<String> = q.ladder.iter().map(|r| format!("- {}: {}", r.who, r.why)).collect();
     format!(
         "Question {id} from member task {mid} ({title}):\n{text}\n\nLadder so far:\n{ladder}\n\n\
          Member job: {job}\nDone command: {done}\nLoops: {used} of {max}\n\
          Output of the member's last check:\n{check}\n\n\
          Task brief: {brief}\nPod: {pod}\n\n\
+         Owner answers on this task:\n{owner}\n\n\
          Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why). \
          You must call one of them.",
         id = q.id,
@@ -848,7 +867,21 @@ pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: O
         check = last_check.unwrap_or("(none)"),
         brief = parent.body,
         pod = parent.pod.join(", "),
+        owner = if owner_answers.is_empty() { "(none)" } else { owner_answers },
     )
+}
+
+/// Answered owner-level questions from all subtasks of `parent_id`, as "- Q<id>: <first line> \u{2192} <answer>".
+fn owner_answers(db: &Db, parent_id: i64) -> Result<String> {
+    let mut lines = Vec::new();
+    for sub in db.subtasks(parent_id)? {
+        for q in db.questions_for_task(sub.id)?.into_iter().filter(|q| q.level == "owner") {
+            let Some(answer) = q.answer.as_deref() else { continue };
+            let first = q.text.lines().next().unwrap_or_default();
+            lines.push(format!("- Q{}: {first} \u{2192} {answer}", q.id));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The member, its parent task and its client for a question.
@@ -867,7 +900,8 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let _live = LiveGuard(live.clone(), LiveKey::Task(parent.id));
     let last = last_done_output(db, member.id)?;
     let tool = if level == "lead" { "escalate" } else { "escalate_to_owner" };
-    let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), tool);
+    let answers = owner_answers(db, parent.id)?;
+    let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), &answers, tool);
     if level == "lead" {
         let run = account_lead_run(db, cfg, &parent, &client, "a member's question", prompt)?;
         run_logged(db, live, "lead", parent.id, &run).await?;
@@ -1598,7 +1632,7 @@ mod tests {
         db.set_question_level(q, "lead", &ladder).unwrap();
         let (q, member) = (db.get_question(q).unwrap().unwrap(), db.get_task(m).unwrap().unwrap());
         let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
-        let p = decision_prompt(&q, &member, &parent, Some("boom"), "escalate");
+        let p = decision_prompt(&q, &member, &parent, Some("boom"), "", "escalate");
         for want in ["q?", "- Backend 7: which db?", "boom", "rule(question_id=", "escalate(question_id="] {
             assert!(p.contains(want), "{want}");
         }
@@ -1740,5 +1774,71 @@ mod tests {
         answer_question(&db, q.id, "only the API part", None, "owner").unwrap();
         assert_eq!(status(t.id), TaskStatus::New);
         assert_eq!(db.pending_instructions(t.id).unwrap()[0].1, "only the API part");
+    }
+
+    /// A split parent with one waiting member at its loop limit and an open lead question.
+    fn limited_member(db: &Db, c: i64) -> (Task, Task, i64) {
+        let (m, q) = waiting_member(db, c, "lead");
+        db.increment_loops(m).unwrap();
+        db.increment_loops(m).unwrap();
+        let member = db.get_task(m).unwrap().unwrap();
+        let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
+        (parent, member, q)
+    }
+
+    #[test]
+    fn answer_at_the_loop_limit_sticks_instead_of_reopening() {
+        let (db, c) = setup();
+        let (parent, member, q) = limited_member(&db, c);
+        answer_question(&db, q, "try harder", None, "lead").unwrap();
+        let status = |id| db.get_task(id).unwrap().unwrap().status;
+        assert_eq!(status(member.id), TaskStatus::Stuck);
+        let events = db.list_events(Some(member.id), 100).unwrap();
+        assert!(events.iter().any(|e| e.kind == "loop_limit"));
+        assert!(events.iter().any(|e| e.kind == "instruction"));
+        assert!(matches!(plan_rollup(&db, &parent).unwrap(), Some(Action::Rollup { status: TaskStatus::Stuck, .. })));
+        assert!(stuck_reason(&db, parent.id).unwrap().unwrap().contains("loop limit (2/2)"));
+    }
+
+    #[test]
+    fn answer_below_or_after_raising_the_limit_reopens() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::Open);
+        let (_, member, q) = limited_member(&db, c);
+        db.set_max_loops(member.id, 5).unwrap();
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::Open);
+    }
+
+    #[test]
+    fn retry_raises_the_limit_of_a_loop_limited_subtask() {
+        let (db, c) = setup();
+        let (parent, member, q) = limited_member(&db, c);
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        db.set_task_status(parent.id, TaskStatus::Stuck).unwrap();
+        retry_stuck(&db, parent.id, "owner").unwrap();
+        let after = db.get_task(member.id).unwrap().unwrap();
+        assert_eq!((after.status, after.max_loops), (TaskStatus::Open, 5));
+        let events = db.list_events(Some(parent.id), 100).unwrap();
+        let resumed = events.iter().find(|e| e.kind == "resumed").unwrap();
+        assert_eq!(resumed.payload["raised_limit"], json!([member.id]));
+    }
+
+    #[test]
+    fn decision_prompt_lists_owner_answers_from_sibling_subtasks() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        let member = db.get_task(m).unwrap().unwrap();
+        let sibling = mk(&db, c, member.parent_id, TaskStatus::Open);
+        let asked = db.create_ladder_question(sibling.id, Role::Builder, "owner", &[], "Which db?\nmore").unwrap();
+        db.answer_question(asked.id, "postgres", None).unwrap();
+        let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
+        let q = db.get_question(q).unwrap().unwrap();
+        let answers = owner_answers(&db, parent.id).unwrap();
+        let p = decision_prompt(&q, &member, &parent, None, &answers, "escalate");
+        assert!(p.contains(&format!("- Q{}: Which db? \u{2192} postgres", asked.id)));
+        assert!(decision_prompt(&q, &member, &parent, None, "", "escalate").contains("Owner answers on this task:\n(none)"));
     }
 }
