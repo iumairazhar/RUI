@@ -132,16 +132,21 @@ fn grant_verdict(path: &str, p: &Protected) -> Option<bool> {
 
 /// True when an EXISTING file must not be modified or deleted.
 pub fn is_protected(path: &str, p: &Protected) -> bool {
+    if p.files.contains(path) {
+        return true;
+    }
     if let Some(v) = grant_verdict(path, p) {
         return v;
     }
-    p.files.contains(path)
-        || (p.check_patterns && looks_like_test(path))
+    (p.check_patterns && looks_like_test(path))
         || (p.config && is_test_config(path, &p.runners))
 }
 
 /// True when a NEW file must not be added: explicit entries, test files and test config files.
 pub fn is_protected_new(path: &str, p: &Protected) -> bool {
+    if p.files.contains(path) {
+        return true;
+    }
     if let Some(v) = grant_verdict(path, p) {
         return v;
     }
@@ -219,6 +224,16 @@ mod tests {
         assert!(!is_protected("tests/test_a.py", &c) && !is_protected_new("tests/test_a.py", &c));
         assert!(is_protected("src/db.rs", &c) && is_protected_new("src/db.rs", &c));
         assert!(is_protected("pyproject.toml", &c) && is_protected_new("pyproject.toml", &c));
+    }
+
+    #[test]
+    fn grants_never_lift_done_command_or_tester_files() {
+        let mut c = p(&[], &["tests/test_done.py", "tests/test_tester.py"], true);
+        c.granted = vec!["tests/".into()];
+        for f in ["tests/test_done.py", "tests/test_tester.py"] {
+            assert!(is_protected(f, &c) && is_protected_new(f, &c), "{f}");
+        }
+        assert!(!is_protected("tests/other.py", &c) && !is_protected_new("tests/other.py", &c));
     }
 
     #[test]
