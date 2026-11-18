@@ -115,7 +115,7 @@ fn is_runner_file(name: &str, r: &Runners) -> bool {
 
 fn is_test_config(path: &str, runners: &Runners) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    let known = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "package.json"];
+    let known = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "package.json", "Cargo.toml", "setup.py", "noxfile.py", "phpunit.xml"];
     known.contains(&name)
         || name.starts_with("jest.config.")
         || name.starts_with("vitest.config.")
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn existing_config_files_are_protected() {
         let m = member("pytest");
-        for f in ["package.json", "web/package.json", "pyproject.toml", "jest.config.ts", "vitest.config.mjs", "setup.cfg", "tox.ini", "pytest.ini"] {
+        for f in ["package.json", "web/package.json", "pyproject.toml", "jest.config.ts", "vitest.config.mjs", "setup.cfg", "tox.ini", "pytest.ini", "Cargo.toml", "crates/a/Cargo.toml", "setup.py", "noxfile.py", "phpunit.xml"] {
             assert!(is_protected(f, &m), "{f}");
         }
         for (file, cmd) in [("Makefile", "make test"), ("sub/Makefile", "gmake"), ("justfile", "just test"), ("Taskfile.yml", "task test")] {
