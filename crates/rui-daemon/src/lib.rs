@@ -24,4 +24,5 @@ pub mod prompts;
 pub mod shell;
 pub mod skills;
 pub mod state;
+pub mod thread;
 pub mod worktree;

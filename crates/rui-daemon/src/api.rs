@@ -84,6 +84,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/runs", get(list_task_runs))
         .route("/tasks/stopped", get(list_stopped))
         .route("/tasks/state", get(list_states))
+        .route("/threads", get(list_threads))
+        .route("/threads/{id}", get(get_thread))
+        .route("/threads/{id}/nodes/{node_id}", get(get_thread_node))
         .route("/inbox", get(get_inbox))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
@@ -296,6 +299,40 @@ async fn list_stopped(State(s): State<ApiState>) -> ApiResult<Json<Vec<i64>>> {
 /// The owner-facing word and reason of every task.
 async fn list_states(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::owner_state::OwnerState>>> {
     Ok(Json(crate::owner_state::all_states(&s.db)?))
+}
+
+#[derive(Deserialize)]
+struct ThreadsQuery {
+    client_id: Option<i64>,
+    state: Option<String>,
+}
+
+/// Threads (top-level tasks as conversations), needs-you first.
+async fn list_threads(State(s): State<ApiState>, Query(q): Query<ThreadsQuery>) -> ApiResult<Json<Vec<crate::thread::ThreadSummary>>> {
+    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    Ok(Json(list))
+}
+
+async fn get_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<crate::thread::Thread>> {
+    let th = crate::thread::thread(&s.db, id, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    th.map(Json).ok_or_else(|| not_found("thread not found"))
+}
+
+#[derive(Deserialize)]
+struct NodeQuery {
+    after_id: Option<i64>,
+}
+
+/// One node's events, cost and done checks, a page at a time.
+async fn get_thread_node(
+    State(s): State<ApiState>,
+    Path((id, node_id)): Path<(i64, String)>,
+    Query(q): Query<NodeQuery>,
+) -> ApiResult<Json<crate::thread::Inspector>> {
+    let th = crate::thread::thread(&s.db, id, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    let th = th.ok_or_else(|| not_found("thread not found"))?;
+    let seen = crate::thread::inspect(&s.db, &th, &node_id, q.after_id.unwrap_or(0))?;
+    seen.map(Json).ok_or_else(|| not_found("node not found"))
 }
 
 /// Everything that needs the owner, newest first.
@@ -1303,6 +1340,54 @@ mod tests {
         assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "task not found"})));
         let (st, v) = call(&app, "GET", &format!("/tasks/{tid}/results"), None).await;
         assert_eq!((st, v), (StatusCode::OK, json!([])));
+    }
+
+    #[tokio::test]
+    async fn threads_list_puts_needs_you_first() {
+        let (app, db, _rx) = setup();
+        let (client, first) = seed_task(&db);
+        let second = seed_task_for(&db, client);
+        db.create_ladder_question(second, Role::Lead, "owner", &[], "Pick one").unwrap();
+        let (code, v) = call(&app, "GET", "/threads", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let ids: Vec<i64> = v.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![second, first]);
+        assert_eq!(v[0]["state"], "needs_you");
+        assert_eq!(v[0]["needs_you_count"], 1);
+        let (_, only) = call(&app, "GET", "/threads?state=planned", None).await;
+        assert_eq!(only.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_get_404s_for_a_subtask_id() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        let (code, v) = call(&app, "GET", &format!("/threads/{top}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["id"], top);
+        let (code, _) = call(&app, "GET", &format!("/threads/{sub}"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn thread_node_inspector_pages_events() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        for _ in 0..250 {
+            db.add_event(Some(sub), "builder", "tool_call", &json!({"tool": "x"})).unwrap();
+        }
+        let uri = format!("/threads/{top}/nodes/task:{sub}");
+        let (code, page) = call(&app, "GET", &uri, None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(page["events"].as_array().unwrap().len(), 200);
+        let next = page["next_after_id"].as_i64().unwrap();
+        let (_, rest) = call(&app, "GET", &format!("{uri}?after_id={next}"), None).await;
+        assert_eq!(rest["events"].as_array().unwrap().len(), 50);
+        assert!(rest["next_after_id"].is_null());
+        let (code, _) = call(&app, "GET", &format!("/threads/{top}/nodes/task:9999"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -171,6 +171,11 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
     })
 }
 
+/// Task or event ids as a SQL list body. Integers only, so safe to inline.
+fn id_list(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+}
+
 /// Fill `depends_on` for each task from `task_deps`.
 fn fill_deps(conn: &Connection, tasks: &mut [Task]) -> Result<()> {
     let mut stmt = conn.prepare("SELECT depends_on FROM task_deps WHERE task_id = ?1 ORDER BY depends_on")?;
@@ -686,6 +691,81 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map(params![after_id, task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---- thread reads (read-only, scoped to a set of task ids) ----
+
+    /// Events of the given tasks and kinds with id > `after_id`, oldest first, at most `limit`.
+    pub fn events_for_tasks(&self, ids: &[i64], kinds: &[&str], after_id: i64, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let marks = vec!["?"; kinds.len()].join(",");
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events WHERE task_id IN ({}) AND kind IN ({marks}) AND id > {after_id} \
+             ORDER BY id LIMIT {limit}",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map(rusqlite::params_from_iter(kinds.iter()), event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The events with these ids, oldest first.
+    pub fn events_by_ids(&self, ids: &[i64]) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {EVENT_COLS} FROM events WHERE id IN ({}) ORDER BY id", id_list(ids));
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map([], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Epoch seconds of the newest activity per task: its newest event of any kind, or its own update.
+    pub fn last_activity(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT t.id, CAST(strftime('%s', MAX(t.updated_at, \
+               COALESCE((SELECT MAX(created_at) FROM events WHERE task_id = t.id), t.updated_at))) AS INTEGER) \
+             FROM tasks t WHERE t.id IN ({})",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter_map(|(id, t)| Some((id, t?))).collect())
+    }
+
+    /// Sum of `total_cost_usd` over the `result` events of each task.
+    pub fn cost_by_task(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, f64>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT task_id, SUM(COALESCE(json_extract(payload, '$.total_cost_usd'), 0)) FROM events \
+             WHERE kind = 'result' AND task_id IN ({}) GROUP BY task_id",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Highest event id among these tasks, or 0.
+    pub fn max_event_id(&self, ids: &[i64]) -> Result<i64> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT COALESCE(MAX(id), 0) FROM events WHERE task_id IN ({})", id_list(ids));
+        Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    }
+
+    /// The newest `story` line of these tasks, else the newest `log_decision` line.
+    pub fn latest_story_line(&self, ids: &[i64]) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let list = id_list(ids);
+        let story = format!("SELECT json_extract(payload, '$.line') FROM events WHERE task_id IN ({list}) AND kind = 'story' ORDER BY id DESC LIMIT 1");
+        let logged = format!(
+            "SELECT json_extract(payload, '$.args.line') FROM events WHERE task_id IN ({list}) AND kind = 'tool_call' \
+             AND json_extract(payload, '$.tool') = 'log_decision' ORDER BY id DESC LIMIT 1"
+        );
+        for sql in [story, logged] {
+            let line: Option<Option<String>> = conn.query_row(&sql, [], |r| r.get(0)).optional()?;
+            if let Some(l) = line.flatten() {
+                return Ok(Some(l));
+            }
+        }
+        Ok(None)
     }
 
     /// How often each skill was installed in the last `days` days, from `skill_used` events.
