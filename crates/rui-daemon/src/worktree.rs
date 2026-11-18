@@ -399,8 +399,10 @@ pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
 }
 
 fn require_failing_within(wt: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
     let mut child = StdCommand::new("sh")
         .args(["-c", cmd])
+        .process_group(0)
         .current_dir(wt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -417,7 +419,8 @@ fn require_failing_within(wt: &Path, cmd: &str, limit: Duration) -> anyhow::Resu
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
+    // Kill the whole group so pytest, npm or make die with sh.
+    let _ = StdCommand::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
     let _ = child.wait();
     bail!("done_command timed out: inconclusive; write a faster check")
 }
@@ -525,6 +528,16 @@ mod tests {
         let e = require_failing_within(d.path(), "true", Duration::from_secs(5)).unwrap_err();
         assert!(e.to_string().contains("already passes"));
         assert!(require_failing_within(d.path(), "false", Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn require_failing_timeout_kills_the_whole_group() {
+        let d = tempfile::tempdir().unwrap();
+        let cmd = "sh -c 'sleep 2; touch late.txt' & sleep 5";
+        let e = require_failing_within(d.path(), cmd, Duration::from_millis(300)).unwrap_err();
+        assert!(e.to_string().contains("timed out"));
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!d.path().join("late.txt").exists());
     }
 
     #[test]
