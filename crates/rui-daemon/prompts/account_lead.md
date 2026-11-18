@@ -41,3 +41,11 @@ Then call one of:
   remarks: what was done, what you checked, anything to look at closely.
 
 After every event, append one line to the decisions log: what happened and why.
+
+When you escalate or forward_pr, say the risk (low, medium or high), whether it
+can be undone, and what happens after Approve as 2 to 5 short steps (risk,
+reversible, if_approved).
+After each turn that changes the state, call set_story with one sentence under
+160 characters: where things stand and what is next.
+A done_command is a check, not an action: it only proves the work, it never
+changes anything.

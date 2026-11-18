@@ -14,9 +14,9 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 13] = [
+const KINDS: [&str; 14] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
-    "dropped", "agent_error", "reviewed", "resumed",
+    "dropped", "agent_error", "reviewed", "resumed", "escalated",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +346,22 @@ fn decision(source: &'static str, ask: String, actions: &[&str]) -> Decision {
     }
 }
 
+/// Risk, reversibility and after-approval steps saved in an `escalated` or `forwarded` payload.
+fn meta_from(payload: &serde_json::Value) -> (&'static str, Option<bool>, Vec<String>) {
+    let risk = match payload["risk"].as_str() {
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high") => "high",
+        _ => "unknown",
+    };
+    let steps = payload["if_approved"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+    (risk, payload["reversible"].as_bool(), steps)
+}
+
+fn apply_meta(d: &mut Decision, payload: &serde_json::Value) {
+    (d.risk, d.reversible, d.if_approved) = meta_from(payload);
+}
+
 fn decision_node(id: String, title: String, at: &str, d: Decision) -> Node {
     let mut n = node(id, "work", "decision", "needs_you", title, at);
     n.decision = Some(d);
@@ -359,6 +375,11 @@ fn question_decisions(ctx: &Ctx) -> Vec<Node> {
         d.question_id = Some(q.id);
         d.why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
         d.ladder = q.ladder.clone();
+        let to_owner = |e: &&Event| e.payload["question_id"] == q.id && e.payload["to"] == "owner";
+        let esc = ctx.evs(q.task_id).into_iter().filter(|e| e.kind == "escalated").filter(to_owner).max_by_key(|e| e.id);
+        if let Some(e) = esc {
+            apply_meta(&mut d, &e.payload);
+        }
         let mut n = decision_node(format!("q:{}", q.id), first_line(&q.text), &q.created_at, d);
         n.subtask_id = (q.task_id != ctx.top.id).then_some(q.task_id);
         n
@@ -400,6 +421,7 @@ fn review_decision(ctx: &Ctx) -> Option<Node> {
     let ask = fwd.payload["remarks"].as_str().filter(|r| !r.is_empty()).unwrap_or("Review the finished work");
     let mut d = decision("review", ask.to_string(), &["approve", "send_back"]);
     d.review = Some(ReviewRef { kind, task_id: ctx.top.id, url });
+    apply_meta(&mut d, &fwd.payload);
     Some(decision_node(format!("rv:{}", fwd.id), "Review the result".into(), &fwd.created_at, d))
 }
 
@@ -467,6 +489,19 @@ fn open_questions(db: &Db, ids: &[i64]) -> Result<Vec<Question>> {
     Ok(all)
 }
 
+/// Decision node ids, highest risk first (stable within equal risk).
+fn needs_you_ids(nodes: &[Node]) -> Vec<String> {
+    let rank = |n: &Node| match n.decision.as_ref().map(|d| d.risk) {
+        Some("high") => 0,
+        Some("medium") => 1,
+        Some("low") => 2,
+        _ => 3,
+    };
+    let mut ds: Vec<&Node> = nodes.iter().filter(|n| n.kind == "decision").collect();
+    ds.sort_by_key(|n| rank(n));
+    ds.into_iter().map(|n| n.id.clone()).collect()
+}
+
 /// Builds the thread of one top-level task. `now` is epoch seconds; a running task with no
 /// event for `stall` seconds is stalled.
 pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
@@ -480,7 +515,7 @@ pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
     if !(top.status == TaskStatus::Split && all_planned) {
         statuses.push(task_status(&ctx, top));
     }
-    let needs_you = nodes.iter().filter(|n| n.kind == "decision").map(|n| n.id.clone()).collect();
+    let needs_you = needs_you_ids(&nodes);
     Ok(Thread {
         id: top.id,
         client: client_ref(db, top)?,
@@ -630,6 +665,46 @@ mod tests {
         assert_eq!(th.needs_you, vec![format!("q:{}", q.id)]);
         let d = th.nodes.iter().find_map(|n| n.decision.as_ref()).unwrap();
         assert_eq!((d.source, d.question_id, d.risk), ("question", Some(q.id), "unknown"));
+    }
+
+    fn owner_question(db: &Db, sub: i64, text: &str, meta: serde_json::Value) -> i64 {
+        let q = db.create_ladder_question(sub, rui_core::Role::Builder, "owner", &[], text).unwrap();
+        let mut p = json!({"question_id": q.id, "from": "rui", "to": "owner", "why": "w"});
+        p.as_object_mut().unwrap().extend(meta.as_object().unwrap().clone());
+        db.add_event(Some(sub), "scheduler", "escalated", &p).unwrap();
+        q.id
+    }
+
+    #[test]
+    fn question_decision_reads_saved_risk_and_missing_is_unknown() {
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "A", json!({"risk": "high", "reversible": false, "if_approved": ["one", "two"]}));
+        let th = get(&db, top, real_now());
+        let d = th.nodes.iter().find_map(|n| n.decision.as_ref()).unwrap();
+        assert_eq!((d.risk, d.reversible, d.if_approved.clone()), ("high", Some(false), vec!["one".to_string(), "two".to_string()]));
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "A", json!({}));
+        let d = get(&db, top, real_now()).nodes.iter().find_map(|n| n.decision.clone()).unwrap();
+        assert_eq!((d.risk, d.reversible, d.if_approved.len()), ("unknown", None, 0));
+    }
+
+    #[test]
+    fn review_decision_reads_forwarded_meta() {
+        let (db, top, _) = setup(TaskStatus::Done);
+        db.set_task_status(top, TaskStatus::Done).unwrap();
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": null, "risk": "low", "reversible": true, "if_approved": ["merge"]})).unwrap();
+        let d = get(&db, top, real_now()).nodes.iter().find_map(|n| n.decision.clone()).unwrap();
+        assert_eq!((d.source, d.risk, d.reversible, d.if_approved), ("review", "low", Some(true), vec!["merge".to_string()]));
+    }
+
+    #[test]
+    fn needs_you_lists_high_risk_first() {
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        let low = owner_question(&db, sub, "L", json!({"risk": "low"}));
+        let unknown = owner_question(&db, sub, "U", json!({}));
+        let high = owner_question(&db, sub, "H", json!({"risk": "high"}));
+        let ids = get(&db, top, real_now()).needs_you;
+        assert_eq!(ids, vec![format!("q:{high}"), format!("q:{low}"), format!("q:{unknown}")]);
     }
 
     #[test]

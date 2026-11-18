@@ -254,13 +254,22 @@ pub struct RuleArgs {
 }
 
 /// Arguments for `escalate` and `escalate_to_owner`.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EscalateArgs {
     /// Id of the question to pass up.
     pub question_id: i64,
     /// Why you cannot decide it.
     pub why: String,
+    /// low, medium or high.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// Whether the owner's choice can be undone.
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// 2 to 5 short steps that run after the owner approves.
+    #[serde(default)]
+    pub if_approved: Option<Vec<String>>,
 }
 
 /// Arguments for `set_limit`.
@@ -316,6 +325,23 @@ pub struct ForwardPrArgs {
     pub task_id: i64,
     /// Your remarks for the owner: what was done and what to look at.
     pub remarks: String,
+    /// low, medium or high.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// Whether the owner's choice can be undone.
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// 2 to 5 short steps that run after the owner approves.
+    #[serde(default)]
+    pub if_approved: Option<Vec<String>>,
+}
+
+/// Arguments for the Account Lead's `set_story`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SetStoryArgs {
+    /// One sentence, under 160 characters: where things stand and what is next.
+    pub line: String,
 }
 
 // ---- plain tool logic ----
@@ -838,6 +864,7 @@ pub mod logic {
     /// Account Lead forwards reviewed work: opens a PR when the repo has a remote, then hands it to the owner.
     pub fn forward_pr(db: &Db, data_dir: &Path, ctx: &Ctx, a: ForwardPrArgs) -> anyhow::Result<Value> {
         let task = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
         let subs = db.subtasks(task.id)?;
         if subs.is_empty() || subs.iter().any(|s| s.status != TaskStatus::Done) {
             anyhow::bail!("all subtasks must be done before forwarding");
@@ -850,12 +877,34 @@ pub mod logic {
             true => Some(crate::worktree::open_pr(&wt, &base, &branch, &task.title, &a.remarks)?),
             false => None,
         };
-        db.add_event(Some(task.id), "lead", "forwarded", &json!({"remarks": a.remarks, "pr_url": pr_url}))?;
+        let mut payload = json!({"remarks": a.remarks, "pr_url": pr_url});
+        payload.as_object_mut().expect("object").extend(meta.as_object().cloned().unwrap_or_default());
+        db.add_event(Some(task.id), "lead", "forwarded", &payload)?;
         db.set_task_status(task.id, TaskStatus::Split)?;
         let suffix = pr_url.as_deref().map(|u| format!(": {u}")).unwrap_or_default();
         log_client_decision(db, data_dir, &task, &format!("Task {} forwarded to the owner{suffix}", task.id))?;
         record(db, ctx, Role::Lead, "forward_pr", &a)?;
         Ok(json!({"pr_url": pr_url}))
+    }
+
+    /// The optional risk fields of an escalation or forward, as an object holding only what was given.
+    fn decision_meta(risk: &Option<String>, reversible: &Option<bool>, if_approved: &Option<Vec<String>>) -> anyhow::Result<Value> {
+        let mut meta = serde_json::Map::new();
+        if let Some(r) = risk {
+            let r = r.trim().to_lowercase();
+            if !["low", "medium", "high"].contains(&r.as_str()) {
+                anyhow::bail!("risk must be low, medium or high");
+            }
+            meta.insert("risk".into(), json!(r));
+        }
+        if let Some(b) = reversible {
+            meta.insert("reversible".into(), json!(b));
+        }
+        let steps: Vec<String> = if_approved.iter().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(5).collect();
+        if !steps.is_empty() {
+            meta.insert("if_approved".into(), json!(steps));
+        }
+        Ok(Value::Object(meta))
     }
 
     /// Lead declares the task split into its subtasks.
@@ -915,6 +964,21 @@ pub mod logic {
         Ok(json!({"ok": true}))
     }
 
+    /// Account Lead records one sentence on where things stand.
+    pub fn set_story(db: &Db, ctx: &Ctx, a: SetStoryArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        let line = a.line.trim();
+        if line.is_empty() {
+            anyhow::bail!("line must not be empty");
+        }
+        if line.chars().count() > 160 {
+            anyhow::bail!("line must be under 160 characters");
+        }
+        db.add_event(Some(task.id), "lead", "story", &json!({"line": line}))?;
+        record(db, ctx, Role::Lead, "set_story", &a)?;
+        Ok(json!({"ok": true}))
+    }
+
     /// The open question a Lead or Rui is allowed to decide: right level, and for a Lead, its own member's.
     fn decidable(db: &Db, ctx: &Ctx, level: &str, id: i64) -> anyhow::Result<rui_core::Question> {
         let q = db.get_question(id)?.ok_or_else(|| anyhow::anyhow!("question {id} not found"))?;
@@ -949,7 +1013,8 @@ pub mod logic {
     pub fn escalate(db: &Db, ctx: &Ctx, level: &str, a: EscalateArgs) -> anyhow::Result<Value> {
         let q = decidable(db, ctx, level, a.question_id)?;
         let who = if level == "lead" { "Lead" } else { "Rui" };
-        let up = scheduler::escalate_question(db, q.id, who, a.why.trim())?;
+        let meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
+        let up = scheduler::escalate_question_with(db, q.id, who, a.why.trim(), &meta)?;
         record(db, ctx, role_of(level), "escalate", &a)?;
         Ok(json!({"ok": true, "level": up.level}))
     }
@@ -1240,6 +1305,15 @@ impl LeadServer {
         Parameters(a): Parameters<ForwardPrArgs>,
     ) -> CallToolResult {
         finish(logic::forward_pr(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Record one sentence, under 160 characters, on where things stand and what is next. Call it after each turn that changes the state.")]
+    async fn set_story(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetStoryArgs>,
+    ) -> CallToolResult {
+        finish(logic::set_story(&self.db, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
@@ -1817,7 +1891,7 @@ mod tests {
         assert_eq!(q.ladder.len(), 1);
         assert_eq!((q.ladder[0].who.as_str(), q.ladder[0].why.as_str()), ("backend 2", "which db?"));
         assert_eq!(status_of(&db, &member), TaskStatus::WaitingAnswer);
-        let esc = |why: &str| EscalateArgs { question_id: qid, why: why.into() };
+        let esc = |why: &str| EscalateArgs { question_id: qid, why: why.into(), ..Default::default() };
         assert!(logic::escalate(&db, &lead, "rui", esc("x")).is_err());
         logic::escalate(&db, &lead, "lead", esc("not sure")).unwrap();
         let q = db.get_question(qid).unwrap().unwrap();
@@ -1830,6 +1904,48 @@ mod tests {
         assert_eq!(q.status, QuestionStatus::Open);
         assert!(logic::escalate(&db, &none, "rui", esc("again")).is_err());
         assert_eq!(status_of(&db, &member), TaskStatus::WaitingAnswer);
+    }
+
+    #[test]
+    fn escalate_saves_risk_meta_and_rejects_bad_risk() {
+        let (db, data, lead, member) = staffed();
+        let qid = ask(&db, data.path(), &member);
+        let args = |risk: &str| EscalateArgs {
+            question_id: qid, why: "w".into(), risk: Some(risk.into()), reversible: Some(false),
+            if_approved: Some(["a", " b ", "", "c", "d", "e", "f", "g"].map(String::from).to_vec()),
+        };
+        assert!(logic::escalate(&db, &lead, "lead", args("extreme")).is_err());
+        logic::escalate(&db, &lead, "lead", args(" HIGH ")).unwrap();
+        let events = db.list_events(member.task_id, 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "escalated").unwrap();
+        assert_eq!((e.payload["risk"].as_str(), e.payload["reversible"].as_bool()), (Some("high"), Some(false)));
+        assert_eq!(e.payload["if_approved"], json!(["a", "b", "c", "d", "e"]));
+    }
+
+    #[test]
+    fn forward_pr_saves_risk_meta() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let a = ForwardPrArgs { task_id: lead_id, remarks: "ok".into(), risk: Some("low".into()), reversible: Some(true), if_approved: Some(vec!["merge".into()]) };
+        logic::forward_pr(&db, data.path(), &lead, a).unwrap();
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        let f = events.iter().find(|e| e.kind == "forwarded").unwrap();
+        assert_eq!((f.payload["risk"].as_str(), f.payload["reversible"].as_bool(), &f.payload["if_approved"]), (Some("low"), Some(true), &json!(["merge"])));
+    }
+
+    #[test]
+    fn set_story_writes_an_event_and_validates() {
+        let (db, _data, lead, _) = staffed();
+        let story = |l: &str| logic::set_story(&db, &lead, SetStoryArgs { line: l.into() });
+        story(" Tests pass, review is next. ").unwrap();
+        assert!(story("  ").is_err());
+        assert!(story(&"x".repeat(161)).is_err());
+        story(&"x".repeat(160)).unwrap();
+        let events = db.list_events(lead.task_id, 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "story").unwrap();
+        assert!(e.payload["line"].as_str().is_some());
+        assert_eq!(events.iter().filter(|e| e.kind == "story").count(), 2);
     }
 
     #[test]
@@ -2014,7 +2130,7 @@ mod tests {
     fn forward_pr_without_a_remote_forwards_locally() {
         let (db, data, lead, member) = staffed();
         let lead_id = lead.task_id.unwrap();
-        let args = || ForwardPrArgs { task_id: lead_id, remarks: "Looks right".into() };
+        let args = || ForwardPrArgs { task_id: lead_id, remarks: "Looks right".into(), risk: None, reversible: None, if_approved: None };
         assert!(logic::forward_pr(&db, data.path(), &lead, args()).is_err(), "subtask not done");
         set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
         let r = logic::forward_pr(&db, data.path(), &lead, args()).unwrap();
@@ -2054,7 +2170,7 @@ mod tests {
         sh(&repo, &["push", "origin", &base]);
         let base_ref = sh(bare.path(), &["rev-parse", &base]);
         unsafe { std::env::set_var("RUI_GH", fake_gh(bare.path())) };
-        let forward = |remarks: &str| logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: remarks.into() });
+        let forward = |remarks: &str| logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: remarks.into(), risk: None, reversible: None, if_approved: None });
         let first = forward("first remarks");
         let second = forward("second remarks");
         unsafe { std::env::remove_var("RUI_GH") };
@@ -2106,7 +2222,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit"];
+        let lead = ["create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);

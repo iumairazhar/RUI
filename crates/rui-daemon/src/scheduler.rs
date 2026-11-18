@@ -296,6 +296,11 @@ pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
 
 /// Passes an open question up one level: lead to rui, rui to owner.
 pub fn escalate_question(db: &Db, id: i64, who: &str, why: &str) -> Result<Question> {
+    escalate_question_with(db, id, who, why, &json!({}))
+}
+
+/// Like `escalate_question`, merging the keys of `extra` (an object) into the `escalated` event.
+pub fn escalate_question_with(db: &Db, id: i64, who: &str, why: &str, extra: &serde_json::Value) -> Result<Question> {
     let q = db.get_question(id)?.context("question not found")?;
     if q.status == QuestionStatus::Answered {
         anyhow::bail!("question {id} is already answered");
@@ -308,7 +313,10 @@ pub fn escalate_question(db: &Db, id: i64, who: &str, why: &str) -> Result<Quest
     let mut ladder = q.ladder.clone();
     ladder.push(Rung { who: who.into(), why: why.into() });
     db.set_question_level(id, next, &ladder)?;
-    let payload = json!({"question_id": id, "from": q.level, "to": next, "why": why});
+    let mut payload = json!({"question_id": id, "from": q.level, "to": next, "why": why});
+    if let (Some(p), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+        p.extend(e.clone());
+    }
     db.add_event(Some(q.task_id), "scheduler", "escalated", &payload)?;
     db.get_question(id)?.context("question not found")
 }

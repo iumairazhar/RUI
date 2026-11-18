@@ -26,5 +26,7 @@ Call escalate_to_owner(question_id, why) when the decision involves:
 - facts only the owner or client knows
 In why, write: the question in one line, the options, and your recommendation,
 so the owner can answer in one click.
+Also pass risk (low, medium or high), reversible (true or false) and
+if_approved (2 to 5 short steps that run after the owner approves).
 
 Call exactly one of them. You have no other tools.
