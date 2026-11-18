@@ -194,8 +194,29 @@ async fn run_with_config(
     stream(cmd, &bin, "claude", parse_line, on_line).await
 }
 
-/// Spawns `cmd`, parses each stdout line with `parse` and tracks the outcome.
-/// `name` is the CLI's name in the failure message.
+/// Kills a whole process group when dropped, so an aborted, stopped or timed-out run takes its
+/// test runners and builds down with it. Disarmed once the agent exits on its own.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        let Some(pgid) = self.0 else { return };
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Spawns `cmd` in its own process group, parses each stdout line with `parse` and tracks the
+/// outcome. `name` is the CLI's name in the failure message.
 pub(crate) async fn stream(
     mut cmd: Command,
     bin: &str,
@@ -203,7 +224,9 @@ pub(crate) async fn stream(
     mut parse: impl FnMut(&str) -> Option<ParsedLine>,
     mut on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
+    cmd.process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {bin}"))?;
+    let group = GroupKill(child.id());
     let mut stderr = child.stderr.take().context("stderr")?;
     let err_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -218,6 +241,7 @@ pub(crate) async fn stream(
         on_line(&p);
     }
     out.exit_ok = child.wait().await?.success();
+    group.disarm();
     let err = err_task.await.unwrap_or_default();
     if !out.exit_ok && out.result_text.is_none() {
         let start = err.len().saturating_sub(2048);
@@ -416,6 +440,38 @@ echo '{"type":"result","result":"hi","is_error":false}'"#,
         let err = run_agent(&run(d.path()), |_| {}).await.err().unwrap();
         assert!(err.to_string().contains("boom"));
         unsafe { std::env::remove_var("RUI_CLAUDE_BIN") };
+    }
+
+    fn running(marker: &str) -> bool {
+        let out = std::process::Command::new("pgrep").args(["-f", marker]).output().unwrap();
+        !out.stdout.is_empty()
+    }
+
+    async fn wait_until(want: bool, marker: &str) -> bool {
+        for _ in 0..100 {
+            if running(marker) == want {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn aborting_a_run_kills_its_whole_process_group() {
+        let d = tempfile::tempdir().unwrap();
+        // A sleep length no other command line will contain, so pgrep only finds this test's child.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let marker = format!("600.{nanos:09}");
+        let agent = fake(d.path(), "hang.sh", &format!("sleep {marker} &\nwait"));
+        // Run through sh: exec'ing a script just written can fail with ETXTBSY under parallel tests.
+        let mut cmd = Command::new("sh");
+        cmd.arg(&agent).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let run = tokio::spawn(async move { stream(cmd, "hang.sh", "hang", parse_line, |_| {}).await });
+        assert!(wait_until(true, &marker).await, "the agent's child never started");
+        run.abort();
+        let _ = run.await;
+        assert!(wait_until(false, &marker).await, "the agent's child outlived the abort");
     }
 
     #[tokio::test]
