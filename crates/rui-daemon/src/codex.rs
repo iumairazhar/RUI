@@ -174,6 +174,7 @@ fn tool_result(id: &str, content: String, is_error: bool) -> ParsedLine {
 
 fn command(bin: &str, run: &AgentRun) -> Command {
     let mut cmd = Command::new(bin);
+    crate::seats::scrub_env(cmd.as_std_mut(), &crate::state::data_dir());
     cmd.args(build_args(run))
         .current_dir(&run.cwd)
         .stdin(Stdio::null())
