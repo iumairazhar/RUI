@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// Reads one PR as JSON. Injectable so tests never shell out.
 pub type GhView = fn(&str) -> Result<Value>;
 
-const FIELDS: &str = "state,mergedAt,reviews,comments,statusCheckRollup";
+const FIELDS: &str = "state,mergedAt,mergeCommit,reviews,comments,statusCheckRollup";
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILED: [&str; 4] = ["FAILURE", "TIMED_OUT", "CANCELLED", "ERROR"];
 const MAX_BODY: usize = 1500;
@@ -34,7 +34,7 @@ const FEEDBACK_KINDS: [&str; 3] = ["ci_failed", "pr_feedback", "pr_feedback_rout
 /// One thing the PR view says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Finding {
-    Merged { merged_at: String },
+    Merged { merged_at: String, merge_commit: Option<String> },
     Closed,
     CiFailed { id: String, name: String, url: String },
     Feedback { id: String, author: String, body: String, url: String, trusted: bool },
@@ -89,7 +89,10 @@ fn wait_or_kill(child: &mut std::process::Child, limit: Duration) -> Result<bool
 pub fn parse(v: &Value, pr_url: &str) -> Vec<Finding> {
     let mut out = vec![];
     match v["state"].as_str() {
-        Some("MERGED") => out.push(Finding::Merged { merged_at: s(&v["mergedAt"]) }),
+        Some("MERGED") => {
+            let merge_commit = v["mergeCommit"]["oid"].as_str().filter(|c| !c.is_empty()).map(String::from);
+            out.push(Finding::Merged { merged_at: s(&v["mergedAt"]), merge_commit })
+        }
         Some("CLOSED") => out.push(Finding::Closed),
         _ => {}
     }
@@ -236,7 +239,9 @@ pub fn record(db: &Db, data_dir: &Path, task: &Task, url: &str, findings: &[Find
 
 fn record_one(db: &Db, data_dir: &Path, task: &Task, url: &str, f: &Finding) -> Result<()> {
     let (kind, payload) = match f {
-        Finding::Merged { merged_at } => ("pr_merged", json!({"url": url, "merged_at": merged_at})),
+        Finding::Merged { merged_at, merge_commit } => {
+            ("pr_merged", json!({"url": url, "merged_at": merged_at, "merge_commit": merge_commit}))
+        }
         Finding::Closed => ("pr_closed", json!({"url": url})),
         Finding::CiFailed { id, name, url } => ("ci_failed", json!({"id": id, "name": name, "url": url})),
         Finding::Feedback { id, author, body, url, trusted } => {
@@ -245,16 +250,16 @@ fn record_one(db: &Db, data_dir: &Path, task: &Task, url: &str, f: &Finding) -> 
     };
     db.add_event(Some(task.id), "github", kind, &payload)?;
     match f {
-        Finding::Merged { .. } => merged(db, data_dir, task, url),
+        Finding::Merged { merge_commit, .. } => merged(db, data_dir, task, url, merge_commit.as_deref()),
         Finding::Closed => close(db, task.id),
         _ => Ok(()),
     }
 }
 
 /// A merge fires the client's pr_merged triggers and asks the owner about a deploy, if one is set up.
-fn merged(db: &Db, data_dir: &Path, task: &Task, url: &str) -> Result<()> {
+fn merged(db: &Db, data_dir: &Path, task: &Task, url: &str, merge_commit: Option<&str>) -> Result<()> {
     crate::triggers::on_pr_merged(db, data_dir, task, url)?;
-    crate::deploy::request(db, data_dir, task)?;
+    crate::deploy::request(db, data_dir, task, merge_commit)?;
     Ok(())
 }
 
@@ -390,7 +395,7 @@ mod tests {
 
     #[test]
     fn parses_merged_failed_checks_and_reviews() {
-        assert_eq!(parse(&merged(), URL), vec![Finding::Merged { merged_at: "2026-11-18T10:00:00Z".into() }]);
+        assert_eq!(parse(&merged(), URL), vec![Finding::Merged { merged_at: "2026-11-18T10:00:00Z".into(), merge_commit: None }]);
         let checks = parse(&failing(), URL);
         let names: Vec<&str> = checks.iter().map(|f| match f { Finding::CiFailed { name, .. } => name.as_str(), _ => "?" }).collect();
         assert_eq!(names, ["test", "deploy"]);

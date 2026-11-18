@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, apps, chat, db::Db, live, mcp, owner_auth, roster, scheduler, seat, skills, state};
+use rui_daemon::{api, apps, chat, db::Db, deploy, live, mcp, owner_auth, roster, scheduler, seat, skills, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,11 @@ async fn main() {
         Ok(n) if n > 0 => println!("recovered {n} task(s)"),
         Ok(_) => {}
         Err(e) => eprintln!("recovery failed: {e:#}"),
+    }
+    match deploy::recover(&db) {
+        Ok(n) if n > 0 => println!("closed {n} deploy(s) left running"),
+        Ok(_) => {}
+        Err(e) => eprintln!("deploy recovery failed: {e:#}"),
     }
     let data_dir = state::data_dir();
     let cfg = scheduler::Config { port, tick, data_dir: data_dir.clone() };

@@ -4,7 +4,9 @@
 //! production deploy cannot be taken back. "skip" records `deploy_skipped {event_id}`.
 //!
 //! A deploy runs the requested command with `sh -c` in the client's repo, only when the repo is on
-//! its base branch with a clean working tree (RUI never checks out or changes the owner's tree).
+//! its base branch with a clean working tree (RUI never checks out or changes the owner's tree),
+//! its HEAD contains the task's merge commit (or branch tip), and no other deploy is running.
+//! A deploy still running when the daemon restarts is closed as failed with an unknown outcome.
 //! It runs off the async runtime with a 15 minute limit; on timeout the whole process group is
 //! killed. Events: `deploy_started {event_id}`, then `deploy_finished {event_id, ok, exit_code,
 //! output_tail}`. A failed deploy shows as a "Deploy failed" Inbox item that can be retried or skipped.
@@ -80,13 +82,14 @@ pub fn set_config(data_dir: &Path, client: &str, cfg: DeployConfig) -> Result<De
 }
 
 /// Records `deploy_requested` for a finished task when its client has a deploy config. Runs nothing.
-pub fn request(db: &Db, data_dir: &Path, task: &Task) -> Result<Option<i64>> {
+/// `merge_commit` is the PR's merge commit when GitHub reported one.
+pub fn request(db: &Db, data_dir: &Path, task: &Task, merge_commit: Option<&str>) -> Result<Option<i64>> {
     let Some(client) = db.get_client(task.client_id)? else { return Ok(None) };
     let Some(cfg) = client_state::read_client(data_dir, &client.name)?.and_then(|c| c.deploy) else { return Ok(None) };
     if validate(&cfg).is_err() {
         return Ok(None);
     }
-    let payload = json!({"task_id": task.id, "environment": cfg.environment, "command": cfg.command});
+    let payload = json!({"task_id": task.id, "environment": cfg.environment, "command": cfg.command, "merge_commit": merge_commit});
     Ok(Some(db.add_event(Some(task.id), "scheduler", "deploy_requested", &payload)?))
 }
 
@@ -124,6 +127,25 @@ fn actionable(r: &Request) -> Result<(), ControlError> {
     }
 }
 
+/// Closes every deploy left running by a previous daemon as failed with an unknown outcome.
+pub fn recover(db: &Db) -> Result<usize> {
+    let _lock = START.lock().unwrap_or_else(|e| e.into_inner());
+    let running: Vec<Request> = requests(db)?.into_iter().filter(|r| r.state == State::Running).collect();
+    for r in &running {
+        let payload = json!({"event_id": r.event.id, "ok": false, "exit_code": null, "output_tail": "daemon restarted; outcome unknown"});
+        db.add_event(r.event.task_id, "scheduler", "deploy_finished", &payload)?;
+    }
+    Ok(running.len())
+}
+
+/// Only one deploy may run at a time, across all clients.
+fn none_running(db: &Db) -> Result<(), ControlError> {
+    if requests(db)?.iter().any(|r| r.state == State::Running) {
+        return Err(ControlError::Conflict("another deploy is still running; wait for it to finish".into()));
+    }
+    Ok(())
+}
+
 /// The owner skips a deploy: it leaves the Inbox and never runs.
 pub fn skip(db: &Db, event_id: i64) -> Result<(), ControlError> {
     let _lock = START.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,14 +168,38 @@ pub fn tree_problem(repo: &Path, base: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// The client's repo, when it is on its base branch with a clean tree.
+/// The commit HEAD must contain: the PR's merge commit, else the task's branch tip.
+fn required_commit(r: &Request, task: &Task) -> Option<String> {
+    let merge = r.event.payload["merge_commit"].as_str().filter(|c| !c.is_empty()).map(String::from);
+    merge.or_else(|| task.branch.clone())
+}
+
+/// Why HEAD does not contain `commit`, if it does not.
+pub fn ancestry_problem(repo: &Path, commit: &str) -> Option<String> {
+    let ok = Command::new("git").arg("-C").arg(repo).args(["merge-base", "--is-ancestor", commit, "HEAD"])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    (!ok).then(|| format!("HEAD does not contain {commit}; pull or merge it into the base branch yourself first"))
+}
+
+/// HEAD's short sha in the repo, or "unknown".
+pub fn head_short(repo: &Path) -> String {
+    let out = crate::worktree::git_stdout(repo, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    let sha = out.trim();
+    if sha.is_empty() { "unknown".into() } else { sha.to_string() }
+}
+
+/// The client's repo, when it is on its base branch with a clean tree that contains the task's work.
 fn deploy_dir(db: &Db, data_dir: &Path, r: &Request) -> Result<PathBuf, ControlError> {
     let task_id = r.event.task_id.ok_or_else(|| ControlError::NotFound("deploy has no task".into()))?;
     let task = db.get_task(task_id)?.ok_or_else(|| ControlError::NotFound("task not found".into()))?;
     let client = db.get_client(task.client_id)?.ok_or_else(|| ControlError::NotFound("client not found".into()))?;
     let repo = crate::scheduler::expand_home(&client.repo_path);
     let base = client_state::base_for(data_dir, &client.name, &repo)?;
-    match tree_problem(&repo, &base)? {
+    if let Some(why) = tree_problem(&repo, &base)? {
+        return Err(ControlError::Conflict(format!("cannot deploy: {why}")));
+    }
+    let commit = required_commit(r, &task).ok_or_else(|| ControlError::Conflict("cannot deploy: the task has no branch or merge commit to check".into()))?;
+    match ancestry_problem(&repo, &commit) {
         Some(why) => Err(ControlError::Conflict(format!("cannot deploy: {why}"))),
         None => Ok(repo),
     }
@@ -165,6 +211,7 @@ pub fn start(db: &Db, data_dir: &Path, event_id: i64) -> Result<Job, ControlErro
     let _lock = START.lock().unwrap_or_else(|e| e.into_inner());
     let r = find(db, event_id)?;
     actionable(&r)?;
+    none_running(db)?;
     let cwd = deploy_dir(db, data_dir, &r)?;
     let command = r.event.payload["command"].as_str().unwrap_or_default().to_string();
     if command.trim().is_empty() {
@@ -250,7 +297,7 @@ pub fn inbox_items(db: &Db) -> Result<Vec<InboxItem>> {
     for r in requests(db)? {
         let title = task_title(db, &r.event)?;
         match r.state {
-            State::Open => items.push(open_item(&r, &title)),
+            State::Open => items.push(open_item(&r, &title, &repo_head(db, &r.event)?)),
             State::Failed => items.push(failed_item(&r, &title)),
             _ => {}
         }
@@ -263,6 +310,13 @@ fn task_title(db: &Db, e: &Event) -> Result<String> {
     Ok(task.map(|t| t.title).unwrap_or_else(|| "this task".into()))
 }
 
+/// HEAD's short sha in the repo of the request's client.
+fn repo_head(db: &Db, e: &Event) -> Result<String> {
+    let task = e.task_id.map(|id| db.get_task(id)).transpose()?.flatten();
+    let client = task.map(|t| db.get_client(t.client_id)).transpose()?.flatten();
+    Ok(client.map(|c| head_short(&crate::scheduler::expand_home(&c.repo_path))).unwrap_or_else(|| "unknown".into()))
+}
+
 fn field(e: &Event, key: &str) -> String {
     e.payload[key].as_str().unwrap_or_default().to_string()
 }
@@ -271,7 +325,7 @@ fn actions() -> Vec<String> {
     vec!["deploy".into(), "skip".into()]
 }
 
-fn open_item(r: &Request, title: &str) -> InboxItem {
+fn open_item(r: &Request, title: &str, head: &str) -> InboxItem {
     let env = field(&r.event, "environment");
     let detail = (env == "production").then(|| "A production deploy cannot be undone.".to_string());
     InboxItem {
@@ -279,7 +333,7 @@ fn open_item(r: &Request, title: &str) -> InboxItem {
         id: r.event.id,
         task_id: r.event.task_id,
         title: format!("Deploy {title} to {env}?"),
-        reason: format!("Runs: {}", field(&r.event, "command")),
+        reason: format!("Runs: {} at HEAD {head}", field(&r.event, "command")),
         actions: actions(),
         created_at: r.event.created_at.clone(),
         detail,
@@ -330,7 +384,15 @@ mod tests {
             client_id: c.id, parent_id: None, title: "Login page".into(), body: String::new(), status: TaskStatus::Done,
             done_command: None, max_loops: 3, role: Role::Lead, source_kind: SourceKind::User, source_ref: None, agent: None, pod: vec![],
         }).unwrap();
+        git(repo.path(), &["branch", "rui/task-1"]);
+        db.set_task_branch(task.id, "rui/task-1").unwrap();
+        let task = db.get_task(task.id).unwrap().unwrap();
         (db, data, repo, task)
+    }
+
+    fn sha(dir: &Path, rev: &str) -> String {
+        let o = Command::new("git").arg("-C").arg(dir).args(["rev-parse", rev]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
     fn kinds(db: &Db, kind: &str) -> Vec<Event> {
@@ -351,13 +413,14 @@ mod tests {
 
     #[test]
     fn pr_merged_requests_a_deploy_only_when_configured() {
-        let merged = crate::pr_watch::Finding::Merged { merged_at: "2026-11-18T10:00:00Z".into() };
+        let merged = crate::pr_watch::Finding::Merged { merged_at: "2026-11-18T10:00:00Z".into(), merge_commit: None };
         let (db, data, _repo, task) = setup(None);
         crate::pr_watch::record(&db, data.path(), &task, "https://x.test/pr/1", std::slice::from_ref(&merged)).unwrap();
         assert!(kinds(&db, "deploy_requested").is_empty());
         assert!(inbox_items(&db).unwrap().is_empty());
 
         let (db, data, _repo, task) = setup(Some("echo ok"));
+        assert_eq!(head_short(_repo.path()).len(), 7);
         crate::pr_watch::record(&db, data.path(), &task, "https://x.test/pr/1", &[merged]).unwrap();
         let reqs = kinds(&db, "deploy_requested");
         assert_eq!(reqs.len(), 1);
@@ -365,14 +428,15 @@ mod tests {
         let items = crate::inbox::inbox(&db).unwrap();
         let item = items.iter().find(|i| i.kind == "deploy").unwrap();
         assert_eq!(item.title, "Deploy Login page to production?");
-        assert_eq!((item.reason.as_str(), item.actions.clone()), ("Runs: echo ok", actions()));
+        let reason = format!("Runs: echo ok at HEAD {}", head_short(_repo.path()));
+        assert_eq!((item.reason.as_str(), item.actions.clone()), (reason.as_str(), actions()));
         assert!(kinds(&db, "deploy_started").is_empty(), "nothing runs without the owner");
     }
 
     #[test]
     fn deploy_is_refused_on_a_dirty_or_other_branch_tree() {
         let (db, data, repo, task) = setup(Some("echo ok"));
-        let id = request(&db, data.path(), &task).unwrap().unwrap();
+        let id = request(&db, data.path(), &task, None).unwrap().unwrap();
         std::fs::write(repo.path().join("a.txt"), "changed").unwrap();
         let err = start(&db, data.path(), id).err().unwrap();
         assert!(matches!(&err, ControlError::Conflict(m) if m.contains("uncommitted")), "{err}");
@@ -387,7 +451,7 @@ mod tests {
     #[test]
     fn deploy_runs_and_records_finished_ok() {
         let (db, data, repo, task) = setup(Some("echo ok && pwd"));
-        let id = request(&db, data.path(), &task).unwrap().unwrap();
+        let id = request(&db, data.path(), &task, None).unwrap().unwrap();
         let job = start(&db, data.path(), id).unwrap();
         assert!(matches!(start(&db, data.path(), id), Err(ControlError::Conflict(_))), "no second start while running");
         assert!(finish(&db, &job, LIMIT).unwrap());
@@ -402,7 +466,7 @@ mod tests {
     #[test]
     fn failed_deploy_becomes_an_inbox_item_and_timeouts_kill_the_group() {
         let (db, data, _repo, task) = setup(Some("echo boom; exit 3"));
-        let id = request(&db, data.path(), &task).unwrap().unwrap();
+        let id = request(&db, data.path(), &task, None).unwrap().unwrap();
         assert!(!finish(&db, &start(&db, data.path(), id).unwrap(), LIMIT).unwrap());
         let items = inbox_items(&db).unwrap();
         assert_eq!((items[0].kind, items[0].title.as_str()), ("deploy_failed", "Deploy failed"));
@@ -416,9 +480,45 @@ mod tests {
     }
 
     #[test]
+    fn deploy_is_refused_until_head_contains_the_work() {
+        let (db, data, repo, task) = setup(Some("echo ok"));
+        git(repo.path(), &["checkout", "-q", "rui/task-1"]);
+        std::fs::write(repo.path().join("b.txt"), "b").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work"]);
+        git(repo.path(), &["checkout", "-q", "main"]);
+        let id = request(&db, data.path(), &task, None).unwrap().unwrap();
+        let err = start(&db, data.path(), id).err().unwrap();
+        assert!(matches!(&err, ControlError::Conflict(m) if m.contains("HEAD does not contain rui/task-1")), "{err}");
+        let tip = sha(repo.path(), "rui/task-1");
+        let by_merge = request(&db, data.path(), &task, Some(&tip)).unwrap().unwrap();
+        assert!(matches!(start(&db, data.path(), by_merge), Err(ControlError::Conflict(_))));
+        git(repo.path(), &["merge", "-q", "--ff-only", "rui/task-1"]);
+        let job = start(&db, data.path(), by_merge).unwrap();
+        assert!(finish(&db, &job, LIMIT).unwrap());
+    }
+
+    #[test]
+    fn only_one_deploy_runs_at_a_time_and_restart_closes_it() {
+        let (db, data, _repo, task) = setup(Some("echo ok"));
+        let first = request(&db, data.path(), &task, None).unwrap().unwrap();
+        let second = request(&db, data.path(), &task, None).unwrap().unwrap();
+        let _job = start(&db, data.path(), first).unwrap();
+        let err = start(&db, data.path(), second).err().unwrap();
+        assert!(matches!(&err, ControlError::Conflict(m) if m.contains("another deploy")), "{err}");
+        assert_eq!(recover(&db).unwrap(), 1);
+        let last = kinds(&db, "deploy_finished").pop().unwrap();
+        assert_eq!(last.payload, json!({"event_id": first, "ok": false, "exit_code": null, "output_tail": "daemon restarted; outcome unknown"}));
+        assert_eq!(recover(&db).unwrap(), 0);
+        let failed: Vec<i64> = inbox_items(&db).unwrap().iter().filter(|i| i.kind == "deploy_failed").map(|i| i.id).collect();
+        assert_eq!(failed, [first]);
+        assert!(start(&db, data.path(), second).is_ok());
+    }
+
+    #[test]
     fn skip_clears_the_item_and_blocks_a_deploy() {
         let (db, data, _repo, task) = setup(Some("echo ok"));
-        let id = request(&db, data.path(), &task).unwrap().unwrap();
+        let id = request(&db, data.path(), &task, None).unwrap().unwrap();
         skip(&db, id).unwrap();
         assert_eq!(kinds(&db, "deploy_skipped").len(), 1);
         assert!(inbox_items(&db).unwrap().is_empty());
