@@ -18,7 +18,7 @@ pub fn branch_name(task_id: i64) -> String {
     format!("rui/{task_id}")
 }
 
-fn git(repo: &Path, args: &[&str]) -> anyhow::Result<Output> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<Output> {
     StdCommand::new("git")
         .arg("-C")
         .arg(repo)
@@ -158,6 +158,14 @@ pub fn branch_files(repo: &Path, branch: &str) -> anyhow::Result<Vec<String>> {
     Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
 }
 
+/// Puts each file back to its state on `branch` (worktree and index).
+pub fn restore_files(wt: &Path, branch: &str, paths: &[String]) -> anyhow::Result<()> {
+    for path in paths {
+        git_stdout(wt, &["checkout", branch, "--", path])?;
+    }
+    Ok(())
+}
+
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 
 /// What the branch in `wt` changed relative to main (or master), capped at 60 KB.
@@ -191,7 +199,7 @@ fn parse_numstat(out: &str) -> Vec<Change> {
         .collect()
 }
 
-fn git_stdout(wt: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn git_stdout(wt: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = git(wt, args)?;
     if !out.status.success() {
         bail!("git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr));

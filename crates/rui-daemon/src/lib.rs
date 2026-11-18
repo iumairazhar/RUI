@@ -14,6 +14,7 @@ pub mod live;
 pub mod mcp;
 pub mod owner_state;
 pub mod projects;
+pub mod protected;
 pub mod results;
 pub mod roster;
 pub mod runner;

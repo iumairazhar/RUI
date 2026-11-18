@@ -1,0 +1,202 @@
+//! Files a team member must not edit: the pod's protected paths, tests and evals,
+//! tests written by a tester, and files the done_command runs.
+
+use crate::client_state::Pod;
+use crate::worktree::{self, branch_files, branch_name};
+use anyhow::Result;
+use rui_core::{Task, TaskStatus};
+use std::collections::HashSet;
+use std::path::Path;
+
+/// What one member subtask may not modify or delete.
+#[derive(Debug, Default)]
+pub struct Protected {
+    pub explicit: Vec<String>,
+    pub files: HashSet<String>,
+    pub check_patterns: bool,
+}
+
+const TEST_DIRS: [&str; 7] = ["test", "tests", "__tests__", "spec", "specs", "eval", "evals"];
+
+/// Builds the protected set for `sub`. Testers only get the pod's explicit entries.
+pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod, task_branch: &str) -> Result<Protected> {
+    let _ = task_branch;
+    let mut p = Protected { explicit: pod.protected.clone(), ..Protected::default() };
+    if sub.agent.as_deref() == Some("tester") {
+        return Ok(p);
+    }
+    p.check_patterns = true;
+    for sib in siblings {
+        if sib.status == TaskStatus::Done && sib.agent.as_deref() == Some("tester") {
+            p.files.extend(branch_files(repo_wt, &branch_name(sib.id))?);
+        }
+    }
+    p.files.extend(done_command_files(repo_wt, sub.done_command.as_deref().unwrap_or("")));
+    Ok(p)
+}
+
+/// Existing files named by a done command (pytest node ids and `./` prefixes are cleaned up).
+fn done_command_files(wt: &Path, cmd: &str) -> Vec<String> {
+    cmd.split_whitespace()
+        .map(|t| t.trim_matches(['\'', '"']))
+        .map(|t| t.split("::").next().unwrap_or(""))
+        .map(|t| t.trim_start_matches("./"))
+        .filter(|t| !t.is_empty() && wt.join(t).is_file())
+        .map(String::from)
+        .collect()
+}
+
+/// `*` matches non-`/` characters, `**` matches anything.
+fn glob(p: &[u8], t: &[u8]) -> bool {
+    match p {
+        [] => t.is_empty(),
+        [b'*', b'*', rest @ ..] => (0..=t.len()).any(|i| glob(rest, &t[i..])),
+        [b'*', rest @ ..] => {
+            let end = t.iter().position(|c| *c == b'/').unwrap_or(t.len());
+            (0..=end).any(|i| glob(rest, &t[i..]))
+        }
+        [c, rest @ ..] => t.first() == Some(c) && glob(rest, &t[1..]),
+    }
+}
+
+fn matches_entry(path: &str, entry: &str) -> bool {
+    if entry.ends_with('/') {
+        return path.starts_with(entry);
+    }
+    glob(entry.as_bytes(), path.as_bytes())
+}
+
+fn looks_like_test(path: &str) -> bool {
+    if path.split('/').any(|s| TEST_DIRS.contains(&s)) {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let py = name.starts_with("test_") && name.ends_with(".py");
+    let suffix = name.ends_with("_test.py") || name.ends_with("_test.go");
+    let infix = name.contains(".test.") || name.contains(".spec.");
+    py || suffix || infix || name == "conftest.py"
+}
+
+/// True when the path must not be modified or deleted.
+pub fn is_protected(path: &str, p: &Protected) -> bool {
+    p.files.contains(path)
+        || p.explicit.iter().any(|e| matches_entry(path, e))
+        || (p.check_patterns && looks_like_test(path))
+}
+
+/// Files that exist on `task_branch` and that the member modified or deleted in `wt`.
+pub fn touched_existing(wt: &Path, task_branch: &str) -> Result<Vec<String>> {
+    let out = worktree::git_stdout(wt, &["diff", "--no-renames", "--name-only", "-z", task_branch])?;
+    let mut files = Vec::new();
+    for path in out.split('\0').filter(|s| !s.is_empty()) {
+        let spec = format!("{task_branch}:{path}");
+        if worktree::git(wt, &["cat-file", "-e", &spec])?.status.success() {
+            files.push(path.to_string());
+        }
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn p(explicit: &[&str], files: &[&str], check: bool) -> Protected {
+        Protected {
+            explicit: explicit.iter().map(|s| s.to_string()).collect(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            check_patterns: check,
+        }
+    }
+
+    #[test]
+    fn glob_star_and_double_star() {
+        assert!(is_protected("src/a.py", &p(&["src/*.py"], &[], false)));
+        assert!(!is_protected("src/a/b.py", &p(&["src/*.py"], &[], false)));
+        assert!(is_protected("a/b/x.json", &p(&["**/x.json"], &[], false)));
+        assert!(is_protected("evals/one/two.txt", &p(&["evals/"], &[], false)));
+        assert!(is_protected("src/db.rs", &p(&["src/db.rs"], &[], false)));
+        assert!(!is_protected("src/dbx.rs", &p(&["src/db.rs"], &[], false)));
+    }
+
+    #[test]
+    fn test_patterns() {
+        let c = p(&[], &[], true);
+        for f in ["tests/a.py", "foo_test.go", "a.spec.ts", "x/test_y.py", "conftest.py", "a/b.test.js", "src/evals/z.json"] {
+            assert!(is_protected(f, &c), "{f}");
+        }
+        assert!(!is_protected("src/main.rs", &c));
+        assert!(!is_protected("tests/a.py", &p(&[], &[], false)));
+    }
+
+    #[test]
+    fn done_command_files_are_parsed() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("tests")).unwrap();
+        std::fs::write(d.path().join("tests/test_api.py"), "x").unwrap();
+        std::fs::write(d.path().join("run.sh"), "x").unwrap();
+        assert_eq!(done_command_files(d.path(), "pytest tests/test_api.py::test_x -q"), ["tests/test_api.py"]);
+        assert_eq!(done_command_files(d.path(), "./run.sh"), ["run.sh"]);
+        assert_eq!(done_command_files(d.path(), "pytest 'tests/test_api.py'"), ["tests/test_api.py"]);
+        assert!(done_command_files(d.path(), "pytest nope.py").is_empty());
+    }
+
+    fn task(agent: Option<&str>, done: &str) -> Task {
+        let db = crate::db::Db::open_test();
+        let client = db.create_client("acme", "/repo", None, &[]).unwrap();
+        db.create_task(&crate::db::NewTask {
+            client_id: client.id,
+            parent_id: None,
+            title: "t".into(),
+            body: String::new(),
+            status: TaskStatus::Open,
+            done_command: Some(done.into()),
+            max_loops: 2,
+            role: rui_core::Role::Builder,
+            source_kind: rui_core::SourceKind::User,
+            source_ref: None,
+            agent: agent.map(String::from),
+            pod: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn tester_gets_only_explicit_entries() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("run.sh"), "x").unwrap();
+        let pod = Pod { roles: vec![], protected: vec!["src/db.rs".into()] };
+        let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod, "b").unwrap();
+        assert!(!tester.check_patterns && tester.files.is_empty());
+        assert!(is_protected("src/db.rs", &tester) && !is_protected("tests/a.py", &tester));
+        let member = protected_set(d.path(), &task(None, "./run.sh"), &[], &pod, "b").unwrap();
+        assert!(member.check_patterns && member.files.contains("run.sh"));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let o = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn touched_existing_and_restore() {
+        let (repo, wts) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        git(repo.path(), &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+        std::fs::write(repo.path().join("tests/test_a.py"), "orig").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (wt, _) = worktree::create_worktree(repo.path(), wts.path(), 2, Some(&tb)).unwrap();
+        std::fs::write(wt.join("tests/test_a.py"), "cheat").unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/new.py"), "new").unwrap();
+        let touched = touched_existing(&wt, &tb).unwrap();
+        assert_eq!(touched, ["tests/test_a.py"]);
+        assert!(is_protected(&touched[0], &p(&[], &[], true)));
+        worktree::restore_files(&wt, &tb, &touched).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("tests/test_a.py")).unwrap(), "orig");
+        assert!(wt.join("src/new.py").exists());
+    }
+}

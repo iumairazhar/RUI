@@ -5,6 +5,7 @@ use crate::results::ResultFile;
 use crate::db::Db;
 use crate::client_state;
 use crate::prompts;
+use crate::protected;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
 use crate::roster;
@@ -1082,6 +1083,9 @@ async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_comm
     if matches!(current.status, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
         return Ok(());
     }
+    if reject_protected(db, cfg, task, wt)? {
+        return Ok(());
+    }
     let check = run_done_command(wt, done_command).await?;
     if after_done_check(db, &cfg.data_dir, task.id, &check)? != TaskStatus::Done {
         return Ok(());
@@ -1090,6 +1094,32 @@ async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_comm
         merge_subtask(db, cfg, task)?;
     }
     Ok(())
+}
+
+/// Undoes edits to protected files. True when something was rejected (the failed loop is counted).
+fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<bool> {
+    let client = client_for(db, task)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let repo = expand_home(&client.repo_path);
+    let (task_wt, task_branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), parent_id)?;
+    let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
+    let siblings = db.subtasks(parent_id)?;
+    let set = protected::protected_set(&task_wt, task, &siblings, &pod, &task_branch)?;
+    let mut bad = protected::touched_existing(wt, &task_branch)?;
+    bad.retain(|f| protected::is_protected(f, &set));
+    if bad.is_empty() {
+        return Ok(false);
+    }
+    crate::worktree::restore_files(wt, &task_branch, &bad)?;
+    let files = bad.join(", ");
+    db.add_event(Some(task.id), "scheduler", "protected_rejected", &json!({"files": bad}))?;
+    let text = format!(
+        "Your changes to protected files were rejected and undone: {files}. Tests, eval files and files the done_command uses must not be edited, deleted or skipped. Make the done_command pass by doing the job."
+    );
+    db.add_event(Some(task.id), "scheduler", "instruction", &json!({"text": text}))?;
+    let status = count_failed_loop(db, &cfg.data_dir, task, &format!("changed protected files: {files}"))?;
+    db.set_task_status(task.id, status)?;
+    Ok(true)
 }
 
 /// Commits the worktree; false when there was nothing to commit.
@@ -1233,6 +1263,46 @@ mod tests {
         assert!(!tools.iter().any(|t| t == "Edit" || t == "Write"));
         assert!(tools.iter().any(|t| t == "mcp__rui__log_decision"));
         assert!(tools.iter().any(|t| t == "Bash"));
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// A repo with `tests/test_a.py` on main, a parent task, one subtask and its worktree.
+    fn protected_setup(data: &Path, repo: &Path) -> (Db, Config, Task, PathBuf) {
+        git_in(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("tests/test_a.py"), "orig").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Db::open_test();
+        let client = db.create_client("acme", &repo.to_string_lossy(), None, &[]).unwrap();
+        let parent = mk(&db, client.id, None, TaskStatus::Split);
+        let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.to_path_buf() };
+        let worktrees = data.join("worktrees");
+        let (_, tb) = ensure_task_worktree(repo, &worktrees, parent.id).unwrap();
+        let (wt, _) = create_worktree(repo, &worktrees, sub.id, Some(&tb)).unwrap();
+        (db, cfg, sub, wt)
+    }
+
+    #[test]
+    fn reject_protected_undoes_edits_and_counts_a_loop() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        std::fs::write(wt.join("tests/test_a.py"), "cheat").unwrap();
+        std::fs::write(wt.join("new.py"), "new").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("tests/test_a.py")).unwrap(), "orig");
+        assert!(wt.join("new.py").exists());
+        let events = db.list_events(Some(sub.id), 50).unwrap();
+        assert!(events.iter().any(|e| e.kind == "protected_rejected"));
+        assert!(events.iter().any(|e| e.kind == "instruction"));
+        let after = db.get_task(sub.id).unwrap().unwrap();
+        assert_eq!((after.loops_used, after.status), (1, TaskStatus::Open));
     }
 
     #[test]
