@@ -6,6 +6,7 @@ pub mod apps;
 pub mod asks;
 pub mod character;
 pub mod chat;
+pub mod client_knowledge;
 mod chat_tools;
 pub mod clients;
 pub mod decision;

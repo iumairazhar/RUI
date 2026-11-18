@@ -21,7 +21,7 @@ use theme::{Theme, theme};
 use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
-    activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, clients,
+    activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, client_knowledge::ClientDrawer, clients,
     inbox::{InboxPanel, PanelEvent},
     library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
 };
@@ -146,6 +146,8 @@ struct Root {
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
     results: Entity<ResultsView>,
+    /// Drawer of the client opened from the Clients page.
+    client_drawer: Entity<ClientDrawer>,
     /// The Inbox slide-over, shown over the current page while `inbox_open`.
     inbox: Entity<InboxPanel>,
     inbox_open: bool,
@@ -198,6 +200,7 @@ impl Root {
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
             results: cx.new(|cx| ResultsView::new(store.clone(), cx)),
+            client_drawer: cx.new(|cx| ClientDrawer::new(store.clone(), cx)),
             store,
         }
     }
@@ -213,7 +216,7 @@ impl Root {
                 _ => self.apps.clone().into_any_element(),
             },
             Nav::Clients => match tab(Sec::Clients) {
-                0 => clients::page(self.add_client_button(cx), cx),
+                0 => clients::page(self.add_client_button(cx), &self.client_drawer, cx),
                 _ => self.agents.clone().into_any_element(),
             },
             Nav::Knowledge => match tab(Sec::Knowledge) {

@@ -417,6 +417,16 @@ pub fn create_client(name: &str, repo_path: &str) -> Result<serde_json::Value> {
     library("POST", "/clients", Some(serde_json::json!({ "name": name, "repo_path": repo_path })))
 }
 
+/// What the owner wrote down about a client, as `{text}`.
+pub fn get_knowledge(client_id: i64) -> Result<serde_json::Value> {
+    library("GET", &format!("/clients/{client_id}/knowledge"), None)
+}
+
+/// Append one dated bullet to a client's knowledge; returns the new `{text}`.
+pub fn add_knowledge(client_id: i64, text: &str) -> Result<serde_json::Value> {
+    library("POST", &format!("/clients/{client_id}/knowledge"), Some(serde_json::json!({ "text": text })))
+}
+
 /// Restart a project's apps.
 pub fn restart_apps(project: &str) -> Result<()> {
     post(&format!("/apps/{}/restart", encode_path(project)), serde_json::json!({}))
