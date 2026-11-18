@@ -60,16 +60,25 @@ pub fn lessons(db: &Db, task_id: i64) -> Result<Vec<Event>> {
     Ok(db.events_for_tasks(&ids, &LESSON_KINDS, 0, 500)?.into_iter().filter(is_lesson).collect())
 }
 
-/// Done top-level tasks with lessons and no `coach_reviewed` event yet.
+/// Only tasks active this recently get a Coach turn, so old finished work isn't backfilled.
+const RECENT_SECS: i64 = 24 * 3600;
+
+/// Done top-level tasks with lessons, recent activity and no `coach_reviewed` event yet.
 pub fn due(db: &Db) -> Result<Vec<i64>> {
     let seen: HashSet<i64> = db.events_of_kinds(&["coach_reviewed"])?.iter().filter_map(|e| e.task_id).collect();
     let mut out = Vec::new();
     for t in db.tasks_with_status(TaskStatus::Done)? {
-        if t.parent_id.is_none() && !seen.contains(&t.id) && !lessons(db, t.id)?.is_empty() {
+        if t.parent_id.is_none() && !seen.contains(&t.id) && is_recent(db, t.id)? && !lessons(db, t.id)?.is_empty() {
             out.push(t.id);
         }
     }
     Ok(out)
+}
+
+/// True when the task last had activity within RECENT_SECS.
+fn is_recent(db: &Db, task_id: i64) -> Result<bool> {
+    let last = db.last_activity(&[task_id])?.into_values().max().unwrap_or(0);
+    Ok(crate::thread::now_secs() - last <= RECENT_SECS)
 }
 
 /// At most one Coach turn at a time: the oldest due task.
