@@ -219,13 +219,15 @@ pub(crate) async fn stream(
     Ok(out)
 }
 
-/// The CLI command for a run, with the seat's environment applied.
+/// The CLI command for a run: every secret variable removed, then the seat's environment applied
+/// (ANTHROPIC_API_KEY only for an active api_key seat).
 fn command(bin: &str, run: &AgentRun, cfg: &Path) -> anyhow::Result<Command> {
     let env = match &run.seat {
         Some(seat) => crate::seats::seat_env(seat)?,
         None => vec![],
     };
     let mut cmd = Command::new(bin);
+    crate::seats::scrub_env(cmd.as_std_mut(), &crate::state::data_dir());
     cmd.args(build_args(run, cfg))
         .envs(env)
         .current_dir(&run.cwd)
@@ -353,9 +355,12 @@ mod tests {
         let mut r = run(d.path());
         let envs = |r: &AgentRun| {
             let cmd = command("claude", r, Path::new("/x.json")).unwrap();
-            cmd.as_std().get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect::<Vec<_>>()
+            let set = cmd.as_std().get_envs().filter(|(_, v)| v.is_some());
+            set.map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect::<Vec<_>>()
         };
         assert!(envs(&r).is_empty());
+        let cmd = command("claude", &r, Path::new("/x.json")).unwrap();
+        assert!(cmd.as_std().get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()), "the daemon's key is removed");
         r.seat = Some(crate::seats::Seat { config_dir: Some("/tmp/claude-two".into()), ..crate::seats::default_seat() });
         let want = (std::ffi::OsString::from("CLAUDE_CONFIG_DIR"), Some(std::ffi::OsString::from("/tmp/claude-two")));
         assert_eq!(envs(&r), [want]);

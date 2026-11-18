@@ -158,6 +158,21 @@ pub fn env_var_present(s: &Seat) -> bool {
     }
 }
 
+/// Names of the secret variables no agent or done command may inherit: ANTHROPIC_API_KEY and
+/// every seat's env_var from seats.json.
+pub fn secret_env_names(data_dir: &Path) -> Vec<String> {
+    let mut names = vec!["ANTHROPIC_API_KEY".to_string()];
+    names.extend(load(data_dir).unwrap_or_default().into_iter().filter_map(|s| s.env_var));
+    names
+}
+
+/// Removes every secret variable from a child process's environment.
+pub fn scrub_env(cmd: &mut std::process::Command, data_dir: &Path) {
+    for name in secret_env_names(data_dir) {
+        cmd.env_remove(name);
+    }
+}
+
 /// Environment the CLI process runs with for this seat. The key is read here, at run time.
 pub fn seat_env(s: &Seat) -> Result<Vec<(String, String)>> {
     match s.kind {
@@ -456,6 +471,17 @@ mod tests {
         assert_eq!(pick_seat(&db, std::slice::from_ref(&key), now()).unwrap().unwrap().id, "k");
         assert_eq!(seat_env(&key).unwrap(), [("ANTHROPIC_API_KEY".to_string(), "fake-value".to_string())]);
         unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn scrub_removes_every_seat_key_and_the_default_key() {
+        let d = tempfile::tempdir().unwrap();
+        let key = Seat { kind: SeatKind::ApiKey, env_var: Some("ANTHROPIC_API_KEY_WORK".into()), ..seat("k", 1, None) };
+        upsert(d.path(), key).unwrap();
+        let mut cmd = std::process::Command::new("true");
+        scrub_env(&mut cmd, d.path());
+        let removed: Vec<String> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        assert_eq!(removed, ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_WORK"]);
     }
 
     #[test]

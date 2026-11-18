@@ -401,10 +401,17 @@ fn tail(bytes: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
+/// `sh -c cmd` with every seat key and ANTHROPIC_API_KEY removed from its environment.
+pub fn done_shell(cmd: &str) -> Command {
+    let mut c = Command::new("sh");
+    c.args(["-c", cmd]);
+    crate::seats::scrub_env(c.as_std_mut(), &crate::state::data_dir());
+    c
+}
+
 /// Runs `sh -c cmd` in `cwd` with a 10 minute timeout.
 pub async fn run_done_command(cwd: &Path, cmd: &str) -> anyhow::Result<DoneCheck> {
-    let child = Command::new("sh")
-        .args(["-c", cmd])
+    let child = done_shell(cmd)
         .current_dir(cwd)
         .kill_on_drop(true)
         .output();
@@ -426,8 +433,8 @@ pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
 
 fn require_failing_within(wt: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
-    let mut child = StdCommand::new("sh")
-        .args(["-c", cmd])
+    let mut child = done_shell(cmd)
+        .as_std_mut()
         .process_group(0)
         .current_dir(wt)
         .stdin(std::process::Stdio::null())
@@ -461,6 +468,12 @@ pub fn reset_worktree(wt: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_commands_never_inherit_the_api_key() {
+        let c = done_shell("true");
+        assert!(c.as_std().get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()));
+    }
 
     fn init_repo(dir: &Path) {
         let run = |args: &[&str]| {
