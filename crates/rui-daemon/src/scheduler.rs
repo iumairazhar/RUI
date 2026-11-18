@@ -784,6 +784,7 @@ impl Drop for RunGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn<F, Fut>(
     db: &Arc<Db>,
     cfg: &Config,
@@ -1048,7 +1049,7 @@ fn task_worktree(cfg: &Config, client: &Client, repo: &Path, task_id: i64) -> Re
 fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: &str, prompt: String) -> Result<AgentRun> {
     let role = roster::load(&cfg.data_dir, "lead");
     let repo = expand_home(&client.repo_path);
-    let (wt, branch) = task_worktree(cfg, &client, &repo, task.id)?;
+    let (wt, branch) = task_worktree(cfg, client, &repo, task.id)?;
     record_parent_branch(db, task.id, &branch)?;
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
     install_logged(db, cfg, &wt, task, "lead", &client.name, &names)?;

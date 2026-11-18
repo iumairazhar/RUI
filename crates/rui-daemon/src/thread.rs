@@ -511,7 +511,7 @@ fn pr_outcome_node(e: &Event) -> Node {
 
 fn app_nodes(ctx: &Ctx) -> Vec<Node> {
     let started = ctx.events.iter().filter(|e| e.kind == "apps_started" && e.task_id == Some(ctx.top.id));
-    started.filter_map(|e| app_node(e)).collect()
+    started.filter_map(app_node).collect()
 }
 
 fn app_node(e: &Event) -> Option<Node> {

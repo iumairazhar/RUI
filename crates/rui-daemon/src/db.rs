@@ -614,7 +614,7 @@ impl Db {
                 params![chat_title(content), chat_id, DEFAULT_CHAT_TITLE],
             )?;
         }
-        Ok(fetch_chat_message(&conn, id)?.ok_or_else(|| anyhow!("message vanished"))?)
+        fetch_chat_message(&conn, id)?.ok_or_else(|| anyhow!("message vanished"))
     }
 
     /// One chat message by id.
