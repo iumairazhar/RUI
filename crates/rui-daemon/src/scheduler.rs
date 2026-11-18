@@ -1422,10 +1422,9 @@ async fn finish_builder(db: &Arc<Db>, cfg: &Config, task: &Task, wt: &Path, done
 
 /// Commits a passing subtask and merges it into the task branch (sync git, run off the async runtime).
 fn commit_and_merge(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<()> {
-    if commit_task(db, task, wt)? {
-        merge_subtask(db, cfg, task)?;
-    }
-    Ok(())
+    // Merge even when there was nothing new to commit: the agent may have committed its work itself.
+    commit_task(db, task, wt)?;
+    merge_subtask(db, cfg, task)
 }
 
 /// The worktree a subtask's builder works in.
