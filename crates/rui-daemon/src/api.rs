@@ -98,6 +98,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/review", post(review_task))
         .route("/tasks/{id}/drop", post(drop_task))
         .route("/tasks/{id}/retry", post(retry_task))
+        .route("/tasks/{id}/checkpoint", post(checkpoint_task))
+        .route("/tasks/{id}/take-over", post(take_over_task))
+        .route("/tasks/{id}/hand-back", post(hand_back_task))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
@@ -580,6 +583,53 @@ async fn retry_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult
     }
     let ids = crate::scheduler::retry_stuck(&s.db, id, "owner")?;
     Ok(Json(serde_json::json!({ "resumed": ids })))
+}
+
+#[derive(Deserialize)]
+struct CheckpointBody {
+    on: bool,
+}
+
+/// Holds a subtask that has not started ("wait for me before this step"), or releases it.
+async fn checkpoint_task(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<CheckpointBody>) -> ApiResult<Json<Task>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if task.parent_id.is_none() || !matches!(task.status, TaskStatus::New | TaskStatus::Open) {
+        return Err(bad_request("only a subtask that has not started can be held"));
+    }
+    if crate::scheduler::owner_hold(&s.db, id)? == Some("takeover") {
+        return Err(conflict("this step is taken over"));
+    }
+    let kind = if b.on { "checkpoint_set" } else { "checkpoint_cleared" };
+    s.db.add_event(Some(id), "owner", kind, &serde_json::json!({}))?;
+    Ok(Json(task))
+}
+
+/// Stops a subtask's agent so the owner can do the step by hand.
+async fn take_over_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<crate::control::TakeOver>> {
+    Ok(Json(crate::control::take_over(&s.db, &s.runs, &s.data_dir, id)?))
+}
+
+#[derive(Deserialize)]
+struct HandBackBody {
+    note: String,
+    #[serde(default)]
+    force: bool,
+}
+
+/// Gives a taken-over step back: runs its check, then lands it or sends the note to the agent.
+async fn hand_back_task(
+    State(s): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(b): Json<HandBackBody>,
+) -> ApiResult<Json<crate::scheduler::HandBack>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if crate::scheduler::owner_hold(&s.db, id)? != Some("takeover") {
+        return Err(conflict("this step is not taken over"));
+    }
+    if !crate::scheduler::subtask_worktree(&s.data_dir, id).exists() {
+        return Err(conflict("this step has no worktree to check"));
+    }
+    Ok(Json(crate::scheduler::hand_back(&s.db, &s.data_dir, &task, &b.note, b.force).await?))
 }
 
 /// Files changed by a task: committed diff when done, else the live worktree diff.
@@ -1107,6 +1157,30 @@ mod tests {
         assert_eq!(db.get_task(tid).unwrap().unwrap().status, TaskStatus::New);
         db.set_task_status(tid, TaskStatus::Done).unwrap();
         assert_eq!(review(json!({"verdict": "ok"})).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_take_over_and_hand_back_guards() {
+        let (app, db, _rx) = setup();
+        let (cid, parent) = seed_task(&db);
+        let kid = seed_child(&db, cid, Some(parent));
+        let cp_uri = format!("/tasks/{kid}/checkpoint");
+        let cp = |on: bool| call(&app, "POST", &cp_uri, Some(json!({"on": on})));
+        assert_eq!(cp(true).await.0, StatusCode::OK);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), Some("checkpoint"));
+        assert_eq!(cp(false).await.0, StatusCode::OK);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), None);
+        let top = call(&app, "POST", &format!("/tasks/{parent}/checkpoint"), Some(json!({"on": true}))).await.0;
+        assert_eq!(top, StatusCode::BAD_REQUEST);
+        let hb_uri = format!("/tasks/{kid}/hand-back");
+        assert_eq!(call(&app, "POST", &hb_uri, Some(json!({"note": "x"}))).await.0, StatusCode::CONFLICT);
+        db.set_task_status(kid, TaskStatus::InProgress).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{kid}/take-over"), None).await;
+        assert_eq!((st, v["branch"].clone(), v["worktree"].clone()), (StatusCode::OK, json!(format!("rui/{kid}")), Value::Null));
+        assert_eq!(db.get_task(kid).unwrap().unwrap().status, TaskStatus::Open);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), Some("takeover"));
+        db.set_task_status(kid, TaskStatus::Done).unwrap();
+        assert_eq!(cp(true).await.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

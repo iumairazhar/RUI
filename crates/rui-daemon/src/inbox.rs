@@ -116,6 +116,33 @@ fn review_detail(f: &serde_json::Value) -> String {
     text
 }
 
+/// Checkpointed subtasks whose dependencies are all done: ready for the owner to release.
+fn checkpoint_items(db: &Db, tasks: &[Task]) -> Result<Vec<InboxItem>> {
+    let done: HashSet<i64> = tasks.iter().filter(|t| t.status == TaskStatus::Done).map(|t| t.id).collect();
+    let waiting = tasks.iter().filter(|t| t.parent_id.is_some() && matches!(t.status, TaskStatus::New | TaskStatus::Open));
+    let mut items = Vec::new();
+    for t in waiting.filter(|t| t.depends_on.iter().all(|d| done.contains(d))) {
+        if crate::scheduler::owner_hold(db, t.id)? == Some("checkpoint") {
+            items.push(checkpoint_item(t));
+        }
+    }
+    Ok(items)
+}
+
+fn checkpoint_item(t: &Task) -> InboxItem {
+    InboxItem {
+        kind: "checkpoint",
+        id: t.id,
+        task_id: Some(t.id),
+        title: format!("Ready: {} is waiting for you", t.title),
+        reason: "Waiting for you to release this step".into(),
+        actions: strings(&["Release"]),
+        created_at: t.updated_at.clone(),
+        detail: None,
+        link: None,
+    }
+}
+
 /// All inbox items, newest first.
 pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     let mut items = question_items(db)?;
@@ -127,6 +154,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
         .collect();
     items.extend(ask_items(db)?);
     items.extend(task_items(db, &questioned)?);
+    items.extend(checkpoint_items(db, &tasks)?);
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)
 }
@@ -168,6 +196,26 @@ mod tests {
         let stuck_items = find("stuck");
         assert_eq!((stuck_items.len(), stuck_items[0].id), (1, stuck.id));
         assert_eq!(stuck_items[0].actions, ["Retry", "New instructions", "Drop it"]);
+    }
+
+    #[test]
+    fn checkpoint_item_only_once_dependencies_are_done() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let top = make(&db, c.id, None, TaskStatus::Split);
+        let dep = make(&db, c.id, Some(top.id), TaskStatus::Open);
+        let held = make(&db, c.id, Some(top.id), TaskStatus::Open);
+        db.add_task_dep(held.id, dep.id).unwrap();
+        db.add_event(Some(held.id), "owner", "checkpoint_set", &json!({})).unwrap();
+        let checkpoints = |db: &Db| inbox(db).unwrap().into_iter().filter(|i| i.kind == "checkpoint").collect::<Vec<_>>();
+        assert!(checkpoints(&db).is_empty());
+        db.set_task_status(dep.id, TaskStatus::Done).unwrap();
+        let items = checkpoints(&db);
+        assert_eq!((items.len(), items[0].id), (1, held.id));
+        assert_eq!(items[0].title, "Ready: Plan is waiting for you");
+        assert_eq!(items[0].actions, ["Release"]);
+        db.add_event(Some(held.id), "owner", "checkpoint_cleared", &json!({})).unwrap();
+        assert!(checkpoints(&db).is_empty());
     }
 
     #[test]

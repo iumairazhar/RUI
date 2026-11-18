@@ -60,6 +60,34 @@ pub fn stop_one(db: &Db, runs: &Runs, id: i64, by: &str, source: Option<&str>, r
     load(db, id)
 }
 
+/// Where the owner does a taken-over step by hand.
+#[derive(Debug, serde::Serialize)]
+pub struct TakeOver {
+    pub task: Task,
+    pub worktree: Option<String>,
+    pub branch: String,
+}
+
+/// Stops a subtask's agent without marking it stuck and hands the step to the owner.
+/// A stuck team is resumed so the step can finish once it is handed back.
+pub fn take_over(db: &Db, runs: &Runs, data_dir: &std::path::Path, id: i64) -> Res<TakeOver> {
+    let task = load(db, id)?;
+    if task.parent_id.is_none() || task.status == TaskStatus::Done {
+        return Err(ControlError::Conflict("only an unfinished subtask can be taken over".into()));
+    }
+    if crate::scheduler::owner_hold(db, id)? == Some("takeover") {
+        return Err(ControlError::Conflict("this step is already taken over".into()));
+    }
+    abort_run(runs, id);
+    db.set_task_status(id, TaskStatus::Open)?;
+    resume_chain(db, id, "owner")?;
+    let wt = crate::scheduler::subtask_worktree(data_dir, id);
+    let worktree = wt.exists().then(|| wt.to_string_lossy().into_owned());
+    let branch = task.branch.clone().unwrap_or_else(|| crate::worktree::branch_name(id));
+    db.add_event(Some(id), "owner", "taken_over", &json!({"worktree": worktree, "branch": branch}))?;
+    Ok(TakeOver { task: load(db, id)?, worktree, branch })
+}
+
 /// Stops a task and, when it has subtasks, every subtask that is not done. Returns the stopped ids.
 pub fn stop_tree(db: &Db, runs: &Runs, id: i64, by: &str, source: Option<&str>, reason: Option<&str>) -> Res<Vec<i64>> {
     let task = load(db, id)?;

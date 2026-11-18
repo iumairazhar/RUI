@@ -14,10 +14,13 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 14] = [
+const KINDS: [&str; 18] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
-    "dropped", "agent_error", "reviewed", "resumed", "escalated",
+    "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
+    "handed_back",
 ];
+const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
+const TAKEOVER_REASON: &str = "You're doing this step";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientRef {
@@ -80,6 +83,9 @@ pub struct Node {
     pub output: Option<Output>,
     pub cost_usd: Option<f64>,
     pub event_ids: Vec<i64>,
+    /// Why the node is in its status, when the owner holds the step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +165,7 @@ fn max_id(evs: &[&Event], kind: &str) -> i64 {
 fn node(id: String, lane: &'static str, kind: &'static str, status: &'static str, title: String, at: &str) -> Node {
     Node {
         id, lane, kind, status, title, agent: None, subtask_id: None, attempts: None, started_at: at.into(), ended_at: None,
-        after: vec![], decision: None, output: None, cost_usd: None, event_ids: vec![],
+        after: vec![], decision: None, output: None, cost_usd: None, event_ids: vec![], reason: None,
     }
 }
 
@@ -216,6 +222,15 @@ fn running_or_stalled(ctx: &Ctx, t: &Task) -> &'static str {
     if ctx.now - last > ctx.stall { "stalled" } else { "running" }
 }
 
+/// "owner" for a step the owner took over, "waiting" for one held at a checkpoint.
+fn held_status(ctx: &Ctx, t: &Task) -> Option<&'static str> {
+    match (crate::scheduler::hold_of(ctx.evs(t.id)), t.status) {
+        (Some("takeover"), s) if s != TaskStatus::Done => Some("owner"),
+        (Some("checkpoint"), TaskStatus::New | TaskStatus::Open) => Some("waiting"),
+        _ => None,
+    }
+}
+
 fn task_status(ctx: &Ctx, t: &Task) -> &'static str {
     if is_halted(ctx, t) {
         return "done";
@@ -223,6 +238,9 @@ fn task_status(ctx: &Ctx, t: &Task) -> &'static str {
     let review = t.parent_id.is_none() && pending_review(ctx).is_some();
     if ctx.owner_question_open(t.id) || pending_land(ctx, t).is_some() || review {
         return "needs_you";
+    }
+    if let Some(held) = held_status(ctx, t) {
+        return held;
     }
     match t.status {
         TaskStatus::Done => "done",
@@ -235,7 +253,7 @@ fn task_status(ctx: &Ctx, t: &Task) -> &'static str {
     }
 }
 
-/// First match wins. `owner` is reserved for a future takeover and is never produced.
+/// First match wins. `owner` means the owner took over a step ("You're doing a step").
 fn thread_state(statuses: &[&str]) -> &'static str {
     let order = ["needs_you", "failed", "stalled", "owner", "waiting", "running"];
     if let Some(s) = order.iter().find(|s| statuses.contains(s)) {
@@ -323,7 +341,34 @@ fn subtask_node(ctx: &Ctx, t: &Task) -> Node {
     let own: Vec<Event> = ctx.evs(t.id).into_iter().filter(|e| e.kind == "done_check").cloned().collect();
     n.event_ids = own.iter().map(|e| e.id).collect();
     n.output = done_checks(&own).last().map(test_output);
+    n.reason = hold_reason(ctx, t, status).map(String::from);
     n
+}
+
+/// The reason shown on a subtask the owner holds.
+fn hold_reason(ctx: &Ctx, t: &Task, status: &str) -> Option<&'static str> {
+    match (held_status(ctx, t)?, status) {
+        ("waiting", "waiting") => Some(CHECKPOINT_REASON),
+        ("owner", "owner") => Some(TAKEOVER_REASON),
+        _ => None,
+    }
+}
+
+/// One node per takeover; the newest is "owner" while the owner still has the step.
+fn takeover_nodes(ctx: &Ctx) -> Vec<Node> {
+    let taken = ctx.events.iter().filter(|e| e.kind == "taken_over");
+    let build = |e: &Event| {
+        let t = ctx.subs.iter().find(|s| Some(s.id) == e.task_id)?;
+        let evs = ctx.evs(t.id);
+        let held = held_status(ctx, t) == Some("owner") && latest(&evs, "taken_over").is_some_and(|l| l.id == e.id);
+        let status = if held { "owner" } else { "done" };
+        let mut n = node(ev_id(e.id), "work", "takeover", status, format!("You took over: {}", t.title), &e.created_at);
+        n.subtask_id = Some(t.id);
+        n.event_ids = vec![e.id];
+        n.reason = held.then(|| TAKEOVER_REASON.to_string());
+        Some(n)
+    };
+    taken.filter_map(build).collect()
 }
 
 fn review_nodes(ctx: &Ctx) -> Vec<Node> {
@@ -466,6 +511,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     v.extend(answer_nodes(ctx));
     v.extend(plan_node(ctx));
     v.extend(ctx.subs.iter().map(|t| subtask_node(ctx, t)));
+    v.extend(takeover_nodes(ctx));
     v.extend(review_nodes(ctx));
     v.extend(question_decisions(ctx));
     v.extend(loop_decisions(ctx));
@@ -638,6 +684,24 @@ mod tests {
 
     fn kinds(th: &Thread) -> Vec<&'static str> {
         th.nodes.iter().map(|n| n.kind).collect()
+    }
+
+    #[test]
+    fn checkpoint_waits_and_takeover_is_owner() {
+        let (db, top, sub) = setup(TaskStatus::Open);
+        db.add_event(Some(sub), "owner", "checkpoint_set", &json!({})).unwrap();
+        let th = get(&db, top, real_now());
+        let n = th.nodes.iter().find(|n| n.id == format!("task:{sub}")).unwrap();
+        assert_eq!((n.status, n.reason.as_deref()), ("waiting", Some("Waiting for you to release this step")));
+        assert_eq!(th.state, "waiting");
+        db.add_event(Some(sub), "owner", "taken_over", &json!({"worktree": null, "branch": "rui/2"})).unwrap();
+        let th = get(&db, top, real_now());
+        assert_eq!((sub_status(&th, sub), th.state), ("owner", "owner"));
+        assert!(th.nodes.iter().any(|n| n.kind == "takeover" && n.status == "owner"));
+        db.add_event(Some(sub), "owner", "handed_back", &json!({})).unwrap();
+        let th = get(&db, top, real_now());
+        assert_eq!(sub_status(&th, sub), "planned");
+        assert!(th.nodes.iter().any(|n| n.kind == "takeover" && n.status == "done"));
     }
 
     #[test]

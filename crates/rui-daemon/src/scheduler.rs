@@ -80,7 +80,7 @@ fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>) -> Result<Option<Ac
     match (t.parent_id, t.status) {
         (None, TaskStatus::New) => Ok(Some(Action::StartLead { task_id: t.id, answers: vec![] })),
         (None, TaskStatus::WaitingAnswer) => plan_answered(db, t),
-        (Some(p), TaskStatus::Open) => Ok(builder_ready(t, by_id.get(&p).copied(), by_id)),
+        (Some(p), TaskStatus::Open) => plan_builder(db, t, by_id.get(&p).copied(), by_id),
         (_, TaskStatus::Split) => plan_rollup(db, t),
         _ => Ok(None),
     }
@@ -96,6 +96,32 @@ fn plan_answered(db: &Db, t: &Task) -> Result<Option<Action>> {
         .filter_map(|q| q.answer.map(|a| (q.text, a)))
         .collect();
     Ok(Some(Action::StartLead { task_id: t.id, answers }))
+}
+
+/// Starts a ready subtask unless the owner holds it (a checkpoint or a takeover).
+fn plan_builder(db: &Db, t: &Task, parent: Option<&Task>, by_id: &HashMap<i64, &Task>) -> Result<Option<Action>> {
+    if owner_hold(db, t.id)?.is_some() {
+        return Ok(None);
+    }
+    Ok(builder_ready(t, parent, by_id))
+}
+
+/// Event kinds that set or clear an owner hold on a subtask.
+pub const HOLD_KINDS: [&str; 4] = ["checkpoint_set", "checkpoint_cleared", "taken_over", "handed_back"];
+
+/// The hold the newest hold event puts on a task: "checkpoint", "takeover" or none.
+pub fn hold_of<'a>(events: impl IntoIterator<Item = &'a rui_core::Event>) -> Option<&'static str> {
+    let last = events.into_iter().filter(|e| HOLD_KINDS.contains(&e.kind.as_str())).max_by_key(|e| e.id)?;
+    match last.kind.as_str() {
+        "checkpoint_set" => Some("checkpoint"),
+        "taken_over" => Some("takeover"),
+        _ => None,
+    }
+}
+
+/// Whether the owner holds a subtask: Some("checkpoint") or Some("takeover").
+pub fn owner_hold(db: &Db, task_id: i64) -> Result<Option<&'static str>> {
+    Ok(hold_of(&db.events_for_tasks(&[task_id], &HOLD_KINDS, 0, i64::MAX)?))
 }
 
 fn builder_ready(t: &Task, parent: Option<&Task>, by_id: &HashMap<i64, &Task>) -> Option<Action> {
@@ -1152,6 +1178,71 @@ fn commit_and_merge(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<()>
     Ok(())
 }
 
+/// The worktree a subtask's builder works in.
+pub fn subtask_worktree(data_dir: &Path, task_id: i64) -> PathBuf {
+    data_dir.join("worktrees").join(task_id.to_string())
+}
+
+/// What came of the owner handing a taken-over subtask back.
+#[derive(Debug, serde::Serialize)]
+pub struct HandBack {
+    pub status: TaskStatus,
+    pub passed: bool,
+    pub output_tail: String,
+}
+
+/// Runs the check on a step the owner did by hand. A pass, or `force`, lands it like a
+/// builder's work; a failure sends the owner's note to the agent and opens the step again.
+pub async fn hand_back(db: &Arc<Db>, data_dir: &Path, task: &Task, note: &str, force: bool) -> Result<HandBack> {
+    // In progress while the check runs, so the scheduler does not start the agent meanwhile.
+    db.set_task_status(task.id, TaskStatus::InProgress)?;
+    db.add_event(Some(task.id), "owner", "handed_back", &json!({"note": note, "force": force}))?;
+    let check = hand_back_check(data_dir, task).await;
+    record_check(db, task.id, &check)?;
+    let status = if check.passed || force {
+        land_handed_back(db, data_dir, task, !check.passed).await?
+    } else {
+        reopen_with_note(db, task.id, note)?
+    };
+    Ok(HandBack { status, passed: check.passed, output_tail: check.output_tail })
+}
+
+/// Runs the subtask's done_command in its worktree; a missing command or a spawn error fails.
+async fn hand_back_check(data_dir: &Path, task: &Task) -> DoneCheck {
+    let Some(cmd) = task.done_command.as_deref() else {
+        return DoneCheck { passed: false, output_tail: "this step has no done_command".into() };
+    };
+    let wt = subtask_worktree(data_dir, task.id);
+    run_done_command(&wt, cmd)
+        .await
+        .unwrap_or_else(|e| DoneCheck { passed: false, output_tail: format!("{e:#}") })
+}
+
+/// Marks the step done (logging `forced_done` when forced), then commits and merges it.
+async fn land_handed_back(db: &Arc<Db>, data_dir: &Path, task: &Task, forced: bool) -> Result<TaskStatus> {
+    db.set_task_status(task.id, TaskStatus::Done)?;
+    if forced {
+        db.add_event(Some(task.id), "owner", "forced_done", &json!({}))?;
+    }
+    // commit_and_merge only reads the data dir from the config.
+    let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data_dir.to_path_buf() };
+    let wt = subtask_worktree(data_dir, task.id);
+    let (db2, task2) = (db.clone(), task.clone());
+    tokio::task::spawn_blocking(move || commit_and_merge(&db2, &cfg, &task2, &wt)).await??;
+    Ok(db.get_task(task.id)?.context("task not found")?.status)
+}
+
+/// Saves the owner's note as an instruction for the agent's next turn and opens the step again.
+fn reopen_with_note(db: &Db, task_id: i64, note: &str) -> Result<TaskStatus> {
+    let text = match note.trim() {
+        "" => "The owner handed this step back but the check still fails. Make the done command pass.",
+        n => n,
+    };
+    db.add_event(Some(task_id), "owner", "instruction", &json!({"text": text}))?;
+    db.set_task_status(task_id, TaskStatus::Open)?;
+    Ok(TaskStatus::Open)
+}
+
 /// Undoes edits to protected files and removes new protected files. True when something was rejected (the failed loop is counted).
 fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<bool> {
     let client = client_for(db, task)?;
@@ -1484,6 +1575,70 @@ mod tests {
         assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: a.id }]);
         db.set_task_status(a.id, TaskStatus::Done).unwrap();
         assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: b.id }]);
+    }
+
+    #[test]
+    fn held_subtask_is_not_planned_until_released() {
+        let (db, c) = setup();
+        let parent = mk(&db, c, None, TaskStatus::Split);
+        let a = mk(&db, c, Some(parent.id), TaskStatus::Open);
+        db.add_event(Some(a.id), "owner", "checkpoint_set", &json!({})).unwrap();
+        assert_eq!(owner_hold(&db, a.id).unwrap(), Some("checkpoint"));
+        assert!(plan(&db).is_empty());
+        db.add_event(Some(a.id), "owner", "checkpoint_cleared", &json!({})).unwrap();
+        assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: a.id }]);
+        db.add_event(Some(a.id), "owner", "taken_over", &json!({})).unwrap();
+        assert!(plan(&db).is_empty());
+        db.add_event(Some(a.id), "owner", "handed_back", &json!({})).unwrap();
+        assert_eq!(owner_hold(&db, a.id).unwrap(), None);
+    }
+
+    /// The protected-files repo with the subtask taken over and running `cmd` as its check.
+    fn handed_setup(data: &Path, repo: &Path, cmd: &str) -> (Arc<Db>, Task, PathBuf) {
+        let (db, _cfg, sub, wt) = protected_setup(data, repo);
+        db.set_done_command(sub.id, cmd).unwrap();
+        db.add_event(Some(sub.id), "owner", "taken_over", &json!({})).unwrap();
+        let sub = db.get_task(sub.id).unwrap().unwrap();
+        (Arc::new(db), sub, wt)
+    }
+
+    fn has_event(db: &Db, id: i64, kind: &str) -> bool {
+        db.list_events(Some(id), 1000).unwrap().iter().any(|e| e.kind == kind)
+    }
+
+    #[tokio::test]
+    async fn failing_hand_back_reopens_with_the_note() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, _wt) = handed_setup(data.path(), repo.path(), "false");
+        let out = hand_back(&db, data.path(), &sub, "fix the edge case", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Open, false));
+        assert_eq!(db.get_task(sub.id).unwrap().unwrap().status, TaskStatus::Open);
+        let pending = db.pending_instructions(sub.id).unwrap();
+        assert_eq!(pending.last().unwrap().1, "fix the edge case");
+        assert_eq!(owner_hold(&db, sub.id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forced_hand_back_is_done_and_logged() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, _wt) = handed_setup(data.path(), repo.path(), "false");
+        let out = hand_back(&db, data.path(), &sub, "", true).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Done, false));
+        assert!(has_event(&db, sub.id, "forced_done"));
+        assert!(!has_event(&db, sub.id, "instruction"));
+    }
+
+    #[tokio::test]
+    async fn passing_hand_back_merges_into_the_task_branch() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, wt) = handed_setup(data.path(), repo.path(), "test -f done.txt");
+        std::fs::write(wt.join("done.txt"), "by hand").unwrap();
+        let out = hand_back(&db, data.path(), &sub, "", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Done, true));
+        assert!(has_event(&db, sub.id, "merged_to_task_branch"));
+        assert!(!has_event(&db, sub.id, "forced_done"));
+        let task_wt = data.path().join("worktrees").join(format!("task-{}", sub.parent_id.unwrap()));
+        assert!(task_wt.join("done.txt").exists());
     }
 
     #[test]
