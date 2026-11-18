@@ -1164,7 +1164,8 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<ApproveArgs>,
     ) -> CallToolResult {
-        finish(logic::approve(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::approve(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "Stop a task and all its unfinished subtasks, for example when the owner cancels or changes course. Give the reason. Returns the stopped task ids.")]
@@ -1313,7 +1314,8 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<ForwardPrArgs>,
     ) -> CallToolResult {
-        finish(logic::forward_pr(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::forward_pr(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "Record one sentence, under 160 characters, on where things stand and what is next. Call it after each turn that changes the state.")]

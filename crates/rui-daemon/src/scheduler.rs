@@ -1076,7 +1076,7 @@ pub fn recover_on_start(db: &Db) -> Result<usize> {
     Ok(count)
 }
 
-async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
+async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let done_command = task.done_command.clone().context("subtask has no done_command")?;
     let client = client_for(db, &task)?;
@@ -1128,7 +1128,7 @@ fn record_parent_branch(db: &Db, parent_id: i64, branch: &str) -> Result<()> {
     Ok(())
 }
 
-async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
+async fn finish_builder(db: &Arc<Db>, cfg: &Config, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
     let current = db.get_task(task.id)?.context("task not found")?;
     if matches!(current.status, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
         return Ok(());
@@ -1140,6 +1140,12 @@ async fn finish_builder(db: &Db, cfg: &Config, task: &Task, wt: &Path, done_comm
     if after_done_check(db, &cfg.data_dir, task.id, &check)? != TaskStatus::Done {
         return Ok(());
     }
+    let (db, cfg, task, wt) = (db.clone(), cfg.clone(), task.clone(), wt.to_path_buf());
+    tokio::task::spawn_blocking(move || commit_and_merge(&db, &cfg, &task, &wt)).await?
+}
+
+/// Commits a passing subtask and merges it into the task branch (sync git, run off the async runtime).
+fn commit_and_merge(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<()> {
     if commit_task(db, task, wt)? {
         merge_subtask(db, cfg, task)?;
     }
