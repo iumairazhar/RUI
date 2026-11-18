@@ -57,7 +57,7 @@ impl Sec {
             Sec::Work => &["Board", "Apps"],
             Sec::Clients => &["Clients", "Pods"],
             Sec::Knowledge => &["Skills", "Playbook"],
-            Sec::Cost => &["Cost", "Seats"],
+            Sec::Cost => &["Spend", "Seats"],
             Sec::Analytics | Sec::Settings => &[],
         }
     }

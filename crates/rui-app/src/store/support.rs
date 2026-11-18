@@ -52,6 +52,8 @@ impl Store {
             (ItemAct::Dismiss, k) => self.dismiss(k, id, cx),
             (ItemAct::Drop, _) => self.act_toast("Dropped", String::new(), move || api::drop_task(id), cx),
             (ItemAct::Retry, _) => self.act_toast("Retrying", String::new(), move || api::retry_task(id), cx),
+            (ItemAct::Deploy | ItemAct::TryAgain, _) => self.act_toast("Deploying", String::new(), move || api::deploy_action(id, "deploy"), cx),
+            (ItemAct::Skip, _) => self.act_toast("Skipped the deploy", String::new(), move || api::deploy_action(id, "skip"), cx),
         }
     }
 

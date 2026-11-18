@@ -24,6 +24,7 @@ use views::{
     activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, client_knowledge::ClientDrawer, clients,
     inbox::{InboxPanel, PanelEvent},
     library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
+    spend::{Mode as SpendMode, SpendView},
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,6 +146,8 @@ struct Root {
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
+    spend: Entity<SpendView>,
+    analytics: Entity<SpendView>,
     results: Entity<ResultsView>,
     /// Drawer of the client opened from the Clients page.
     client_drawer: Entity<ClientDrawer>,
@@ -199,6 +202,8 @@ impl Root {
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
+            spend: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Spend, cx)),
+            analytics: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Analytics, cx)),
             results: cx.new(|cx| ResultsView::new(store.clone(), cx)),
             client_drawer: cx.new(|cx| ClientDrawer::new(store.clone(), cx)),
             store,
@@ -224,10 +229,10 @@ impl Root {
                 _ => playbook::page(cx),
             },
             Nav::Cost => match tab(Sec::Cost) {
-                0 => empty_page(Sec::Cost, "Cost tracking comes later.", cx),
+                0 => self.spend.clone().into_any_element(),
                 _ => self.seats.clone().into_any_element(),
             },
-            Nav::Analytics => empty_page(Sec::Analytics, "Analytics comes later.", cx),
+            Nav::Analytics => self.analytics.clone().into_any_element(),
             Nav::Settings => empty_page(Sec::Settings, "Settings come later.", cx),
         }
     }
@@ -398,6 +403,12 @@ impl Root {
         self.pill_seq += 1;
         if nav == Nav::Knowledge {
             self.store.update(cx, |s, cx| s.refresh_skills(cx));
+        }
+        if nav == Nav::Cost {
+            self.spend.update(cx, |v, cx| v.load(cx));
+        }
+        if nav == Nav::Analytics {
+            self.analytics.update(cx, |v, cx| v.load(cx));
         }
         if nav == Nav::Work {
             self.activity.update(cx, |v, _| v.reset_motion());

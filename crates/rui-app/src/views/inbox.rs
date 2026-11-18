@@ -147,7 +147,7 @@ impl InboxPanel {
         let (word, st) = kinds::tag_of(kinds::kind_of(&it.kind), th);
         let title = div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg);
         let top = div().flex().items_center().gap(px(8.)).child(title.child(decision::first_line(&it.title))).child(tag(st, word));
-        let reason = (!it.reason.is_empty()).then(|| div().text_size(px(11.5)).text_color(th.muted).child(it.reason.clone()));
+        let reason = kinds::reason(it).map(|r| div().text_size(px(11.5)).text_color(th.muted).child(r));
         let buttons = match until {
             Some(u) => self.snoozed_buttons(i, it, u, th, cx),
             None => self.buttons(i, it, cx),
