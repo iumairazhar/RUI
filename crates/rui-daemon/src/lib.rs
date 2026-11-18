@@ -6,6 +6,7 @@ pub mod client_state;
 pub mod coach;
 pub mod control;
 pub mod db;
+pub mod deploy;
 pub mod drop;
 pub mod email;
 pub mod heartbeat;

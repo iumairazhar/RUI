@@ -14,10 +14,10 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 20] = [
+const KINDS: [&str; 23] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
     "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
-    "handed_back", "pr_merged", "pr_closed",
+    "handed_back", "pr_merged", "pr_closed", "deploy_requested", "deploy_started", "deploy_finished",
 ];
 const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
 const TAKEOVER_REASON: &str = "You're doing this step";
@@ -522,6 +522,31 @@ fn app_node(e: &Event) -> Option<Node> {
     Some(out_node(e, "app", &label, out))
 }
 
+/// One "deploy" output per deploy the owner started: running, done or failed.
+fn deploy_nodes(ctx: &Ctx) -> Vec<Node> {
+    let evs = ctx.evs(ctx.top.id);
+    let reqs = evs.iter().filter(|e| e.kind == "deploy_requested");
+    reqs.filter_map(|r| deploy_node(r, &evs)).collect()
+}
+
+fn deploy_node(req: &Event, evs: &[&Event]) -> Option<Node> {
+    let mine = |e: &&&Event| e.payload["event_id"].as_i64() == Some(req.id);
+    let started = evs.iter().filter(|e| e.kind == "deploy_started").filter(mine).max_by_key(|e| e.id)?;
+    let finished = evs.iter().filter(|e| e.kind == "deploy_finished" && e.id > started.id).find(mine);
+    let status = match finished.map(|f| f.payload["ok"].as_bool() == Some(true)) {
+        None => "running",
+        Some(true) => "done",
+        Some(false) => "failed",
+    };
+    let label = format!("Deploy to {}", req.payload["environment"].as_str().unwrap_or("?"));
+    let output_tail = finished.and_then(|f| f.payload["output_tail"].as_str()).map(String::from);
+    let mut n = out_node(started, "deploy", &label, Output { kind: "deploy", label: label.clone(), url: None, preview: None, output_tail });
+    n.status = status;
+    n.ended_at = finished.map(|f| f.created_at.clone());
+    n.event_ids = std::iter::once(req.id).chain([started.id]).chain(finished.map(|f| f.id)).collect();
+    Some(n)
+}
+
 // ---- assembly ----
 
 fn nodes(ctx: &Ctx) -> Vec<Node> {
@@ -539,6 +564,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     v.extend(forward_node(ctx));
     v.extend(pr_outcome_nodes(ctx));
     v.extend(app_nodes(ctx));
+    v.extend(deploy_nodes(ctx));
     v
 }
 
@@ -934,6 +960,23 @@ mod tests {
         let th = get(&db, top, real_now());
         let closed = th.nodes.iter().find(|n| n.title == "PR closed without merge").unwrap();
         assert_eq!((closed.lane, closed.kind, closed.status), ("out", "pr", "failed"));
+    }
+
+    #[test]
+    fn started_deploys_are_out_nodes() {
+        let (db, top, _) = setup(TaskStatus::Done);
+        let req = db.add_event(Some(top), "scheduler", "deploy_requested", &json!({"environment": "production", "command": "x"})).unwrap();
+        let deploys = |db: &Db| get(db, top, real_now()).nodes.into_iter().filter(|n| n.kind == "deploy").collect::<Vec<_>>();
+        assert!(deploys(&db).is_empty(), "an unstarted request is an Inbox item, not an output");
+        db.add_event(Some(top), "owner", "deploy_started", &json!({"event_id": req})).unwrap();
+        assert_eq!((deploys(&db)[0].lane, deploys(&db)[0].status), ("out", "running"));
+        db.add_event(Some(top), "scheduler", "deploy_finished", &json!({"event_id": req, "ok": false, "output_tail": "boom"})).unwrap();
+        let n = &deploys(&db)[0];
+        assert_eq!((n.status, n.title.as_str()), ("failed", "Deploy to production"));
+        assert_eq!(n.output.as_ref().unwrap().output_tail.as_deref(), Some("boom"));
+        db.add_event(Some(top), "owner", "deploy_started", &json!({"event_id": req})).unwrap();
+        db.add_event(Some(top), "scheduler", "deploy_finished", &json!({"event_id": req, "ok": true, "output_tail": "ok"})).unwrap();
+        assert_eq!(deploys(&db)[0].status, "done", "a retry that passed wins");
     }
 
     #[test]

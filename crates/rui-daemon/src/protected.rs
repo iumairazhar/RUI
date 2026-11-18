@@ -272,7 +272,7 @@ mod tests {
     fn tester_gets_only_explicit_entries() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("run.sh"), "x").unwrap();
-        let pod = Pod { roles: vec![], protected: vec!["src/db.rs".into()] };
+        let pod = Pod { roles: vec![], protected: vec!["src/db.rs".into()], cli: None };
         let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod, &[]).unwrap();
         assert!(!tester.check_patterns && tester.files.is_empty());
         assert!(is_protected("src/db.rs", &tester) && !is_protected("tests/a.py", &tester));
@@ -307,7 +307,7 @@ mod tests {
     }
 
     fn member(done: &str) -> Protected {
-        let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
+        let pod = Pod { roles: vec![], protected: vec!["evals/".into()], cli: None };
         let d = tempfile::tempdir().unwrap();
         protected_set(d.path(), &task(None, done), &[], &pod, &[]).unwrap()
     }
@@ -337,7 +337,7 @@ mod tests {
         assert!(!is_protected_new("src/new.py", &m));
         assert!(!is_protected_new("Makefile", &m));
         assert!(is_protected_new("Makefile", &member("make test")));
-        let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
+        let pod = Pod { roles: vec![], protected: vec!["evals/".into()], cli: None };
         let d = tempfile::tempdir().unwrap();
         let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod, &[]).unwrap();
         for f in ["package.json", "pytest.ini", "Makefile", "tests/test_x.py"] {
@@ -358,7 +358,7 @@ mod tests {
         }
         assert!(!is_protected("justfile", &member("make test")));
         assert!(!is_protected("Taskfile.yml", &member("just x")));
-        let pod = Pod { roles: vec![], protected: vec![] };
+        let pod = Pod { roles: vec![], protected: vec![], cli: None };
         let d = tempfile::tempdir().unwrap();
         let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod, &[]).unwrap();
         for f in ["package.json", "pytest.ini", "Makefile", "jest.config.ts"] {

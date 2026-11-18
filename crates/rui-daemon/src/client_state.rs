@@ -17,6 +17,16 @@ pub struct ClientFile {
     /// Email domains that belong to this client, like "acme.com". Used to match emails and meetings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
+    /// How to deploy this client's work. Only the owner sets it; every run needs the owner's yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<DeployConfig>,
+}
+
+/// The owner's deploy command and the environment it deploys to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeployConfig {
+    pub command: String,
+    pub environment: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -32,6 +42,9 @@ pub struct Pod {
     pub roles: Vec<PodRole>,
     #[serde(default)]
     pub protected: Vec<String>,
+    /// Agent CLI for this client's members: "claude" (default) or "codex". A role's own `cli` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<String>,
 }
 
 /// Folder holding one client's state files.
@@ -60,8 +73,9 @@ pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<boo
     let old = read_client(data_dir, name)?;
     let kept = old.as_ref().is_some_and(|c| c.internal);
     let domains = old.as_ref().map(|c| c.domains.clone()).unwrap_or_default();
+    let deploy = old.as_ref().and_then(|c| c.deploy.clone());
     let base = old.and_then(|c| c.base);
-    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains };
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains, deploy };
     fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
     create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
     for f in ["briefs.md", "decisions.log", "playbook.md", "knowledge.md"] {
@@ -220,7 +234,7 @@ mod tests {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"]);
         ensure(t.path(), "A", "/r", None).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "main");
-        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![] };
+        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![], deploy: None };
         fs::write(dir(t.path(), "A").join("client.json"), serde_json::to_string(&file).unwrap()).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "release");
     }
@@ -229,7 +243,7 @@ mod tests {
     fn pod_defaults_and_round_trips() {
         let t = tempfile::tempdir().unwrap();
         assert_eq!(read_pod(t.path(), "A").unwrap(), Pod::default());
-        let pod = Pod { roles: vec![PodRole { role: "backend".into(), skills: vec!["rust".into()] }], protected: vec!["src/db.rs".into()] };
+        let pod = Pod { roles: vec![PodRole { role: "backend".into(), skills: vec!["rust".into()] }], protected: vec!["src/db.rs".into()], cli: None };
         write_pod(t.path(), "A", &pod).unwrap();
         assert_eq!(read_pod(t.path(), "A").unwrap(), pod);
     }

@@ -1667,6 +1667,7 @@ mod tests {
         let pod = client_state::Pod {
             roles: vec![client_state::PodRole { role: "backend".into(), skills: vec!["extra-skill".into()] }],
             protected: vec![],
+            cli: None,
         };
         client_state::write_pod(data.path(), "acme", &pod).unwrap();
         let vars = account_lead_vars(data.path(), &client, "a new task").unwrap();

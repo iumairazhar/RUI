@@ -524,7 +524,7 @@ pub mod logic {
         let roles = check_pod_roles(data_dir, &a.roles)?;
         crate::client_state::ensure(data_dir, &client.name, &client.repo_path, None)?;
         let kept = crate::client_state::read_pod(data_dir, &client.name)?;
-        let pod = crate::client_state::Pod { roles, protected: a.protected.clone().unwrap_or(kept.protected) };
+        let pod = crate::client_state::Pod { roles, protected: a.protected.clone().unwrap_or(kept.protected), cli: kept.cli };
         crate::client_state::write_pod(data_dir, &client.name, &pod)?;
         let names: Vec<&str> = pod.roles.iter().map(|r| r.role.as_str()).collect();
         crate::client_state::append_decision(data_dir, &client.name, &format!("Pod set up: {} (by Rui)", names.join(", ")))?;

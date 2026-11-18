@@ -3,10 +3,12 @@
 //! GET/POST /clients/{id}/knowledge (owner knowledge, append-only),
 //! POST /inputs/email and POST /inputs/email/{event_id} (make_task or dismiss),
 //! POST /inputs/meeting (a meeting to prepare a brief for),
-//! GET/POST /clients/{id}/triggers (the client's triggers; POST replaces the whole list).
+//! GET/POST /clients/{id}/triggers (the client's triggers; POST replaces the whole list),
+//! POST /clients/{id}/deploy-config (the owner's deploy command) and
+//! POST /deploys/{event_id} (deploy or skip a requested deploy; never runs on its own).
 
 use crate::api::ApiState;
-use crate::{client_state, control, email, meeting, triggers};
+use crate::{client_state, control, deploy, email, meeting, triggers};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -40,6 +42,8 @@ pub fn routes() -> Router<ApiState> {
         .route("/inputs/email/{event_id}", post(act_on_email))
         .route("/inputs/meeting", post(post_meeting))
         .route("/clients/{id}/triggers", get(get_triggers).post(set_triggers))
+        .route("/clients/{id}/deploy-config", post(set_deploy_config))
+        .route("/deploys/{event_id}", post(act_on_deploy))
 }
 
 #[derive(Deserialize)]
@@ -154,6 +158,44 @@ async fn set_triggers(State(s): State<ApiState>, Path(id): Path<i64>, Json(list)
     triggers::validate(&list).map_err(bad)?;
     triggers::write(&s.data_dir, &name, &list).map_err(internal)?;
     Ok(Json(json!(list)))
+}
+
+/// Sets the client's deploy command and environment. Only the owner calls this.
+async fn set_deploy_config(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<client_state::DeployConfig>) -> Reply {
+    let name = client_name(&s, id)?;
+    let cfg = deploy::set_config(&s.data_dir, &name, b).map_err(bad)?;
+    Ok(Json(json!(cfg)))
+}
+
+#[derive(Deserialize)]
+struct DeployAction {
+    action: String,
+}
+
+fn control_fail(e: control::ControlError) -> Fail {
+    match e {
+        control::ControlError::NotFound(m) => fail(StatusCode::NOT_FOUND, m),
+        control::ControlError::Conflict(m) => fail(StatusCode::CONFLICT, m),
+        control::ControlError::Other(e) => internal(e),
+    }
+}
+
+/// "deploy" checks the repo and starts the command off the runtime; "skip" drops the request.
+async fn act_on_deploy(State(s): State<ApiState>, Path(event_id): Path<i64>, Json(b): Json<DeployAction>) -> Reply {
+    match b.action.as_str() {
+        "skip" => deploy::skip(&s.db, event_id).map_err(control_fail).map(|_| Json(json!({ "ok": true }))),
+        "deploy" => {
+            let job = deploy::start(&s.db, &s.data_dir, event_id).map_err(control_fail)?;
+            let db = s.db.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = deploy::finish(&db, &job, deploy::LIMIT) {
+                    crate::scheduler::report_error(&db, job.task_id, &e);
+                }
+            });
+            Ok(Json(json!({ "ok": true, "status": "running" })))
+        }
+        _ => Err(fail(StatusCode::BAD_REQUEST, "action must be deploy or skip")),
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +340,24 @@ mod tests {
         assert_eq!(call(&app, "POST", &uri, json!([])).await.0, StatusCode::OK);
         assert_eq!(call(&app, "GET", &uri, json!({})).await.1, json!([]));
         assert_eq!(call(&app, "GET", "/clients/999/triggers", json!({})).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deploy_config_and_actions() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, db, cid) = app(d.path());
+        let uri = format!("/clients/{cid}/deploy-config");
+        assert_eq!(call(&app, "POST", &uri, json!({"command": "a\nb", "environment": "production"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "POST", &uri, json!({"command": "", "environment": "staging"})).await.0, StatusCode::BAD_REQUEST);
+        let (code, v) = call(&app, "POST", &uri, json!({"command": "make deploy", "environment": "staging"})).await;
+        assert_eq!((code, v["command"].as_str()), (StatusCode::OK, Some("make deploy")));
+        assert_eq!(client_state::read_client(d.path(), "acme").unwrap().unwrap().deploy.unwrap().environment, "staging");
+        let t = task(&db, cid, None, TaskStatus::Done);
+        let id = crate::deploy::request(&db, d.path(), &db.get_task(t).unwrap().unwrap()).unwrap().unwrap();
+        assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "nope"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "deploy"})).await.0, StatusCode::INTERNAL_SERVER_ERROR, "/tmp/acme is no repo");
+        assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "skip"})).await.0, StatusCode::OK);
+        assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "skip"})).await.0, StatusCode::CONFLICT);
+        assert_eq!(call(&app, "POST", "/deploys/999", json!({"action": "skip"})).await.0, StatusCode::NOT_FOUND);
     }
 }

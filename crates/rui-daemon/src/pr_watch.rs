@@ -239,10 +239,17 @@ fn record_one(db: &Db, data_dir: &Path, task: &Task, url: &str, f: &Finding) -> 
     };
     db.add_event(Some(task.id), "github", kind, &payload)?;
     match f {
-        Finding::Merged { .. } => crate::triggers::on_pr_merged(db, data_dir, task, url).map(|_| ()),
+        Finding::Merged { .. } => merged(db, data_dir, task, url),
         Finding::Closed => close(db, task.id),
         _ => Ok(()),
     }
+}
+
+/// A merge fires the client's pr_merged triggers and asks the owner about a deploy, if one is set up.
+fn merged(db: &Db, data_dir: &Path, task: &Task, url: &str) -> Result<()> {
+    crate::triggers::on_pr_merged(db, data_dir, task, url)?;
+    crate::deploy::request(db, data_dir, task)?;
+    Ok(())
 }
 
 /// A finished task whose PR was closed unmerged goes stuck, so the Inbox offers drop or retry.

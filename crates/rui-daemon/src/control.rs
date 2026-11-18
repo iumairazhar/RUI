@@ -144,6 +144,7 @@ fn land_approved(db: &Db, data_dir: &std::path::Path, task: &Task) -> Res<()> {
         Err(e) => Err(ControlError::Conflict(format!("could not merge: {e:#}"))),
         Ok(crate::worktree::LandResult::Merged) => {
             db.add_event(Some(task.id), "owner", "landed", &json!({"branch": branch}))?;
+            crate::deploy::request(db, data_dir, task)?;
             Ok(())
         }
         Ok(crate::worktree::LandResult::Conflict(files)) => {
