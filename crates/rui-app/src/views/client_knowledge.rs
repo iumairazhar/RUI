@@ -1,5 +1,6 @@
 //! Client drawer: what the owner knows about one client, and a box to add more.
 
+use super::client_triggers::TriggerPanel;
 use super::library::{self as lib, after_slide, run, slide_overlay, toast};
 use super::{markdown, primary_button};
 use crate::api;
@@ -38,19 +39,22 @@ pub struct ClientDrawer {
     text: Option<String>,
     editor: Entity<TextEditor>,
     busy: bool,
+    triggers: Entity<TriggerPanel>,
 }
 
 impl ClientDrawer {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| TextEditor::new("", cx));
         cx.subscribe(&editor, |this, _, _: &Save, cx| this.add(cx)).detach();
-        Self { store, open: None, closing: false, text: None, editor, busy: false }
+        let triggers = cx.new(|cx| TriggerPanel::new(store.clone(), cx));
+        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers }
     }
 
     /// Open the drawer for a client and load its knowledge.
     pub fn open(&mut self, id: i64, name: String, cx: &mut Context<Self>) {
         (self.open, self.closing, self.text, self.busy) = (Some((id, name)), false, None, false);
         self.editor.update(cx, |e, cx| e.set_text("", cx));
+        self.triggers.update(cx, |t, cx| t.open(id, cx));
         run(cx, move || api::get_knowledge(id), move |v, res, cx| v.loaded(id, res, cx));
         cx.notify();
     }
@@ -139,7 +143,8 @@ impl ClientDrawer {
         let head = div().flex().flex_col().gap(px(2.)).child(title).child(lib::note(SUBTITLE, th));
         let known = div().flex().flex_col().gap(px(12.)).child(head).child(self.current(th)).child(self.input(th, cx));
         let known = known.into_any_element();
-        let body = lib::scroll_body("client-drawer-body", vec![known]);
+        let auto = self.triggers.clone().into_any_element();
+        let body = lib::scroll_body("client-drawer-body", vec![known, auto]);
         lib::drawer_shell("client-drawer", th).child(self.head(name, th, cx)).child(body).into_any_element()
     }
 }

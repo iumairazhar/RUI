@@ -50,6 +50,8 @@ impl Store {
             (ItemAct::Approve, _) => self.act_toast("Approved", "Lesson added".into(), move || api::resolve_proposal(id, "approve"), cx),
             (ItemAct::MakeTask, _) => self.act_toast("Made a task", String::new(), move || api::input_action(api::EMAIL_INPUT, id, "make_task"), cx),
             (ItemAct::Dismiss, k) => self.dismiss(k, id, cx),
+            (ItemAct::Drop, _) => self.act_toast("Dropped", String::new(), move || api::drop_task(id), cx),
+            (ItemAct::Retry, _) => self.act_toast("Retrying", String::new(), move || api::retry_task(id), cx),
         }
     }
 

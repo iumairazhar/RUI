@@ -427,6 +427,29 @@ pub fn add_knowledge(client_id: i64, text: &str) -> Result<serde_json::Value> {
     library("POST", &format!("/clients/{client_id}/knowledge"), Some(serde_json::json!({ "text": text })))
 }
 
+/// A client trigger: start a task when `on` happens ("pr_merged", "email" or "schedule").
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+pub struct Trigger {
+    pub id: String,
+    pub on: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// A client's triggers.
+pub fn get_triggers(client_id: i64) -> Result<Vec<Trigger>> {
+    Ok(serde_json::from_value(library("GET", &format!("/clients/{client_id}/triggers"), None)?)?)
+}
+
+/// Replace a client's whole trigger list. Errors carry the daemon's `{error}` text.
+pub fn set_triggers(client_id: i64, list: &[Trigger]) -> Result<Vec<Trigger>> {
+    let body = serde_json::to_value(list)?;
+    Ok(serde_json::from_value(library("POST", &format!("/clients/{client_id}/triggers"), Some(body))?)?)
+}
+
 /// Restart a project's apps.
 pub fn restart_apps(project: &str) -> Result<()> {
     post(&format!("/apps/{}/restart", encode_path(project)), serde_json::json!({}))

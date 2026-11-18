@@ -10,6 +10,8 @@ use gpui::{AnyElement, App, Div, Entity, FontWeight, Stateful, div, prelude::*, 
 /// Kind strings for email and meeting brief items.
 pub const EMAIL_KIND: &str = "email";
 pub const BRIEF_KIND: &str = "meeting_brief";
+/// Kind string for a PR closed without merging.
+pub const PR_CLOSED_KIND: &str = "pr_closed";
 
 /// How an Inbox item renders.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +27,7 @@ pub enum Kind {
     Scout,
     Email,
     Brief,
+    PrClosed,
     Other,
 }
 
@@ -42,6 +45,7 @@ pub fn kind_of(kind: &str) -> Kind {
         "scout" => Kind::Scout,
         EMAIL_KIND => Kind::Email,
         BRIEF_KIND => Kind::Brief,
+        PR_CLOSED_KIND => Kind::PrClosed,
         _ => Kind::Other,
     }
 }
@@ -60,6 +64,7 @@ pub fn tag_of(k: Kind, th: &Theme) -> (&'static str, &Status) {
         Kind::Scout => ("Scout", &th.run),
         Kind::Email => ("Email", &th.wait),
         Kind::Brief => ("Meeting", &th.wait),
+        Kind::PrClosed => ("PR closed", &th.block),
         Kind::Other => ("Inbox", &th.wait),
     }
 }
@@ -73,6 +78,8 @@ pub enum ItemAct {
     OpenSeats,
     Undo,
     Release,
+    Drop,
+    Retry,
 }
 
 impl ItemAct {
@@ -84,6 +91,8 @@ impl ItemAct {
             ItemAct::OpenSeats => "Open seats",
             ItemAct::Undo => "Undo",
             ItemAct::Release => "Release",
+            ItemAct::Drop => "Drop it",
+            ItemAct::Retry => "Retry",
         }
     }
 }
@@ -97,6 +106,7 @@ pub fn acts_of(k: Kind) -> Vec<ItemAct> {
         Kind::Seats => vec![ItemAct::OpenSeats],
         Kind::Undo => vec![ItemAct::Undo],
         Kind::Checkpoint => vec![ItemAct::Release],
+        Kind::PrClosed => vec![ItemAct::Drop, ItemAct::Retry],
         _ => vec![],
     }
 }
@@ -106,7 +116,7 @@ pub fn body(it: &InboxItem, th: &Theme) -> Option<AnyElement> {
     let detail = it.detail.as_deref().filter(|d| !d.trim().is_empty())?;
     match kind_of(&it.kind) {
         Kind::Proposal => Some(quote(detail, th).into_any_element()),
-        Kind::Scout | Kind::Brief | Kind::Email | Kind::Other => Some(markdown::render(detail, th.fg, 12.5, th)),
+        Kind::Scout | Kind::Brief | Kind::Email | Kind::PrClosed | Kind::Other => Some(markdown::render(detail, th.fg, 12.5, th)),
         _ => None,
     }
 }
@@ -141,6 +151,7 @@ mod tests {
         assert_eq!(kind_of("seats"), Kind::Seats);
         assert_eq!(kind_of(EMAIL_KIND), Kind::Email);
         assert_eq!(kind_of(BRIEF_KIND), Kind::Brief);
+        assert_eq!(kind_of(PR_CLOSED_KIND), Kind::PrClosed);
         assert_eq!(kind_of("something_new"), Kind::Other);
         assert!(acts_of(Kind::Other).is_empty());
     }
@@ -154,6 +165,8 @@ mod tests {
         assert_eq!(acts_of(Kind::Seats), [ItemAct::OpenSeats]);
         assert_eq!(acts_of(Kind::Undo), [ItemAct::Undo]);
         assert_eq!(acts_of(Kind::Checkpoint), [ItemAct::Release]);
+        assert_eq!(acts_of(Kind::PrClosed), [ItemAct::Drop, ItemAct::Retry]);
+        assert_eq!((ItemAct::Drop.label(), ItemAct::Retry.label()), ("Drop it", "Retry"));
         assert!(acts_of(Kind::Question).is_empty());
     }
 }

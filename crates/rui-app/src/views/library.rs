@@ -130,10 +130,10 @@ pub fn status_cell(status: &str, width: f32, th: &Theme) -> Div {
 // ---- building blocks ----
 
 /// Run a daemon call in the background, then hand its result (or the error text) to `done`.
-pub fn run<V: 'static>(
+pub fn run<V: 'static, T: Send + 'static>(
     cx: &mut Context<V>,
-    call: impl FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
-    done: impl FnOnce(&mut V, Result<serde_json::Value, String>, &mut Context<V>) + 'static,
+    call: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    done: impl FnOnce(&mut V, Result<T, String>, &mut Context<V>) + 'static,
 ) {
     cx.spawn(async move |this, cx| {
         let res = cx.background_executor().spawn(async move { call() }).await;
