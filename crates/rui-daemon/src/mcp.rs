@@ -765,7 +765,8 @@ pub mod logic {
     fn precheck_done(db: &Db, data_dir: &Path, parent: &Task, cmd: &str) -> anyhow::Result<()> {
         let client = db.get_client(parent.client_id)?.ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
         let repo = expand_home(&client.repo_path);
-        let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id)?;
+        let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+        let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id, &base)?;
         crate::worktree::require_failing(&wt, cmd)
     }
 
@@ -808,9 +809,10 @@ pub mod logic {
         }
         let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
         let repo = expand_home(&client.repo_path);
-        let (wt, branch) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), task.id)?;
+        let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+        let (wt, branch) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), task.id, &base)?;
         let pr_url = match crate::worktree::has_remote(&repo) {
-            true => Some(crate::worktree::open_pr(&wt, &crate::worktree::base_branch(&repo)?, &branch, &task.title, &a.remarks)?),
+            true => Some(crate::worktree::open_pr(&wt, &base, &branch, &task.title, &a.remarks)?),
             false => None,
         };
         db.add_event(Some(task.id), "lead", "forwarded", &json!({"remarks": a.remarks, "pr_url": pr_url}))?;
@@ -1923,8 +1925,22 @@ mod tests {
         assert!(crate::client_state::read_log(data.path(), &client.name, 10).unwrap().contains("forwarded to the owner"));
     }
 
+    /// A fake `gh`: `pr view` fails until `pr create` ran; `pr comment` logs its arguments.
+    fn fake_gh(dir: &Path) -> PathBuf {
+        let gh = dir.join("fake-gh.sh");
+        let script = format!(
+            "#!/bin/sh\ncase \"$2\" in\n  view) test -f {d}/marker && echo https://example.test/pr/1 || exit 1 ;;\n  create) touch {d}/marker; echo creating; echo https://example.test/pr/1 ;;\n  comment) echo \"$@\" >> {d}/comments.log ;;\nesac\n",
+            d = dir.display()
+        );
+        std::fs::write(&gh, script).unwrap();
+        let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&gh, perms).unwrap();
+        gh
+    }
+
     #[test]
-    fn forward_pr_with_a_remote_pushes_only_the_task_branch() {
+    fn forward_pr_twice_on_a_remote_repo() {
         let (db, data, lead, member) = staffed();
         let lead_id = lead.task_id.unwrap();
         set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
@@ -1932,19 +1948,21 @@ mod tests {
         let bare = tempfile::tempdir().unwrap();
         sh(bare.path(), &["init", "--bare"]);
         sh(&repo, &["remote", "add", "origin", &bare.path().to_string_lossy()]);
-        let gh = bare.path().join("fake-gh.sh");
-        std::fs::write(&gh, "#!/bin/sh\necho 'creating'\necho https://example.test/pr/1\n").unwrap();
-        let mut perms = std::fs::metadata(&gh).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&gh, perms).unwrap();
-        unsafe { std::env::set_var("RUI_GH", &gh) };
-        let r = logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: "ok".into() });
+        let base = crate::worktree::base_branch(&repo).unwrap();
+        sh(&repo, &["push", "origin", &base]);
+        let base_ref = sh(bare.path(), &["rev-parse", &base]);
+        unsafe { std::env::set_var("RUI_GH", fake_gh(bare.path())) };
+        let forward = |remarks: &str| logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: remarks.into() });
+        let first = forward("first remarks");
+        let second = forward("second remarks");
         unsafe { std::env::remove_var("RUI_GH") };
-        assert_eq!(r.unwrap()["pr_url"], "https://example.test/pr/1");
+        assert_eq!(first.unwrap()["pr_url"], "https://example.test/pr/1");
+        assert_eq!(second.unwrap()["pr_url"], "https://example.test/pr/1");
         let branch = format!("rui/task-{lead_id}");
         assert!(!sh(bare.path(), &["rev-parse", "--verify", &branch]).is_empty());
-        let refs = sh(bare.path(), &["for-each-ref", "--format=%(refname)"]);
-        assert!(!refs.contains("refs/heads/main") && !refs.contains("refs/heads/master"), "{refs}");
+        assert_eq!(sh(bare.path(), &["rev-parse", &base]), base_ref);
+        let log = std::fs::read_to_string(bare.path().join("comments.log")).unwrap();
+        assert!(log.contains("second remarks") && !log.contains("first remarks"), "{log}");
     }
 
     async fn post(app: &axum::Router, path: &str, body: Value) -> Value {

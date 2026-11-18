@@ -760,11 +760,17 @@ fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, cl
     Ok(unique)
 }
 
+/// The top-level task's worktree and branch, cut from the client's base branch.
+fn task_worktree(cfg: &Config, client: &Client, repo: &Path, task_id: i64) -> Result<(PathBuf, String)> {
+    let base = client_state::base_for(&cfg.data_dir, &client.name, repo)?;
+    ensure_task_worktree(repo, &cfg.data_dir.join("worktrees"), task_id, &base)
+}
+
 /// Builds an Account Lead wake for `task`: a fresh session in the task worktree, read-only tools.
 fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: &str, prompt: String) -> Result<AgentRun> {
     let role = roster::load(&cfg.data_dir, "lead");
     let repo = expand_home(&client.repo_path);
-    let (wt, branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), task.id)?;
+    let (wt, branch) = task_worktree(cfg, &client, &repo, task.id)?;
     record_parent_branch(db, task.id, &branch)?;
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
     install_logged(db, cfg, &wt, task, "lead", &client.name, &names)?;
@@ -803,7 +809,7 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
 async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = client_for(db, &task)?;
-    let prompt = review_prompt(db, &task, &client)?;
+    let prompt = review_prompt(db, &cfg.data_dir, &task, &client)?;
     let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
     if let Err(e) = run_logged(db, live, "lead", task_id, &run).await {
         return agent_failed(db, task_id, &e);
@@ -814,7 +820,7 @@ async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result
     Ok(())
 }
 
-fn review_prompt(db: &Db, task: &Task, client: &Client) -> Result<String> {
+fn review_prompt(db: &Db, data_dir: &Path, task: &Task, client: &Client) -> Result<String> {
     let lines: Vec<String> = db
         .subtasks(task.id)?
         .iter()
@@ -828,7 +834,7 @@ fn review_prompt(db: &Db, task: &Task, client: &Client) -> Result<String> {
             )
         })
         .collect();
-    let base = crate::worktree::base_branch(&expand_home(&client.repo_path)).unwrap_or_else(|_| "main".into());
+    let base = client_state::base_for(data_dir, &client.name, &expand_home(&client.repo_path)).unwrap_or_else(|_| "main".into());
     Ok(format!(
         "{}\n\nAll subtasks are done. Review the work on branch {} (compare with `git diff {base}...HEAD`).\nSubtasks:\n{}\n\nCall send_back(task_id={id}, remarks) or forward_pr(task_id={id}, remarks).",
         lead_prompt(task, client, &[]),
@@ -1069,7 +1075,7 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
     let repo = expand_home(&client.repo_path);
     let parent_id = task.parent_id.context("subtask has no parent")?;
     let worktrees = cfg.data_dir.join("worktrees");
-    let (_, task_branch) = ensure_task_worktree(&repo, &worktrees, parent_id)?;
+    let (_, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     record_parent_branch(db, parent_id, &task_branch)?;
     let (wt, branch) = create_worktree(&repo, &worktrees, task_id, Some(&task_branch))?;
     db.set_task_branch(task_id, &branch)?;
@@ -1137,7 +1143,7 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
     let client = client_for(db, task)?;
     let parent_id = task.parent_id.context("subtask has no parent")?;
     let repo = expand_home(&client.repo_path);
-    let (task_wt, task_branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), parent_id)?;
+    let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
     let siblings = db.subtasks(parent_id)?;
     let set = protected::protected_set(&task_wt, task, &siblings, &pod)?;
@@ -1180,7 +1186,7 @@ fn merge_subtask(db: &Db, cfg: &Config, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
     let parent_id = task.parent_id.context("subtask has no parent")?;
     let repo = expand_home(&client.repo_path);
-    let (task_wt, task_branch) = ensure_task_worktree(&repo, &cfg.data_dir.join("worktrees"), parent_id)?;
+    let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     let branch = crate::worktree::branch_name(task.id);
     let message = format!("rui: task {}: {}", task.id, task.title);
     match merge_into(&task_wt, &branch, &message)? {
@@ -1329,7 +1335,7 @@ mod tests {
         let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
         let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.to_path_buf() };
         let worktrees = data.join("worktrees");
-        let (_, tb) = ensure_task_worktree(repo, &worktrees, parent.id).unwrap();
+        let (_, tb) = ensure_task_worktree(repo, &worktrees, parent.id, &crate::worktree::base_branch(repo).unwrap()).unwrap();
         let (wt, _) = create_worktree(repo, &worktrees, sub.id, Some(&tb)).unwrap();
         (db, cfg, sub, wt)
     }
@@ -1381,7 +1387,7 @@ mod tests {
             let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
             let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.path().to_path_buf() };
             let worktrees = data.path().join("worktrees");
-            let (_, tb) = ensure_task_worktree(r, &worktrees, parent.id).unwrap();
+            let (_, tb) = ensure_task_worktree(r, &worktrees, parent.id, &crate::worktree::base_branch(r).unwrap()).unwrap();
             let (wt, _) = create_worktree(r, &worktrees, sub.id, Some(&tb)).unwrap();
             (db, cfg, sub, wt)
         };
@@ -1491,7 +1497,7 @@ mod tests {
         let p = mk(&db, c, None, TaskStatus::Split);
         let sub = mk(&db, c, Some(p.id), TaskStatus::Done);
         let client = db.get_client(c).unwrap().unwrap();
-        let text = review_prompt(&db, &p, &client).unwrap();
+        let text = review_prompt(&db, std::path::Path::new("/nonexistent-data"), &p, &client).unwrap();
         assert!(text.contains(&format!("rui/task-{}", p.id)) && text.contains(&format!("- #{} ", sub.id)));
         assert!(text.contains(&format!("send_back(task_id={}", p.id)) && text.contains("forward_pr("));
     }

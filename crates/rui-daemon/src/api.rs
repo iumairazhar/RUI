@@ -524,7 +524,7 @@ async fn review_task(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Js
     if !["ok", "changes"].contains(&b.verdict.as_str()) {
         return Err(bad_request("verdict must be ok or changes"));
     }
-    Ok(Json(crate::control::review(&s.db, &s.runs, id, &b.verdict, b.text.as_deref())?))
+    Ok(Json(crate::control::review(&s.db, &s.runs, &s.data_dir, id, &b.verdict, b.text.as_deref())?))
 }
 
 /// Drops a task: stops it and its team for good.

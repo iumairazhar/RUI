@@ -85,13 +85,13 @@ pub fn drop_task(db: &Db, runs: &Runs, id: i64) -> Res<Vec<i64>> {
 }
 
 /// Records the owner's verdict on landed work. "changes" sends the text back to the Lead.
-pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) -> Res<Task> {
+pub fn review(db: &Db, runs: &Runs, data_dir: &std::path::Path, id: i64, verdict: &str, text: Option<&str>) -> Res<Task> {
     let task = load(db, id)?;
     if task.status != TaskStatus::Done || task.parent_id.is_some() {
         return Err(ControlError::Conflict("only finished top-level tasks can be reviewed".into()));
     }
     if verdict == "ok" {
-        land_approved(db, &task)?;
+        land_approved(db, data_dir, &task)?;
         db.add_event(Some(id), "owner", "reviewed", &json!({"verdict": "ok", "by": "owner"}))?;
         return load(db, id);
     }
@@ -103,7 +103,7 @@ pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) 
 }
 
 /// Merges an approved task's branch into the base branch, for repos with no remote.
-fn land_approved(db: &Db, task: &Task) -> Res<()> {
+fn land_approved(db: &Db, data_dir: &std::path::Path, task: &Task) -> Res<()> {
     let Some(branch) = task.branch.as_deref() else { return Ok(()) };
     let client = db.get_client(task.client_id)?.ok_or_else(|| ControlError::NotFound("client not found".into()))?;
     let repo = crate::scheduler::expand_home(&client.repo_path);
@@ -111,7 +111,8 @@ fn land_approved(db: &Db, task: &Task) -> Res<()> {
         return Ok(());
     }
     let message = format!("rui: task {}: {}", task.id, task.title);
-    match crate::worktree::land(&repo, branch, &message) {
+    let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+    match crate::worktree::land(&repo, branch, &base, &message) {
         Err(e) => Err(ControlError::Conflict(format!("could not merge: {e:#}"))),
         Ok(crate::worktree::LandResult::Merged) => {
             db.add_event(Some(task.id), "owner", "landed", &json!({"branch": branch}))?;
@@ -326,14 +327,14 @@ mod tests {
     fn review_and_drop() {
         let (db, runs) = (Db::open_test(), Runs::default());
         let (parent, subs) = pod(&db);
-        assert!(matches!(review(&db, &runs, parent.id, "ok", None), Err(ControlError::Conflict(_))));
+        assert!(matches!(review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "ok", None), Err(ControlError::Conflict(_))));
         db.set_task_status(parent.id, TaskStatus::Done).unwrap();
-        assert!(matches!(review(&db, &runs, parent.id, "changes", Some(" ")), Err(ControlError::Conflict(_))));
-        review(&db, &runs, parent.id, "changes", Some("shorter")).unwrap();
+        assert!(matches!(review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "changes", Some(" ")), Err(ControlError::Conflict(_))));
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "changes", Some("shorter")).unwrap();
         assert_eq!(db.get_task(parent.id).unwrap().unwrap().status, TaskStatus::New);
         assert_eq!(db.pending_instructions(parent.id).unwrap().len(), 1);
         db.set_task_status(parent.id, TaskStatus::Done).unwrap();
-        review(&db, &runs, parent.id, "ok", None).unwrap();
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "ok", None).unwrap();
         assert_eq!(db.events_of_kinds(&["reviewed"]).unwrap().len(), 2);
         let ids = drop_task(&db, &runs, subs[0].id).unwrap();
         assert_eq!(ids, [subs[0].id]);
@@ -356,12 +357,12 @@ mod tests {
         git_ok(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
         let c = db.create_client("c", &repo.path().to_string_lossy(), None, &[]).unwrap();
         let t = task(&db, c.id, None, Role::Lead, TaskStatus::Done);
-        let (wt, branch) = crate::worktree::ensure_task_worktree(repo.path(), wts.path(), t.id).unwrap();
+        let (wt, branch) = crate::worktree::ensure_task_worktree(repo.path(), wts.path(), t.id, "main").unwrap();
         std::fs::write(wt.join("feature.txt"), "f").unwrap();
         assert!(crate::worktree::commit_all(&wt, "work").unwrap());
         db.set_task_branch(t.id, &branch).unwrap();
         assert!(!repo.path().join("feature.txt").exists());
-        review(&db, &runs, t.id, "ok", None).unwrap();
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), t.id, "ok", None).unwrap();
         assert!(repo.path().join("feature.txt").exists());
         assert_eq!(db.events_of_kinds(&["landed"]).unwrap().len(), 1);
     }

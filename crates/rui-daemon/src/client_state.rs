@@ -12,6 +12,8 @@ pub struct ClientFile {
     pub repo_path: String,
     #[serde(default)]
     pub internal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -52,8 +54,10 @@ pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<boo
     }
     let d = dir(data_dir, name);
     fs::create_dir_all(&d)?;
-    let kept = read_client(data_dir, name)?.map(|c| c.internal).unwrap_or(false);
-    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept) };
+    let old = read_client(data_dir, name)?;
+    let kept = old.as_ref().is_some_and(|c| c.internal);
+    let base = old.and_then(|c| c.base);
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base };
     fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
     create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
     for f in ["briefs.md", "decisions.log", "playbook.md"] {
@@ -68,6 +72,15 @@ pub fn read_client(data_dir: &Path, name: &str) -> Result<Option<ClientFile>> {
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
+/// The branch work lands on: the client's `base` setting, else the repo's detected base branch.
+pub fn base_for(data_dir: &Path, client_name: &str, repo: &Path) -> Result<String> {
+    let set = read_client(data_dir, client_name)?.and_then(|c| c.base).filter(|b| !b.trim().is_empty());
+    match set {
+        Some(base) => Ok(base),
+        None => crate::worktree::base_branch(repo),
+    }
 }
 
 pub fn read_pod(data_dir: &Path, name: &str) -> Result<Pod> {
@@ -140,7 +153,28 @@ mod tests {
         let c = ensure(t.path(), "Acme Co", "/r2", None).unwrap();
         assert!(c.internal);
         assert_eq!(c.repo_path, "/r2");
+        let path = d.join("client.json");
+        let with_base = fs::read_to_string(&path).unwrap().replace("\"internal\": true", "\"internal\": true, \"base\": \"release\"");
+        fs::write(&path, with_base).unwrap();
+        assert_eq!(ensure(t.path(), "Acme Co", "/r3", None).unwrap().base.as_deref(), Some("release"));
         assert!(read_log(t.path(), "Acme Co", 10).unwrap().contains("kept"));
+    }
+
+    #[test]
+    fn base_for_prefers_the_client_setting() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap();
+            assert!(o.status.success());
+        };
+        git(&["init", "-b", "main"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"]);
+        ensure(t.path(), "A", "/r", None).unwrap();
+        assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "main");
+        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()) };
+        fs::write(dir(t.path(), "A").join("client.json"), serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "release");
     }
 
     #[test]

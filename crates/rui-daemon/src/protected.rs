@@ -226,7 +226,7 @@ mod tests {
         std::fs::write(repo.path().join("tests/test_a.py"), "orig").unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
-        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1, &worktree::base_branch(repo.path()).unwrap()).unwrap();
         let (wt, _) = worktree::create_worktree(repo.path(), wts.path(), 2, Some(&tb)).unwrap();
         std::fs::write(wt.join("tests/test_a.py"), "cheat").unwrap();
         std::fs::create_dir_all(wt.join("src")).unwrap();
@@ -279,7 +279,7 @@ mod tests {
         std::fs::write(repo.path().join("a.py"), "orig").unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
-        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (_, tb) = worktree::ensure_task_worktree(repo.path(), wts.path(), 1, &worktree::base_branch(repo.path()).unwrap()).unwrap();
         let (wt, _) = worktree::create_worktree(repo.path(), wts.path(), 2, Some(&tb)).unwrap();
         std::fs::write(wt.join("committed.py"), "c").unwrap();
         git(&wt, &["add", "."]);

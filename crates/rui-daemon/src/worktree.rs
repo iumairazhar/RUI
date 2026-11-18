@@ -36,11 +36,39 @@ pub fn task_branch_name(parent_id: i64) -> String {
     format!("rui/task-{parent_id}")
 }
 
-/// The repo's base branch: `main` if it exists, else `master`.
+fn branch_exists(repo: &Path, name: &str) -> bool {
+    git(repo, &["rev-parse", "--verify", "--quiet", name]).is_ok_and(|o| o.status.success())
+}
+
+/// The remote to push to: the only one, or `origin` when there are several.
+pub fn push_remote(repo: &Path) -> anyhow::Result<String> {
+    let out = git_stdout(repo, &["remote"])?;
+    let remotes: Vec<&str> = out.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
+    match remotes.as_slice() {
+        [] => bail!("no remote"),
+        [only] => Ok(only.to_string()),
+        many if many.contains(&"origin") => Ok("origin".into()),
+        _ => bail!("several remotes and none is origin; set one up"),
+    }
+}
+
+/// The branch the push remote's HEAD points at, if it also exists locally.
+fn remote_head_branch(repo: &Path) -> Option<String> {
+    let remote = push_remote(repo).ok()?;
+    let head = format!("refs/remotes/{remote}/HEAD");
+    let out = git_stdout(repo, &["symbolic-ref", "--quiet", "--short", &head]).ok()?;
+    let name = out.trim().strip_prefix(&format!("{remote}/"))?.to_string();
+    branch_exists(repo, &name).then_some(name)
+}
+
+/// The repo's base branch: the remote's default branch, else `main`, else `master`.
 pub fn base_branch(repo: &Path) -> anyhow::Result<String> {
+    if let Some(b) = remote_head_branch(repo) {
+        return Ok(b);
+    }
     ["main", "master"]
         .into_iter()
-        .find(|b| git(repo, &["rev-parse", "--verify", "--quiet", b]).is_ok_and(|o| o.status.success()))
+        .find(|b| branch_exists(repo, b))
         .map(String::from)
         .context("no main or master branch")
 }
@@ -83,15 +111,29 @@ pub fn create_worktree(
 }
 
 /// Creates (or reuses) the worktree of a top-level task's branch, cut from the base branch.
-pub fn ensure_task_worktree(repo: &Path, worktrees_dir: &Path, parent_id: i64) -> anyhow::Result<(PathBuf, String)> {
+/// The base is remembered in git config (`branch.<branch>.ruiBase`) the first time the branch is made.
+pub fn ensure_task_worktree(repo: &Path, worktrees_dir: &Path, parent_id: i64, base: &str) -> anyhow::Result<(PathBuf, String)> {
     let path = worktrees_dir.join(format!("task-{parent_id}"));
     let branch = task_branch_name(parent_id);
     if path.exists() && is_worktree(&path) {
         return Ok((path, branch));
     }
-    let base = base_branch(repo)?;
-    add_worktree(repo, worktrees_dir, &path, &branch, Some(&base))?;
+    add_worktree(repo, worktrees_dir, &path, &branch, Some(base))?;
+    let key = format!("branch.{branch}.ruiBase");
+    if git_stdout(repo, &["config", "--get", &key]).is_err() {
+        git_stdout(repo, &["config", &key, base])?;
+    }
     Ok((path, branch))
+}
+
+/// The base branch a task worktree was cut from; falls back to the repo's base branch.
+pub fn task_base(wt: &Path) -> anyhow::Result<String> {
+    let branch = git_stdout(wt, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let key = format!("branch.{}.ruiBase", branch.trim());
+    match git_stdout(wt, &["config", "--get", &key]) {
+        Ok(base) if !base.trim().is_empty() => Ok(base.trim().to_string()),
+        _ => base_branch(wt),
+    }
 }
 
 /// Stages everything in the worktree and commits it; Ok(false) if nothing changed.
@@ -127,12 +169,12 @@ fn merge_failure(repo: &Path) -> anyhow::Result<LandResult> {
     Ok(LandResult::Conflict(files))
 }
 
-/// Merges `branch` into the repo's checked-out `main`/`master` with a merge commit.
-pub fn land(repo: &Path, branch: &str, message: &str) -> anyhow::Result<LandResult> {
+/// Merges `branch` into the repo's checked-out `base` branch with a merge commit.
+pub fn land(repo: &Path, branch: &str, base: &str, message: &str) -> anyhow::Result<LandResult> {
     let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let current = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if current.trim() != "main" && current.trim() != "master" {
-        bail!("repo is on '{}', expected main or master", current.trim());
+    if current.trim() != base {
+        bail!("repo is on '{}', expected {base}", current.trim());
     }
     let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
     if git(repo, &args)?.status.success() {
@@ -180,9 +222,9 @@ pub fn remove_new_files(wt: &Path, paths: &[String]) -> anyhow::Result<()> {
 
 const MAX_DIFF_BYTES: usize = 60 * 1024;
 
-/// What the branch in `wt` changed relative to main (or master), capped at 60 KB.
+/// What the branch in `wt` changed relative to its base branch, capped at 60 KB.
 pub fn diff_vs_main(wt: &Path) -> anyhow::Result<String> {
-    let base = base_branch(wt)?;
+    let base = task_base(wt)?;
     let diff = git_stdout(wt, &["diff", &format!("{base}...HEAD")])?;
     if diff.len() <= MAX_DIFF_BYTES {
         return Ok(diff);
@@ -263,7 +305,7 @@ pub fn changes(wt: &Path, done: bool) -> anyhow::Result<Vec<Change>> {
 
 /// Read-only list of what the branch in `wt` changed relative to the base branch.
 pub fn changes_vs_base(wt: &Path) -> anyhow::Result<Vec<Change>> {
-    let range = format!("{}...HEAD", base_branch(wt)?);
+    let range = format!("{}...HEAD", task_base(wt)?);
     let mut list = parse_numstat(&git_stdout(wt, &["diff", "--no-renames", "--numstat", &range])?);
     for c in &mut list {
         c.diff = git_stdout(wt, &["diff", "--no-renames", &range, "--", &c.file])?;
@@ -271,15 +313,38 @@ pub fn changes_vs_base(wt: &Path) -> anyhow::Result<Vec<Change>> {
     Ok(list)
 }
 
-/// Pushes a task branch and opens a PR with the gh CLI; returns the PR url.
-/// Only `rui/task-*` branches are ever pushed, never a base branch.
-pub fn open_pr(wt: &Path, base: &str, branch: &str, title: &str, body: &str) -> anyhow::Result<String> {
-    if !branch.starts_with("rui/task-") {
-        bail!("refusing to push branch '{branch}': only rui/task-* branches are pushed");
+fn gh_command() -> String {
+    std::env::var("RUI_GH").unwrap_or_else(|_| "gh".into())
+}
+
+/// URL of the open PR for `branch`, if there is one.
+fn existing_pr(wt: &Path, branch: &str) -> Option<String> {
+    let out = StdCommand::new(gh_command())
+        .args(["pr", "view", branch, "--json", "url", "--jq", ".url"])
+        .current_dir(wt)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    git_stdout(wt, &["push", "-u", "origin", &format!("{branch}:{branch}")])?;
-    let gh = std::env::var("RUI_GH").unwrap_or_else(|_| "gh".into());
-    let out = StdCommand::new(gh)
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+fn comment_on_pr(wt: &Path, branch: &str, body: &str) -> anyhow::Result<()> {
+    let out = StdCommand::new(gh_command())
+        .args(["pr", "comment", branch, "--body", body])
+        .current_dir(wt)
+        .output()
+        .context("run gh")?;
+    if !out.status.success() {
+        bail!("gh pr comment failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+fn create_pr(wt: &Path, base: &str, branch: &str, title: &str, body: &str) -> anyhow::Result<String> {
+    let out = StdCommand::new(gh_command())
         .args(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body])
         .current_dir(wt)
         .output()
@@ -290,6 +355,19 @@ pub fn open_pr(wt: &Path, base: &str, branch: &str, title: &str, body: &str) -> 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let url = stdout.lines().rev().map(str::trim).find(|l| !l.is_empty());
     url.map(String::from).context("gh printed no PR url")
+}
+
+/// Pushes a task branch and opens a PR with the gh CLI (or comments on the open one); returns the PR url.
+/// Only `rui/task-*` branches are ever pushed, never a base branch.
+pub fn open_pr(wt: &Path, base: &str, branch: &str, title: &str, body: &str) -> anyhow::Result<String> {
+    if !branch.starts_with("rui/task-") {
+        bail!("refusing to push branch '{branch}': only rui/task-* branches are pushed");
+    }
+    let remote = push_remote(wt)?;
+    git_stdout(wt, &["push", "-u", &remote, &format!("{branch}:{branch}")])?;
+    let Some(url) = existing_pr(wt, branch) else { return create_pr(wt, base, branch, title, body) };
+    comment_on_pr(wt, branch, body)?;
+    Ok(url)
 }
 
 fn tail(bytes: &[u8], max: usize) -> String {
@@ -477,7 +555,7 @@ mod tests {
         let wts = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let b = branch_with(repo.path(), wts.path(), 1, "new.txt", "n");
-        assert_eq!(land(repo.path(), &b, "merge 1").unwrap(), LandResult::Merged);
+        assert_eq!(land(repo.path(), &b, &base_branch(repo.path()).unwrap(), "merge 1").unwrap(), LandResult::Merged);
         assert!(repo.path().join("new.txt").exists());
     }
 
@@ -488,21 +566,24 @@ mod tests {
         init_repo(repo.path());
         let b1 = branch_with(repo.path(), wts.path(), 1, "a.txt", "one");
         let b2 = branch_with(repo.path(), wts.path(), 2, "a.txt", "two");
-        assert_eq!(land(repo.path(), &b1, "m1").unwrap(), LandResult::Merged);
-        let got = land(repo.path(), &b2, "m2").unwrap();
+        assert_eq!(land(repo.path(), &b1, &base_branch(repo.path()).unwrap(), "m1").unwrap(), LandResult::Merged);
+        let got = land(repo.path(), &b2, &base_branch(repo.path()).unwrap(), "m2").unwrap();
         assert_eq!(got, LandResult::Conflict(vec!["a.txt".into()]));
         assert!(git_stdout(repo.path(), &["status", "--porcelain"]).unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(repo.path().join("a.txt")).unwrap(), "one");
     }
 
     #[test]
-    fn land_requires_main_or_master() {
+    fn land_requires_the_given_base_checked_out() {
         let repo = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let b = branch_with(repo.path(), wts.path(), 1, "x.txt", "x");
+        let base = base_branch(repo.path()).unwrap();
         git(repo.path(), &["checkout", "-b", "feature"]).unwrap();
-        assert!(land(repo.path(), &b, "m").is_err());
+        let err = land(repo.path(), &b, &base, "m").unwrap_err();
+        assert!(err.to_string().contains(&format!("expected {base}")));
+        assert!(land(repo.path(), &b, "feature", "m").is_ok());
     }
 
     fn head_of(repo: &Path, rev: &str) -> String {
@@ -514,12 +595,12 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
         init_repo(repo.path());
-        let (p, b) = ensure_task_worktree(repo.path(), wts.path(), 9).unwrap();
+        let (p, b) = ensure_task_worktree(repo.path(), wts.path(), 9, &base_branch(repo.path()).unwrap()).unwrap();
         assert_eq!(b, "rui/task-9");
         assert!(p.join("a.txt").exists());
         let base = base_branch(repo.path()).unwrap();
         assert_eq!(head_of(repo.path(), &b), head_of(repo.path(), &base));
-        let (p2, b2) = ensure_task_worktree(repo.path(), wts.path(), 9).unwrap();
+        let (p2, b2) = ensure_task_worktree(repo.path(), wts.path(), 9, &base_branch(repo.path()).unwrap()).unwrap();
         assert_eq!((p, b), (p2, b2));
     }
 
@@ -530,7 +611,7 @@ mod tests {
         init_repo(repo.path());
         let base = base_branch(repo.path()).unwrap();
         let before = head_of(repo.path(), &base);
-        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1, &base_branch(repo.path()).unwrap()).unwrap();
         let (sub, sub_branch) = create_worktree(repo.path(), wts.path(), 5, Some(&task_branch)).unwrap();
         std::fs::write(sub.join("new.txt"), "n").unwrap();
         assert!(commit_all(&sub, "work").unwrap());
@@ -544,7 +625,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
         init_repo(repo.path());
-        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1).unwrap();
+        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1, &base_branch(repo.path()).unwrap()).unwrap();
         let mut branches = Vec::new();
         for (id, text) in [(5, "one"), (6, "two")] {
             let (sub, b) = create_worktree(repo.path(), wts.path(), id, Some(&task_branch)).unwrap();
@@ -563,7 +644,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let wts = tempfile::tempdir().unwrap();
         init_repo(repo.path());
-        let (wt, _) = ensure_task_worktree(repo.path(), wts.path(), 3).unwrap();
+        let (wt, _) = ensure_task_worktree(repo.path(), wts.path(), 3, &base_branch(repo.path()).unwrap()).unwrap();
         std::fs::write(wt.join("new.txt"), "n\n").unwrap();
         assert!(commit_all(&wt, "work").unwrap());
         let got = changes_vs_base(&wt).unwrap();
@@ -579,5 +660,53 @@ mod tests {
         let err = open_pr(repo.path(), "main", "main", "t", "b").unwrap_err();
         assert!(err.to_string().contains("rui/task-"));
         assert!(open_pr(repo.path(), "main", "rui/5", "t", "b").is_err());
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let o = StdCommand::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn base_branch_follows_the_remote_head() {
+        let repo = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let first = base_branch(repo.path()).unwrap();
+        git_ok(bare.path(), &["init", "--bare"]);
+        git_ok(repo.path(), &["branch", "develop"]);
+        git_ok(repo.path(), &["remote", "add", "origin", &bare.path().to_string_lossy()]);
+        git_ok(repo.path(), &["push", "origin", &first, "develop"]);
+        git_ok(repo.path(), &["fetch", "origin"]);
+        git_ok(repo.path(), &["remote", "set-head", "origin", "develop"]);
+        assert_eq!(base_branch(repo.path()).unwrap(), "develop");
+    }
+
+    #[test]
+    fn push_remote_picks_the_single_remote_or_origin() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        assert!(push_remote(repo.path()).unwrap_err().to_string().contains("no remote"));
+        git_ok(repo.path(), &["remote", "add", "upstream", "/tmp/x"]);
+        assert_eq!(push_remote(repo.path()).unwrap(), "upstream");
+        git_ok(repo.path(), &["remote", "add", "other", "/tmp/y"]);
+        assert!(push_remote(repo.path()).unwrap_err().to_string().contains("none is origin"));
+        git_ok(repo.path(), &["remote", "add", "origin", "/tmp/z"]);
+        assert_eq!(push_remote(repo.path()).unwrap(), "origin");
+    }
+
+    #[test]
+    fn task_worktree_remembers_its_base() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        git_ok(repo.path(), &["branch", "release"]);
+        let (wt, branch) = ensure_task_worktree(repo.path(), wts.path(), 4, "release").unwrap();
+        let key = format!("branch.{branch}.ruiBase");
+        assert_eq!(git_stdout(repo.path(), &["config", "--get", &key]).unwrap().trim(), "release");
+        assert_eq!(task_base(&wt).unwrap(), "release");
+        std::fs::write(wt.join("n.txt"), "n\n").unwrap();
+        assert!(commit_all(&wt, "work").unwrap());
+        assert_eq!(changes_vs_base(&wt).unwrap().len(), 1);
     }
 }
