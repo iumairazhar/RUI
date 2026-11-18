@@ -98,6 +98,12 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Replace the hint shown while empty.
+    pub fn set_placeholder(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.placeholder = text.to_string().into();
+        cx.notify();
+    }
+
     /// Clear the text and notify.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.reset();

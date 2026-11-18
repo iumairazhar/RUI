@@ -6,8 +6,10 @@ use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Ta
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod branches;
 mod costs;
 mod support;
+pub use branches::*;
 pub use costs::*;
 pub use support::*;
 

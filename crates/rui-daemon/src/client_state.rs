@@ -20,6 +20,39 @@ pub struct ClientFile {
     /// How to deploy this client's work. Only the owner sets it; every run needs the owner's yes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeployConfig>,
+    /// What RUI may do with git branches for this client. Only the owner changes it.
+    #[serde(default)]
+    pub branches: BranchRules,
+}
+
+/// The owner's branch rules: may RUI merge into the base, push branches, and which branches are off limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchRules {
+    #[serde(default = "yes")]
+    pub allow_land: bool,
+    #[serde(default = "yes")]
+    pub allow_push: bool,
+    #[serde(default = "default_protected")]
+    pub protected: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_protected() -> Vec<String> {
+    ["main", "master", "production", "prod", "release"].map(String::from).to_vec()
+}
+
+impl Default for BranchRules {
+    fn default() -> Self {
+        BranchRules { allow_land: true, allow_push: true, protected: default_protected() }
+    }
+}
+
+/// The client's branch rules; defaults when client.json or the field is missing.
+pub fn branch_rules(data_dir: &Path, name: &str) -> Result<BranchRules> {
+    Ok(read_client(data_dir, name)?.map(|c| c.branches).unwrap_or_default())
 }
 
 /// The owner's deploy command and the environment it deploys to.
@@ -74,8 +107,9 @@ pub fn ensure(data_dir: &Path, name: &str, repo_path: &str, internal: Option<boo
     let kept = old.as_ref().is_some_and(|c| c.internal);
     let domains = old.as_ref().map(|c| c.domains.clone()).unwrap_or_default();
     let deploy = old.as_ref().and_then(|c| c.deploy.clone());
+    let branches = old.as_ref().map(|c| c.branches.clone()).unwrap_or_default();
     let base = old.and_then(|c| c.base);
-    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains, deploy };
+    let file = ClientFile { name: name.to_string(), repo_path: repo_path.to_string(), internal: internal.unwrap_or(kept), base, domains, deploy, branches };
     fs::write(d.join("client.json"), serde_json::to_string_pretty(&file)?)?;
     create_if_missing(&d.join("pod.json"), &serde_json::to_string_pretty(&Pod::default())?)?;
     for f in ["briefs.md", "decisions.log", "playbook.md", "knowledge.md"] {
@@ -234,9 +268,24 @@ mod tests {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "i"]);
         ensure(t.path(), "A", "/r", None).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "main");
-        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![], deploy: None };
+        let file = ClientFile { name: "A".into(), repo_path: "/r".into(), internal: false, base: Some("release".into()), domains: vec![], deploy: None, branches: BranchRules::default() };
         fs::write(dir(t.path(), "A").join("client.json"), serde_json::to_string(&file).unwrap()).unwrap();
         assert_eq!(base_for(t.path(), "A", repo.path()).unwrap(), "release");
+    }
+
+    #[test]
+    fn branch_rules_default_when_the_field_is_missing() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(branch_rules(t.path(), "A").unwrap(), BranchRules::default());
+        let d = dir(t.path(), "A");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("client.json"), r#"{"name":"A","repo_path":"/r"}"#).unwrap();
+        let rules = branch_rules(t.path(), "A").unwrap();
+        assert!(rules.allow_land && rules.allow_push);
+        assert_eq!(rules.protected, ["main", "master", "production", "prod", "release"]);
+        fs::write(d.join("client.json"), r#"{"name":"A","repo_path":"/r","branches":{"allow_push":false}}"#).unwrap();
+        let rules = branch_rules(t.path(), "A").unwrap();
+        assert!(rules.allow_land && !rules.allow_push && rules.protected.len() == 5);
     }
 
     #[test]

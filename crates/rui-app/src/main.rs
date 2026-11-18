@@ -289,6 +289,7 @@ impl Root {
         let s = self.store.read(cx);
         let error = s.error.clone().or_else(|| s.action_error.clone());
         let error = error.map(|e| div().id("header-error").text_color(th.block.fg).child(e));
+        let limit = seat::limits::pill(&s.limits).map(|(text, l)| views::tag(seat::limits::level_status(l, th), &text));
         div()
             .id("header")
             .absolute()
@@ -300,6 +301,7 @@ impl Root {
             .gap(px(9.))
             .child(div().id("header-title").text_size(px(15.)).font_weight(FontWeight::BOLD).child("Rui"))
             .child(div().id("header-summary").text_size(px(12.)).text_color(th.muted).child(self.summary(cx)))
+            .children(limit)
             .children(error.map(|e| e.text_size(px(12.))))
     }
 

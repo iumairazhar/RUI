@@ -67,6 +67,8 @@ pub struct Store {
     pub seat: Option<SeatInfo>,
     /// Every seat with its usage, from `GET /seats`.
     pub seats: Vec<api::SeatStatus>,
+    /// Claude's last reported limits per seat, from `GET /limits`.
+    pub limits: Vec<api::SeatLimits>,
     /// Set to ask the root to switch to the Seat page.
     pub open_seats: bool,
     /// Latest run per task id.
@@ -135,6 +137,7 @@ pub struct Store {
 struct Extras {
     seat: Option<SeatInfo>,
     seats: Option<Vec<api::SeatStatus>>,
+    limits: Option<Vec<api::SeatLimits>>,
     runs: Option<Vec<TaskRun>>,
     inbox: Option<Vec<InboxItem>>,
     states: Option<Vec<OwnerState>>,
@@ -150,6 +153,7 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
     Extras {
         seat: api::get_seat().ok(),
         seats: api::get_seats().ok(),
+        limits: api::get_limits().ok(),
         runs: api::get_task_runs().ok(),
         inbox: api::get_inbox().ok(),
         states: api::get_task_states().ok(),
@@ -227,6 +231,7 @@ impl Store {
             action_error: None,
             seat: None,
             seats: vec![],
+            limits: vec![],
             open_seats: false,
             runs: HashMap::new(),
             inbox: vec![],
@@ -336,6 +341,9 @@ impl Store {
         }
         if let Some(seats) = extras.seats {
             self.seats = seats;
+        }
+        if let Some(limits) = extras.limits {
+            self.limits = limits;
         }
         if let Some(runs) = extras.runs {
             self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();
