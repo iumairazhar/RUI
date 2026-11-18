@@ -9,6 +9,7 @@ use crate::protected;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
 use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
 use crate::roster;
+use crate::seats;
 use crate::skills::{self, Skill};
 use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, ensure_task_worktree, merge_into, run_done_command};
 use anyhow::{Context, Result};
@@ -474,7 +475,7 @@ pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, li
             last_beat = std::time::Instant::now();
             beat(&db, &cfg, &running, &snapshot);
         }
-        match plan_tick(&db, &snapshot) {
+        match plan_gated(&db, &cfg.data_dir, &snapshot, crate::thread::now_secs()) {
             Ok(actions) => {
                 for a in actions {
                     execute(&db, &cfg, &running, &locks, &live, &apps, a);
@@ -483,6 +484,22 @@ pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, li
             Err(e) => report_error(&db, None, &e),
         }
     }
+}
+
+/// `plan_tick_at`, then the seat gate: while every seat is used up, no new turn starts.
+pub fn plan_gated(db: &Db, data_dir: &Path, running: &HashSet<i64>, now: i64) -> Result<Vec<Action>> {
+    let actions = plan_tick_at(db, running, now)?;
+    let free = seats::check_gate(db, data_dir, now)?;
+    Ok(hold_turns(actions, free))
+}
+
+/// Drops every action that would start an agent turn unless a seat is free. Running turns are not touched.
+pub fn hold_turns(actions: Vec<Action>, seat_free: bool) -> Vec<Action> {
+    if seat_free {
+        return actions;
+    }
+    let keep = |a: &Action| matches!(a, Action::Rollup { .. } | Action::DeliverAnswer { .. });
+    actions.into_iter().filter(keep).collect()
 }
 
 /// Runs the heartbeat once; errors are logged.
@@ -766,14 +783,38 @@ fn client_for(db: &Db, task: &Task) -> Result<Client> {
     db.get_client(task.client_id)?.context("client not found")
 }
 
-/// Runs the agent, logging every line as an event for `agent`.
-async fn run_logged(db: &Db, live: &Live, agent: &str, task_id: i64, run: &AgentRun) -> Result<RunOutcome> {
-    run_agent(run, |p| {
+/// Runs the agent on the picked seat, logging every line as an event for `agent`.
+/// The `result` event carries `seat_id`, which is how usage per seat is counted.
+async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
+    let seat = seats::pick_from(db, &cfg.data_dir, crate::thread::now_secs())?.context("all seats are used up")?;
+    run.seat = Some(seat.clone());
+    let res = run_agent(&run, |p| {
         on_line(live, LiveKey::Task(task_id), p);
         let Some((kind, payload)) = line_event(p) else { return };
-        let _ = db.add_event(Some(task_id), agent, kind, &payload);
+        let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
     })
-    .await
+    .await;
+    if limit_text(&res).is_some_and(|t| seats::hit_limit(&t)) {
+        seats::mark_exhausted(db, &seat, crate::thread::now_secs())?;
+    }
+    res
+}
+
+/// Adds `seat_id` to a `result` payload.
+pub fn tag_seat(kind: &str, mut payload: Value, seat_id: &str) -> Value {
+    if kind == "result" && payload.is_object() {
+        payload["seat_id"] = json!(seat_id);
+    }
+    payload
+}
+
+/// The text of a failed turn: its error result or the run error. None for a good turn.
+fn limit_text(res: &Result<RunOutcome>) -> Option<String> {
+    match res {
+        Ok(out) if out.is_error => out.result_text.clone(),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    }
 }
 
 /// The task itself, plus the owner's answers when this wake follows questions.
@@ -932,6 +973,7 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
         mcp_headers: vec![("X-Rui-Task-Id".into(), task.id.to_string())],
         resume: None,
         partial: true,
+        seat: None,
     })
 }
 
@@ -941,7 +983,7 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
-    if let Err(e) = run_logged(db, live, "lead", task_id, &run).await {
+    if let Err(e) = run_logged(db, cfg, live, "lead", task_id, run).await {
         return agent_failed(db, task_id, &e);
     }
     after_lead_turn(db, task_id)?;
@@ -954,7 +996,7 @@ async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result
     let client = client_for(db, &task)?;
     let prompt = review_prompt(db, &cfg.data_dir, &task, &client)?;
     let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
-    if let Err(e) = run_logged(db, live, "lead", task_id, &run).await {
+    if let Err(e) = run_logged(db, cfg, live, "lead", task_id, run).await {
         return agent_failed(db, task_id, &e);
     }
     if after_lead_turn(db, task_id)? == TaskStatus::Stuck {
@@ -1053,12 +1095,12 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), &answers, tool);
     if level == "lead" {
         let run = account_lead_run(db, cfg, &parent, &client, "a member's question", prompt)?;
-        run_logged(db, live, "lead", parent.id, &run).await?;
+        run_logged(db, cfg, live, "lead", parent.id, run).await?;
         return Ok(());
     }
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
     let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent, playbook)?);
-    run_logged(db, live, "rui", parent.id, &rui_decision_run(cfg, &parent, prompt, system)).await?;
+    run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
 }
 
@@ -1105,6 +1147,7 @@ fn rui_decision_run(cfg: &Config, parent: &Task, prompt: String, system_prompt: 
         mcp_headers: vec![],
         resume: None,
         partial: true,
+        seat: None,
     }
 }
 
@@ -1240,8 +1283,9 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string())],
         resume,
         partial: true,
+        seat: None,
     };
-    match run_logged(db, live, "builder", task_id, &run).await {
+    match run_logged(db, cfg, live, "builder", task_id, run).await {
         Ok(out) => {
             if let Some(id) = out.session_id {
                 db.set_session(Role::Builder, Some(task_id), &id)?;
@@ -1748,6 +1792,30 @@ mod tests {
         assert!(!has_event(&db, sub.id, "forced_done"));
         let task_wt = data.path().join("worktrees").join(format!("task-{}", sub.parent_id.unwrap()));
         assert!(task_wt.join("done.txt").exists());
+    }
+
+    #[test]
+    fn all_seats_used_holds_new_turns() {
+        let (db, c) = setup();
+        let d = tempfile::tempdir().unwrap();
+        let t = mk(&db, c, None, TaskStatus::New);
+        let now = crate::thread::now_secs();
+        let lead = vec![Action::StartLead { task_id: t.id, answers: vec![] }];
+        assert_eq!(plan_gated(&db, d.path(), &HashSet::new(), now).unwrap(), lead);
+        let only = seats::Seat { budget_usd: Some(1.0), ..seats::default_seat() };
+        seats::upsert(d.path(), only).unwrap();
+        db.add_event(Some(t.id), "lead", "result", &json!({"total_cost_usd": 0.95, "seat_id": "default"})).unwrap();
+        assert!(plan_gated(&db, d.path(), &HashSet::new(), now).unwrap().is_empty());
+        assert_eq!(db.events_of_kinds(&["seats_exhausted"]).unwrap().len(), 1);
+        let rollup = Action::Rollup { task_id: t.id, status: TaskStatus::Done };
+        let mixed = vec![rollup, Action::StartBuilder { task_id: 9 }, Action::Review { task_id: 9 }];
+        assert_eq!(hold_turns(mixed, false), [Action::Rollup { task_id: t.id, status: TaskStatus::Done }]);
+    }
+
+    #[test]
+    fn only_result_events_get_a_seat_id() {
+        assert_eq!(tag_seat("result", json!({"total_cost_usd": 1.0}), "w")["seat_id"], "w");
+        assert!(tag_seat("assistant", json!({}), "w").get("seat_id").is_none());
     }
 
     #[test]

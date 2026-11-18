@@ -755,6 +755,14 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Cost of one seat's turns since `since` (an ISO time), and when the oldest of them ran.
+    pub fn seat_usage_since(&self, seat_id: &str, since: &str) -> Result<(f64, Option<String>)> {
+        let conn = self.conn()?;
+        let sql = "SELECT COALESCE(SUM(COALESCE(json_extract(payload, '$.total_cost_usd'), 0)), 0), MIN(created_at) \
+                   FROM events WHERE kind = 'result' AND json_extract(payload, '$.seat_id') = ?1 AND created_at >= ?2";
+        Ok(conn.query_row(sql, params![seat_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
     /// Highest event id among these tasks, or 0.
     pub fn max_event_id(&self, ids: &[i64]) -> Result<i64> {
         let conn = self.conn()?;

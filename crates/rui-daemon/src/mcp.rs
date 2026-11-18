@@ -2265,6 +2265,7 @@ mod tests {
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
             mcp_headers: vec![],
             resume: None,
+            seat: None,
             partial: false,
         };
         let out = run_agent(&run, |l| {

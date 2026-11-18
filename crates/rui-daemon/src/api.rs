@@ -107,6 +107,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/apps/{project}/stop", post(stop_apps))
         .route("/apps/{project}/{name}/stop", post(stop_app))
         .merge(crate::library_api::routes())
+        .merge(crate::seats_api::routes())
         .with_state(state)
 }
 

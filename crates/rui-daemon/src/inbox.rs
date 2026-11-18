@@ -162,6 +162,24 @@ fn checkpoint_item(t: &Task) -> InboxItem {
     }
 }
 
+/// "All seats are used up", while the newest seat gate event says so.
+fn seat_items(db: &Db) -> Result<Vec<InboxItem>> {
+    let Some(e) = crate::seats::latest_gate_event(db)?.filter(|e| e.kind == "seats_exhausted") else {
+        return Ok(vec![]);
+    };
+    Ok(vec![InboxItem {
+        kind: "seats",
+        id: e.id,
+        task_id: None,
+        title: "All seats are used up".into(),
+        reason: e.payload["reason"].as_str().unwrap_or_default().to_string(),
+        actions: vec![],
+        created_at: e.created_at,
+        detail: None,
+        link: None,
+    }])
+}
+
 /// All inbox items, newest first.
 pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     let mut items = question_items(db)?;
@@ -175,6 +193,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     items.extend(undo_items(db, crate::thread::now_secs())?);
     items.extend(task_items(db, &questioned)?);
     items.extend(checkpoint_items(db, &tasks)?);
+    items.extend(seat_items(db)?);
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)
 }
@@ -236,6 +255,18 @@ mod tests {
         assert_eq!(items[0].actions, ["Release"]);
         db.add_event(Some(held.id), "owner", "checkpoint_cleared", &json!({})).unwrap();
         assert!(checkpoints(&db).is_empty());
+    }
+
+    #[test]
+    fn seats_item_shows_until_a_seat_frees_up() {
+        let db = Db::open_test();
+        let seats = |db: &Db| inbox(db).unwrap().into_iter().filter(|i| i.kind == "seats").collect::<Vec<_>>();
+        assert!(seats(&db).is_empty());
+        db.add_event(None, "scheduler", "seats_exhausted", &json!({"reason": "Work: frees up 10:00"})).unwrap();
+        let items = seats(&db);
+        assert_eq!((items[0].title.as_str(), items[0].reason.as_str()), ("All seats are used up", "Work: frees up 10:00"));
+        db.add_event(None, "scheduler", "seats_freed", &json!({})).unwrap();
+        assert!(seats(&db).is_empty());
     }
 
     #[test]

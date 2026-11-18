@@ -25,6 +25,8 @@ pub struct AgentRun {
     pub resume: Option<String>,
     /// Ask the CLI for partial message events (live typing).
     pub partial: bool,
+    /// Seat to run on; None runs on the default login with the daemon's own environment.
+    pub seat: Option<crate::seats::Seat>,
 }
 
 /// Final result of a turn.
@@ -144,15 +146,7 @@ async fn run_with_config(
     mut on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
     let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    let mut child = Command::new(&bin)
-        .args(build_args(run, cfg))
-        .current_dir(&run.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("spawn {bin}"))?;
+    let mut child = command(&bin, run, cfg)?.spawn().with_context(|| format!("spawn {bin}"))?;
     let mut stderr = child.stderr.take().context("stderr")?;
     let err_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -173,6 +167,23 @@ async fn run_with_config(
         bail!("claude exited with failure: {}", String::from_utf8_lossy(&err[start..]));
     }
     Ok(out)
+}
+
+/// The CLI command for a run, with the seat's environment applied.
+fn command(bin: &str, run: &AgentRun, cfg: &Path) -> anyhow::Result<Command> {
+    let env = match &run.seat {
+        Some(seat) => crate::seats::seat_env(seat)?,
+        None => vec![],
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(build_args(run, cfg))
+        .envs(env)
+        .current_dir(&run.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    Ok(cmd)
 }
 
 fn track(out: &mut RunOutcome, p: &ParsedLine) {
@@ -209,6 +220,7 @@ mod tests {
             mcp_headers: vec![],
             resume: None,
             partial: false,
+            seat: None,
         }
     }
 
@@ -283,6 +295,23 @@ mod tests {
         assert!(!build_args(&r, Path::new("/x.json")).contains(&flag));
         r.partial = true;
         assert!(build_args(&r, Path::new("/x.json")).contains(&flag));
+    }
+
+    #[test]
+    fn seat_env_is_applied_to_the_command() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = run(d.path());
+        let envs = |r: &AgentRun| {
+            let cmd = command("claude", r, Path::new("/x.json")).unwrap();
+            cmd.as_std().get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect::<Vec<_>>()
+        };
+        assert!(envs(&r).is_empty());
+        r.seat = Some(crate::seats::Seat { config_dir: Some("/tmp/claude-two".into()), ..crate::seats::default_seat() });
+        let want = (std::ffi::OsString::from("CLAUDE_CONFIG_DIR"), Some(std::ffi::OsString::from("/tmp/claude-two")));
+        assert_eq!(envs(&r), [want]);
+        let missing = Some("RUI_TEST_RUNNER_MISSING_KEY".to_string());
+        r.seat = Some(crate::seats::Seat { kind: crate::seats::SeatKind::ApiKey, env_var: missing, ..crate::seats::default_seat() });
+        assert!(command("claude", &r, Path::new("/x.json")).is_err());
     }
 
     #[test]
