@@ -1,4 +1,4 @@
-//! Runs one headless Claude Code CLI turn and streams its JSON output.
+//! Runs one headless agent CLI turn (Claude Code by default, or Codex; see `codex.rs`) and streams its JSON output.
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -6,6 +6,25 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+
+/// Which agent CLI runs a turn. Claude is the default; Codex is chosen per role or per client pod.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Cli {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Cli {
+    /// "claude" or "codex" (any case); None for anything else.
+    pub fn parse(s: &str) -> Option<Cli> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Cli::Claude),
+            "codex" => Some(Cli::Codex),
+            _ => None,
+        }
+    }
+}
 
 /// Everything needed to run one agent turn.
 pub struct AgentRun {
@@ -132,6 +151,25 @@ pub async fn run_agent(
     run: &AgentRun,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
+    run_agent_with(Cli::Claude, run, on_line).await
+}
+
+/// Runs one turn on the chosen agent CLI. Both report through the same `ParsedLine` shape.
+pub async fn run_agent_with(
+    cli: Cli,
+    run: &AgentRun,
+    on_line: impl FnMut(&ParsedLine),
+) -> anyhow::Result<RunOutcome> {
+    match cli {
+        Cli::Claude => run_claude(run, on_line).await,
+        Cli::Codex => crate::codex::run(run, on_line).await,
+    }
+}
+
+async fn run_claude(
+    run: &AgentRun,
+    on_line: impl FnMut(&ParsedLine),
+) -> anyhow::Result<RunOutcome> {
     let cfg = temp_config_path();
     let json = mcp_config_json(&run.mcp_url, &run.mcp_headers);
     std::fs::write(&cfg, serde_json::to_vec(&json)?).context("write mcp config")?;
@@ -143,10 +181,22 @@ pub async fn run_agent(
 async fn run_with_config(
     run: &AgentRun,
     cfg: &Path,
-    mut on_line: impl FnMut(&ParsedLine),
+    on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
     let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    let mut child = command(&bin, run, cfg)?.spawn().with_context(|| format!("spawn {bin}"))?;
+    stream(command(&bin, run, cfg)?, &bin, "claude", parse_line, on_line).await
+}
+
+/// Spawns `cmd`, parses each stdout line with `parse` and tracks the outcome.
+/// `name` is the CLI's name in the failure message.
+pub(crate) async fn stream(
+    mut cmd: Command,
+    bin: &str,
+    name: &str,
+    mut parse: impl FnMut(&str) -> Option<ParsedLine>,
+    mut on_line: impl FnMut(&ParsedLine),
+) -> anyhow::Result<RunOutcome> {
+    let mut child = cmd.spawn().with_context(|| format!("spawn {bin}"))?;
     let mut stderr = child.stderr.take().context("stderr")?;
     let err_task = tokio::spawn(async move {
         let mut buf = Vec::new();
@@ -156,7 +206,7 @@ async fn run_with_config(
     let mut out = RunOutcome { session_id: None, result_text: None, is_error: false, exit_ok: false };
     let mut lines = BufReader::new(child.stdout.take().context("stdout")?).lines();
     while let Some(line) = lines.next_line().await? {
-        let Some(p) = parse_line(&line) else { continue };
+        let Some(p) = parse(&line) else { continue };
         track(&mut out, &p);
         on_line(&p);
     }
@@ -164,7 +214,7 @@ async fn run_with_config(
     let err = err_task.await.unwrap_or_default();
     if !out.exit_ok && out.result_text.is_none() {
         let start = err.len().saturating_sub(2048);
-        bail!("claude exited with failure: {}", String::from_utf8_lossy(&err[start..]));
+        bail!("{name} exited with failure: {}", String::from_utf8_lossy(&err[start..]));
     }
     Ok(out)
 }

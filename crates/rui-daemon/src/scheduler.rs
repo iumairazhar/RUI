@@ -7,7 +7,7 @@ use crate::client_state;
 use crate::prompts;
 use crate::protected;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
-use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
+use crate::runner::{AgentRun, Cli, ParsedLine, RunOutcome, run_agent_with};
 use crate::roster;
 use crate::seats;
 use crate::skills::{self, Skill};
@@ -842,10 +842,15 @@ fn client_for(db: &Db, task: &Task) -> Result<Client> {
 
 /// Runs the agent on the picked seat, logging every line as an event for `agent`.
 /// The `result` event carries `seat_id`, which is how usage per seat is counted.
-pub(crate) async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
+pub(crate) async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, run: AgentRun) -> Result<RunOutcome> {
+    run_logged_on(Cli::Claude, db, cfg, live, agent, task_id, run).await
+}
+
+/// `run_logged` on the given agent CLI.
+async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
     let seat = seats::pick_from(db, &cfg.data_dir, crate::thread::now_secs())?.context("all seats are used up")?;
     run.seat = Some(seat.clone());
-    let res = run_agent(&run, |p| {
+    let res = run_agent_with(cli, &run, |p| {
         on_line(live, LiveKey::Task(task_id), p);
         let Some((kind, payload)) = line_event(p) else { return };
         let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
@@ -1345,7 +1350,8 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         partial: true,
         seat: None,
     };
-    match run_logged(db, cfg, live, "builder", task_id, run).await {
+    let cli = crate::codex::for_member(&cfg.data_dir, &client.name, task.agent.as_deref().unwrap_or("builder"));
+    match run_logged_on(cli, db, cfg, live, "builder", task_id, run).await {
         Ok(out) => {
             if let Some(id) = out.session_id {
                 db.set_session(Role::Builder, Some(task_id), &id)?;
