@@ -63,6 +63,14 @@ fn ctx_from(parts: &Parts) -> Ctx {
     }
 }
 
+/// Runs blocking logic (git, a done_command precheck) off the async runtime.
+async fn blocking<F>(f: F) -> anyhow::Result<Value>
+where
+    F: FnOnce() -> anyhow::Result<Value> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(anyhow::anyhow!("task failed: {e}")))
+}
+
 fn finish(res: anyhow::Result<Value>) -> CallToolResult {
     match res {
         Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
@@ -1239,7 +1247,8 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<CreateSubtaskArgs>,
     ) -> CallToolResult {
-        finish(logic::create_subtask(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::create_subtask(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "Call once all subtasks are created to mark this task as split into them.")]
@@ -1284,7 +1293,8 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<SetDoneArgs>,
     ) -> CallToolResult {
-        finish(logic::set_done_command(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::set_done_command(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "After review: send the work back. The remarks become a new subtask for the Pod.")]
@@ -1293,7 +1303,8 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<SendBackArgs>,
     ) -> CallToolResult {
-        finish(logic::send_back(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::send_back(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "After review: the work is good. Opens a PR (or, for local-only repos, an Inbox review item) with your remarks for the owner.")]
