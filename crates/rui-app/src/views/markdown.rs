@@ -80,8 +80,8 @@ fn bare_url(s: &str) -> Option<(Span, &str)> {
 pub fn inline(src: &str) -> Vec<Span> {
     let (mut out, mut buf, mut rest) = (Vec::new(), String::new(), src);
     while let Some(c) = rest.chars().next() {
-        let found = if rest.starts_with("**") {
-            split_at_marker(&rest[2..], "**").map(|(a, b)| (bold_span(a), b))
+        let found = if let Some(after) = rest.strip_prefix("**") {
+            split_at_marker(after, "**").map(|(a, b)| (bold_span(a), b))
         } else if c == '`' {
             split_at_marker(&rest[1..], "`").map(|(a, b)| (Span::Code(a.to_string()), b))
         } else if c == '[' {

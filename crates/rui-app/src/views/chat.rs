@@ -113,6 +113,7 @@ impl ChatView {
         question_card(&q.text, None, input, btn.into_any_element(), cx).into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn message_list(
         &mut self,
         chat: &[ChatMessage],

@@ -152,7 +152,7 @@ pub fn toast<V: 'static>(store: &Entity<Store>, title: &str, chip: &str, cx: &mu
 pub fn after_slide<V: 'static>(cx: &mut Context<V>, done: fn(&mut V, &mut Context<V>)) {
     cx.spawn(async move |this, cx| {
         cx.background_executor().timer(Duration::from_millis(DRAWER_MS)).await;
-        this.update(cx, |v, cx| done(v, cx)).ok();
+        this.update(cx, done).ok();
     })
     .detach();
 }
@@ -327,6 +327,7 @@ fn version_row<V: 'static>(ts: u64, restore: fn(&mut V, u64, &mut Context<V>), t
 }
 
 /// Small modal with Cancel and a confirm button, popping in over a dimmed layer.
+#[allow(clippy::too_many_arguments)]
 pub fn confirm_modal<V: 'static>(
     title: &str,
     body: &str,
