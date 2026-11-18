@@ -16,8 +16,16 @@ pub struct Protected {
     pub check_patterns: bool,
     /// Test config files (pytest.ini, package.json, ...) are protected too.
     pub config: bool,
-    /// The done_command runs `make`, so a Makefile counts as a config file.
-    pub make_used: bool,
+    /// Task runners the done_command uses; their files count as config files.
+    pub runners: Runners,
+}
+
+/// Which task runners a command invokes.
+#[derive(Default, Clone, Debug)]
+pub struct Runners {
+    pub make: bool,
+    pub just: bool,
+    pub task: bool,
 }
 
 const TEST_DIRS: [&str; 7] = ["test", "tests", "__tests__", "spec", "specs", "eval", "evals"];
@@ -30,7 +38,7 @@ pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod) -
     }
     p.check_patterns = true;
     p.config = true;
-    p.make_used = uses_make(sub.done_command.as_deref().unwrap_or(""));
+    p.runners = runners_in(sub.done_command.as_deref().unwrap_or(""));
     for sib in siblings {
         if sib.status == TaskStatus::Done && sib.agent.as_deref() == Some("tester") {
             p.files.extend(branch_files(repo_wt, &branch_name(sib.id))?);
@@ -40,8 +48,19 @@ pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod) -
     Ok(p)
 }
 
-fn uses_make(cmd: &str) -> bool {
-    cmd.split_whitespace().any(|t| t == "make" || t == "gmake")
+/// Finds task runners by the basename of each command token, so `/usr/bin/make` and `(make)` count.
+fn runners_in(cmd: &str) -> Runners {
+    let mut r = Runners::default();
+    let seps = |c: char| c.is_whitespace() || ";&|()".contains(c);
+    for tok in cmd.split(seps).map(|t| t.trim_matches(['\'', '"'])) {
+        match Path::new(tok).file_name().and_then(|n| n.to_str()) {
+            Some("make" | "gmake") => r.make = true,
+            Some("just") => r.just = true,
+            Some("task") => r.task = true,
+            _ => {}
+        }
+    }
+    r
 }
 
 /// Existing files named by a done command (pytest node ids and `./` prefixes are cleaned up).
@@ -86,13 +105,19 @@ fn looks_like_test(path: &str) -> bool {
     py || suffix || infix || name == "conftest.py"
 }
 
-fn is_test_config(path: &str, make_used: bool) -> bool {
+fn is_runner_file(name: &str, r: &Runners) -> bool {
+    (r.make && ["Makefile", "makefile", "GNUmakefile"].contains(&name))
+        || (r.just && ["justfile", "Justfile", ".justfile"].contains(&name))
+        || (r.task && ["Taskfile.yml", "Taskfile.yaml"].contains(&name))
+}
+
+fn is_test_config(path: &str, runners: &Runners) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let known = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "package.json"];
     known.contains(&name)
         || name.starts_with("jest.config.")
         || name.starts_with("vitest.config.")
-        || (make_used && name == "Makefile")
+        || is_runner_file(name, runners)
 }
 
 /// True when an EXISTING file must not be modified or deleted.
@@ -100,12 +125,14 @@ pub fn is_protected(path: &str, p: &Protected) -> bool {
     p.files.contains(path)
         || p.explicit.iter().any(|e| matches_entry(path, e))
         || (p.check_patterns && looks_like_test(path))
-        || (p.config && is_test_config(path, p.make_used))
+        || (p.config && is_test_config(path, &p.runners))
 }
 
-/// True when a NEW file must not be added. Config names are allowed when new.
+/// True when a NEW file must not be added: explicit entries, test files and test config files.
 pub fn is_protected_new(path: &str, p: &Protected) -> bool {
-    p.explicit.iter().any(|e| matches_entry(path, e)) || (p.check_patterns && looks_like_test(path))
+    p.explicit.iter().any(|e| matches_entry(path, e))
+        || (p.check_patterns && looks_like_test(path))
+        || (p.config && is_test_config(path, &p.runners))
 }
 
 /// Files that exist on `task_branch` and that the member modified or deleted in `wt`.
@@ -145,7 +172,7 @@ mod tests {
             files: files.iter().map(|s| s.to_string()).collect(),
             check_patterns: check,
             config: false,
-            make_used: false,
+            runners: Runners::default(),
         }
     }
 
@@ -246,13 +273,37 @@ mod tests {
     }
 
     #[test]
-    fn new_files_reject_tests_not_config() {
+    fn runners_are_found_by_basename() {
+        assert!(runners_in("/usr/bin/make test").make);
+        assert!(runners_in("cd api && make check").make);
+        assert!(runners_in("(gmake)").make);
+        assert!(runners_in("just test").just);
+        assert!(runners_in("task test").task);
+        for cmd in ["makefile-lint x", "taskset 1 ls"] {
+            let r = runners_in(cmd);
+            assert!(!r.make && !r.just && !r.task, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn new_files_reject_tests_and_config() {
         let m = member("pytest");
         for f in ["tests/test_x.py", "conftest.py", "pkg/conftest.py", "evals/x.json"] {
             assert!(is_protected_new(f, &m), "{f}");
         }
+        for f in ["package.json", "pyproject.toml", "jest.config.js", "pytest.ini", "setup.cfg", "tox.ini", "vitest.config.ts"] {
+            assert!(is_protected_new(f, &m), "{f}");
+        }
         assert!(!is_protected_new("src/new.py", &m));
-        assert!(!is_protected_new("package.json", &m));
+        assert!(!is_protected_new("Makefile", &m));
+        assert!(is_protected_new("Makefile", &member("make test")));
+        let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
+        let d = tempfile::tempdir().unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod).unwrap();
+        for f in ["package.json", "pytest.ini", "Makefile", "tests/test_x.py"] {
+            assert!(!is_protected_new(f, &tester), "{f}");
+        }
+        assert!(is_protected_new("evals/x.json", &tester));
     }
 
     #[test]
@@ -261,9 +312,12 @@ mod tests {
         for f in ["package.json", "web/package.json", "pyproject.toml", "jest.config.ts", "vitest.config.mjs", "setup.cfg", "tox.ini", "pytest.ini"] {
             assert!(is_protected(f, &m), "{f}");
         }
-        assert!(!is_protected("Makefile", &m));
-        assert!(is_protected("Makefile", &member("make test")));
-        assert!(is_protected("sub/Makefile", &member("gmake")));
+        for (file, cmd) in [("Makefile", "make test"), ("sub/Makefile", "gmake"), ("justfile", "just test"), ("Taskfile.yml", "task test")] {
+            assert!(!is_protected(file, &m), "{file}");
+            assert!(is_protected(file, &member(cmd)), "{file}");
+        }
+        assert!(!is_protected("justfile", &member("make test")));
+        assert!(!is_protected("Taskfile.yml", &member("just x")));
         let pod = Pod { roles: vec![], protected: vec![] };
         let d = tempfile::tempdir().unwrap();
         let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod).unwrap();
