@@ -1171,7 +1171,7 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
 /// Union of the protected paths the Lead granted this subtask.
 fn granted_paths(db: &Db, task: &Task) -> Result<Vec<String>> {
     let mut paths = Vec::new();
-    for e in db.events_of_kinds(&["paths_granted"])?.iter().filter(|e| e.task_id == Some(task.id)) {
+    for e in db.events_for_tasks(&[task.id], &["paths_granted"], 0, i64::MAX)? {
         let list = e.payload["paths"].as_array().into_iter().flatten();
         paths.extend(list.filter_map(|p| p.as_str().map(String::from)));
     }
