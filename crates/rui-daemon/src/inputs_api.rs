@@ -353,7 +353,7 @@ mod tests {
         assert_eq!((code, v["command"].as_str()), (StatusCode::OK, Some("make deploy")));
         assert_eq!(client_state::read_client(d.path(), "acme").unwrap().unwrap().deploy.unwrap().environment, "staging");
         let t = task(&db, cid, None, TaskStatus::Done);
-        let id = crate::deploy::request(&db, d.path(), &db.get_task(t).unwrap().unwrap()).unwrap().unwrap();
+        let id = crate::deploy::request(&db, d.path(), &db.get_task(t).unwrap().unwrap(), None).unwrap().unwrap();
         assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "nope"})).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "deploy"})).await.0, StatusCode::INTERNAL_SERVER_ERROR, "/tmp/acme is no repo");
         assert_eq!(call(&app, "POST", &format!("/deploys/{id}"), json!({"action": "skip"})).await.0, StatusCode::OK);
