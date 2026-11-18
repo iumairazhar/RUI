@@ -231,11 +231,11 @@ mod tests {
     fn app(data: &std::path::Path) -> Router {
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let db = Arc::new(Db::open_test());
-        router(ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.to_path_buf(), apps: Apps::default() })
+        router(ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() })
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
-        let req = Request::builder().method(method).uri(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let req = Request::builder().method(method).uri(uri).header(crate::owner_auth::HEADER, "test-owner-token").header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();

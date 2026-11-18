@@ -21,6 +21,7 @@ pub mod library_skills;
 pub mod live;
 pub mod mcp;
 pub mod meeting;
+pub mod owner_auth;
 pub mod owner_state;
 pub mod pr_watch;
 pub mod projects;
