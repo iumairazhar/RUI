@@ -1146,7 +1146,7 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
     let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
     let siblings = db.subtasks(parent_id)?;
-    let set = protected::protected_set(&task_wt, task, &siblings, &pod)?;
+    let set = protected::protected_set(&task_wt, task, &siblings, &pod, &granted_paths(db, task)?)?;
     let mut bad = protected::touched_existing(wt, &task_branch)?;
     bad.retain(|f| protected::is_protected(f, &set));
     let mut bad_new = protected::added_files(wt, &task_branch)?;
@@ -1158,6 +1158,16 @@ fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<boo
     crate::worktree::remove_new_files(wt, &bad_new)?;
     record_rejection(db, cfg, task, &bad, &bad_new)?;
     Ok(true)
+}
+
+/// Union of the protected paths the Lead granted this subtask.
+fn granted_paths(db: &Db, task: &Task) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for e in db.events_of_kinds(&["paths_granted"])?.iter().filter(|e| e.task_id == Some(task.id)) {
+        let list = e.payload["paths"].as_array().into_iter().flatten();
+        paths.extend(list.filter_map(|p| p.as_str().map(String::from)));
+    }
+    Ok(paths)
 }
 
 /// Records the rejection events and counts the failed loop.
@@ -1395,6 +1405,19 @@ mod tests {
         assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
         assert_eq!(std::fs::read_to_string(wt.join("package.json")).unwrap(), "{\"scripts\":{\"test\":\"jest\"}}");
         assert!(rejected(&db, sub.id));
+    }
+
+    #[test]
+    fn reject_protected_honours_a_paths_granted_event() {
+        for granted in [false, true] {
+            let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+            if granted {
+                db.add_event(Some(sub.id), "lead", "paths_granted", &json!({"paths": ["package.json"]})).unwrap();
+            }
+            std::fs::write(wt.join("package.json"), "{}").unwrap();
+            assert_eq!(reject_protected(&db, &cfg, &sub, &wt).unwrap(), !granted);
+        }
     }
 
     #[test]

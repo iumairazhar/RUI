@@ -18,6 +18,8 @@ pub struct Protected {
     pub config: bool,
     /// Task runners the done_command uses; their files count as config files.
     pub runners: Runners,
+    /// Protected paths the Account Lead granted this one subtask.
+    pub granted: Vec<String>,
 }
 
 /// Which task runners a command invokes.
@@ -31,8 +33,8 @@ pub struct Runners {
 const TEST_DIRS: [&str; 7] = ["test", "tests", "__tests__", "spec", "specs", "eval", "evals"];
 
 /// Builds the protected set for `sub`. Testers only get the pod's explicit entries.
-pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod) -> Result<Protected> {
-    let mut p = Protected { explicit: pod.protected.clone(), ..Protected::default() };
+pub fn protected_set(repo_wt: &Path, sub: &Task, siblings: &[Task], pod: &Pod, granted: &[String]) -> Result<Protected> {
+    let mut p = Protected { explicit: pod.protected.clone(), granted: granted.to_vec(), ..Protected::default() };
     if sub.agent.as_deref() == Some("tester") {
         return Ok(p);
     }
@@ -120,19 +122,30 @@ fn is_test_config(path: &str, runners: &Runners) -> bool {
         || is_runner_file(name, runners)
 }
 
+/// Pod-listed paths stay protected; otherwise a grant lifts protection. None means no rule decided.
+fn grant_verdict(path: &str, p: &Protected) -> Option<bool> {
+    if p.explicit.iter().any(|e| matches_entry(path, e)) {
+        return Some(true);
+    }
+    p.granted.iter().any(|g| matches_entry(path, g)).then_some(false)
+}
+
 /// True when an EXISTING file must not be modified or deleted.
 pub fn is_protected(path: &str, p: &Protected) -> bool {
+    if let Some(v) = grant_verdict(path, p) {
+        return v;
+    }
     p.files.contains(path)
-        || p.explicit.iter().any(|e| matches_entry(path, e))
         || (p.check_patterns && looks_like_test(path))
         || (p.config && is_test_config(path, &p.runners))
 }
 
 /// True when a NEW file must not be added: explicit entries, test files and test config files.
 pub fn is_protected_new(path: &str, p: &Protected) -> bool {
-    p.explicit.iter().any(|e| matches_entry(path, e))
-        || (p.check_patterns && looks_like_test(path))
-        || (p.config && is_test_config(path, &p.runners))
+    if let Some(v) = grant_verdict(path, p) {
+        return v;
+    }
+    (p.check_patterns && looks_like_test(path)) || (p.config && is_test_config(path, &p.runners))
 }
 
 /// Files that exist on `task_branch` and that the member modified or deleted in `wt`.
@@ -173,6 +186,7 @@ mod tests {
             check_patterns: check,
             config: false,
             runners: Runners::default(),
+            granted: vec![],
         }
     }
 
@@ -194,6 +208,17 @@ mod tests {
         }
         assert!(!is_protected("src/main.rs", &c));
         assert!(!is_protected("tests/a.py", &p(&[], &[], false)));
+    }
+
+    #[test]
+    fn grants_lift_protection_except_pod_entries() {
+        let mut c = p(&["src/db.rs"], &[], true);
+        c.config = true;
+        c.granted = vec!["package.json".into(), "tests/".into(), "src/db.rs".into()];
+        assert!(!is_protected("package.json", &c) && !is_protected_new("package.json", &c));
+        assert!(!is_protected("tests/test_a.py", &c) && !is_protected_new("tests/test_a.py", &c));
+        assert!(is_protected("src/db.rs", &c) && is_protected_new("src/db.rs", &c));
+        assert!(is_protected("pyproject.toml", &c) && is_protected_new("pyproject.toml", &c));
     }
 
     #[test]
@@ -233,10 +258,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("run.sh"), "x").unwrap();
         let pod = Pod { roles: vec![], protected: vec!["src/db.rs".into()] };
-        let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod).unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "./run.sh"), &[], &pod, &[]).unwrap();
         assert!(!tester.check_patterns && tester.files.is_empty());
         assert!(is_protected("src/db.rs", &tester) && !is_protected("tests/a.py", &tester));
-        let member = protected_set(d.path(), &task(None, "./run.sh"), &[], &pod).unwrap();
+        let member = protected_set(d.path(), &task(None, "./run.sh"), &[], &pod, &[]).unwrap();
         assert!(member.check_patterns && member.files.contains("run.sh"));
     }
 
@@ -269,7 +294,7 @@ mod tests {
     fn member(done: &str) -> Protected {
         let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
         let d = tempfile::tempdir().unwrap();
-        protected_set(d.path(), &task(None, done), &[], &pod).unwrap()
+        protected_set(d.path(), &task(None, done), &[], &pod, &[]).unwrap()
     }
 
     #[test]
@@ -299,7 +324,7 @@ mod tests {
         assert!(is_protected_new("Makefile", &member("make test")));
         let pod = Pod { roles: vec![], protected: vec!["evals/".into()] };
         let d = tempfile::tempdir().unwrap();
-        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod).unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod, &[]).unwrap();
         for f in ["package.json", "pytest.ini", "Makefile", "tests/test_x.py"] {
             assert!(!is_protected_new(f, &tester), "{f}");
         }
@@ -320,7 +345,7 @@ mod tests {
         assert!(!is_protected("Taskfile.yml", &member("just x")));
         let pod = Pod { roles: vec![], protected: vec![] };
         let d = tempfile::tempdir().unwrap();
-        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod).unwrap();
+        let tester = protected_set(d.path(), &task(Some("tester"), "make test"), &[], &pod, &[]).unwrap();
         for f in ["package.json", "pytest.ini", "Makefile", "jest.config.ts"] {
             assert!(!is_protected(f, &tester), "{f}");
         }

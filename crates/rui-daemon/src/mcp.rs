@@ -210,6 +210,9 @@ pub struct CreateSubtaskArgs {
     pub done_command: String,
     /// Ids of sibling subtasks that must finish first.
     pub depends_on: Option<Vec<i64>>,
+    /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
+    #[serde(default)]
+    pub allow_paths: Option<Vec<String>>,
 }
 
 /// Arguments for the member's `report_progress`.
@@ -300,6 +303,9 @@ pub struct SendBackArgs {
     pub agent: Option<String>,
     /// Command that proves the requested changes. It must fail now.
     pub done_command: String,
+    /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
+    #[serde(default)]
+    pub allow_paths: Option<Vec<String>>,
 }
 
 /// Arguments for the Account Lead's `forward_pr`.
@@ -712,7 +718,7 @@ pub mod logic {
     pub fn create_subtask(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateSubtaskArgs) -> anyhow::Result<Value> {
         let parent = current_task(db, ctx)?;
         let deps = a.depends_on.clone().unwrap_or_default();
-        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, &a.done_command, &deps)?;
+        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, &a.done_command, &deps, &a.allow_paths.clone().unwrap_or_default())?;
         record(db, ctx, Role::Lead, "create_subtask", &a)?;
         let fresh = db.get_task(task.id)?.unwrap_or(task);
         Ok(serde_json::to_value(fresh)?)
@@ -720,8 +726,9 @@ pub mod logic {
 
     /// Validates and inserts an Open subtask of `parent` for pod member `agent`.
     #[allow(clippy::too_many_arguments)]
-    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: &str, deps: &[i64]) -> anyhow::Result<Task> {
+    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: &str, deps: &[i64], allow: &[String]) -> anyhow::Result<Task> {
         check_agent(data_dir, parent, agent)?;
+        check_allow(allow)?;
         let done = done.trim();
         if done.is_empty() {
             anyhow::bail!("done_command must not be empty");
@@ -746,7 +753,33 @@ pub mod logic {
         for d in deps {
             db.add_task_dep(task.id, *d)?;
         }
+        record_grant(db, data_dir, parent, &task, allow)?;
         Ok(task)
+    }
+
+    /// Each granted path must be a non-empty relative path with no `..` segment.
+    fn check_allow(allow: &[String]) -> anyhow::Result<()> {
+        for e in allow {
+            let e = e.trim();
+            if e.is_empty() || e.starts_with('/') || e.split('/').any(|s| s == "..") {
+                anyhow::bail!("allow_paths entry '{e}' must be a relative path inside the repo");
+            }
+            if e.chars().all(|c| matches!(c, '*' | '/')) {
+                anyhow::bail!("allow_paths entry '{e}' grants everything; name the specific paths");
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs a protected-path grant on the new subtask and in the client's decisions log.
+    fn record_grant(db: &Db, data_dir: &Path, parent: &Task, task: &Task, allow: &[String]) -> anyhow::Result<()> {
+        if allow.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<&str> = allow.iter().map(|e| e.trim()).collect();
+        db.add_event(Some(task.id), "lead", "paths_granted", &json!({"paths": paths}))?;
+        let line = format!("Task {} subtask {} ({}) may change protected paths: {}", parent.id, task.id, task.title, paths.join(", "));
+        log_client_decision(db, data_dir, parent, &line)
     }
 
     /// The Account Lead's own task, checked against `task_id`, with non-empty remarks.
@@ -789,7 +822,7 @@ pub mod logic {
             "{}\n\nThis follows the Account Lead's review of \"{}\". The earlier work is already on this branch; change only what the remarks ask.",
             a.remarks, parent.title
         );
-        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, &a.done_command, &[])?;
+        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, &a.done_command, &[], &a.allow_paths.clone().unwrap_or_default())?;
         db.set_task_status(parent.id, TaskStatus::Split)?;
         db.add_event(Some(parent.id), "lead", "sent_back", &json!({"subtask_id": sub.id, "remarks": a.remarks}))?;
         log_client_decision(db, data_dir, &parent, &format!("Task {} sent back: {first}", parent.id))?;
@@ -1347,6 +1380,7 @@ mod tests {
             job: "b".into(),
             done_command: "test -f done.txt".into(),
             depends_on: None,
+            allow_paths: None,
         }
     }
 
@@ -1873,7 +1907,7 @@ mod tests {
     }
 
     fn send_args(task_id: i64, remarks: &str) -> SendBackArgs {
-        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into() }
+        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into(), allow_paths: None }
     }
 
     #[test]
@@ -1898,6 +1932,53 @@ mod tests {
         let client = db.get_client(sub.client_id).unwrap().unwrap();
         let log = crate::client_state::read_log(data.path(), &client.name, 10).unwrap();
         assert!(log.contains(&format!("Task {lead_id} sent back: Fix the tests")));
+    }
+
+    fn grant_log(db: &Db, data: &Path, id: i64) -> String {
+        let client = db.get_client(db.get_task(id).unwrap().unwrap().client_id).unwrap().unwrap();
+        crate::client_state::read_log(data, &client.name, 20).unwrap()
+    }
+
+    #[test]
+    fn create_subtask_records_granted_paths() {
+        let (db, data, lead, _m) = staffed();
+        let args = CreateSubtaskArgs { allow_paths: Some(vec![" package.json ".into()]), ..sub_args("backend", "dep") };
+        let sub = logic::create_subtask(&db, data.path(), &lead, args).unwrap();
+        let id = sub["id"].as_i64().unwrap();
+        let events = db.list_events(Some(id), 50).unwrap();
+        let ev = events.iter().find(|e| e.kind == "paths_granted").unwrap();
+        assert_eq!(ev.payload["paths"], json!(["package.json"]));
+        assert!(grant_log(&db, data.path(), id).contains("may change protected paths: package.json"));
+    }
+
+    #[test]
+    fn create_subtask_rejects_bad_allow_paths() {
+        let (db, data, lead, _m) = staffed();
+        let before = db.subtasks(lead.task_id.unwrap()).unwrap().len();
+        for bad in ["/etc/passwd", "../x", "a/../x", " "] {
+            let args = CreateSubtaskArgs { allow_paths: Some(vec![bad.into()]), ..sub_args("backend", "x") };
+            let err = logic::create_subtask(&db, data.path(), &lead, args).unwrap_err().to_string();
+            assert!(err.contains("must be a relative path inside the repo"), "{bad}: {err}");
+        }
+        for wide in ["*", "**", "**/"] {
+            let args = CreateSubtaskArgs { allow_paths: Some(vec![wide.into()]), ..sub_args("backend", "x") };
+            let err = logic::create_subtask(&db, data.path(), &lead, args).unwrap_err().to_string();
+            assert!(err.contains("grants everything"), "{wide}: {err}");
+        }
+        assert_eq!(db.subtasks(lead.task_id.unwrap()).unwrap().len(), before);
+    }
+
+    #[test]
+    fn send_back_records_granted_paths() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        set_status(&db, lead_id, TaskStatus::Clarifying);
+        let args = SendBackArgs { allow_paths: Some(vec!["package.json".into()]), ..send_args(lead_id, "Add a dep") };
+        let r = logic::send_back(&db, data.path(), &lead, args).unwrap();
+        let id = r["subtask_id"].as_i64().unwrap();
+        assert!(db.list_events(Some(id), 50).unwrap().iter().any(|e| e.kind == "paths_granted"));
+        assert!(grant_log(&db, data.path(), id).contains("may change protected paths: package.json"));
     }
 
     #[test]
