@@ -186,10 +186,16 @@ pub fn precheck_and_reset(wt: &Path, cmd: &str) -> anyhow::Result<()> {
     })
 }
 
-fn merge_failure(repo: &Path) -> anyhow::Result<LandResult> {
+/// A failed merge: conflicting files, or git's own message when it refused before merging
+/// (for example untracked files that the merge would overwrite).
+fn merge_failure(repo: &Path, out: &std::process::Output) -> anyhow::Result<LandResult> {
     let files = git_stdout(repo, &["diff", "--name-only", "--diff-filter=U"])?;
     let files: Vec<String> = files.lines().map(String::from).collect();
-    git(repo, &["merge", "--abort"])?;
+    let _ = git(repo, &["merge", "--abort"]);
+    if files.is_empty() {
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!("git refused the merge: {why}");
+    }
     Ok(LandResult::Conflict(files))
 }
 
@@ -201,10 +207,11 @@ pub fn land(repo: &Path, branch: &str, base: &str, message: &str) -> anyhow::Res
         bail!("repo is on '{}', expected {base}", current.trim());
     }
     let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
-    if git(repo, &args)?.status.success() {
+    let out = git(repo, &args)?;
+    if out.status.success() {
         return Ok(LandResult::Merged);
     }
-    merge_failure(repo)
+    merge_failure(repo, &out)
 }
 
 /// Merges `branch` into whatever branch worktree `wt` has checked out, with a merge commit.
@@ -212,10 +219,11 @@ pub fn merge_into(wt: &Path, branch: &str, message: &str) -> anyhow::Result<Land
     with_worktree_lock(wt, || {
         let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
-        if git(wt, &args)?.status.success() {
+        let out = git(wt, &args)?;
+        if out.status.success() {
             return Ok(LandResult::Merged);
         }
-        merge_failure(wt)
+        merge_failure(wt, &out)
     })
 }
 
