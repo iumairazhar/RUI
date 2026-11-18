@@ -47,5 +47,12 @@ can be undone, and what happens after Approve as 2 to 5 short steps (risk,
 reversible, if_approved).
 After each turn that changes the state, call set_story with one sentence under
 160 characters: where things stand and what is next.
-A done_command is a check, not an action: it only proves the work, it never
-changes anything.
+A done_command is a check, not an action. It must only read and test; never
+install, migrate, write files or call outside services. It runs once before the
+work starts, to prove it fails.
+
+Members can't edit tests, test config (package.json, pyproject.toml, pytest.ini,
+Cargo.toml and similar) or files the done_command uses. If a subtask truly needs
+to change one, pass allow_paths with the exact paths, e.g. ["package.json"].
+Grant the smallest set; never grant a test folder to the member whose work it
+checks. Every grant is logged.
