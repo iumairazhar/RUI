@@ -46,6 +46,8 @@ pub enum Action {
     Review { task_id: i64 },
     /// Run a Lead or Rui decision turn for an open question at `level`.
     Decide { question_id: i64, level: String },
+    /// The owner's undo window ran out: deliver the held answer.
+    DeliverAnswer { question_id: i64, event_id: i64 },
 }
 
 // ---- pure decision layer ----
@@ -53,16 +55,33 @@ pub enum Action {
 /// Looks at the database and returns what should happen now, skipping running tasks.
 /// Decision turns are tracked in `running` under the key `-question_id`.
 pub fn plan_tick(db: &Db, running: &HashSet<i64>) -> Result<Vec<Action>> {
+    plan_tick_at(db, running, crate::thread::now_secs())
+}
+
+/// `plan_tick` with the clock passed in, so tests can move time.
+pub fn plan_tick_at(db: &Db, running: &HashSet<i64>, now: i64) -> Result<Vec<Action>> {
     let tasks = db.list_tasks()?;
     let by_id: HashMap<i64, &Task> = tasks.iter().map(|t| (t.id, t)).collect();
+    let pending = pending_approvals(db)?;
+    let held: HashSet<i64> = pending.iter().map(approval_question).collect();
     let mut actions = Vec::new();
     for t in tasks.iter().filter(|t| !running.contains(&t.id)) {
-        if let Some(a) = plan_task(db, t, &by_id)? {
+        if let Some(a) = plan_task(db, t, &by_id, &held)? {
             actions.push(a);
         }
     }
     actions.extend(plan_decisions(db, running, &by_id)?);
+    actions.extend(plan_deliveries(&pending, now));
     Ok(actions)
+}
+
+/// One delivery per held answer whose undo window has run out.
+fn plan_deliveries(pending: &[rui_core::Event], now: i64) -> Vec<Action> {
+    pending
+        .iter()
+        .filter(|e| approval_run_at(e) <= now)
+        .map(|e| Action::DeliverAnswer { question_id: approval_question(e), event_id: e.id })
+        .collect()
 }
 
 /// One decision turn per open lead or rui question whose member is still waiting.
@@ -76,19 +95,20 @@ fn plan_decisions(db: &Db, running: &HashSet<i64>, by_id: &HashMap<i64, &Task>) 
         .collect())
 }
 
-fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>) -> Result<Option<Action>> {
+fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>, held: &HashSet<i64>) -> Result<Option<Action>> {
     match (t.parent_id, t.status) {
         (None, TaskStatus::New) => Ok(Some(Action::StartLead { task_id: t.id, answers: vec![] })),
-        (None, TaskStatus::WaitingAnswer) => plan_answered(db, t),
+        (None, TaskStatus::WaitingAnswer) => plan_answered(db, t, held),
         (Some(p), TaskStatus::Open) => plan_builder(db, t, by_id.get(&p).copied(), by_id),
         (_, TaskStatus::Split) => plan_rollup(db, t),
         _ => Ok(None),
     }
 }
 
-fn plan_answered(db: &Db, t: &Task) -> Result<Option<Action>> {
+/// Wakes the Lead once every question is answered. An answer still in its undo window (`held`) does not count.
+fn plan_answered(db: &Db, t: &Task, held: &HashSet<i64>) -> Result<Option<Action>> {
     let qs = db.questions_for_task(t.id)?;
-    if qs.is_empty() || qs.iter().any(|q| q.status != QuestionStatus::Answered) {
+    if qs.is_empty() || qs.iter().any(|q| q.status != QuestionStatus::Answered || held.contains(&q.id)) {
         return Ok(None);
     }
     let answers = qs
@@ -247,6 +267,77 @@ pub fn answer_question(db: &Db, id: i64, answer: &str, why: Option<&str>, by: &s
     let q = db.answer_question(id, answer, why)?.context("question not found")?;
     deliver_answer(db, &q, by)?;
     Ok(q)
+}
+
+/// Seconds the owner has to undo an answer before it takes effect.
+pub const UNDO_SECS: i64 = 10;
+
+const APPROVAL_KINDS: [&str; 3] = ["approval_pending", "approval_cancelled", "approval_delivered"];
+
+/// A held owner answer: the question, the `approval_pending` event id and when it goes out.
+pub struct HeldAnswer {
+    pub question: Question,
+    pub event_id: i64,
+    pub run_at: i64,
+}
+
+/// Stores the owner's answer but holds delivery for `UNDO_SECS`, logging `approval_pending`.
+pub fn answer_with_undo(db: &Db, id: i64, answer: &str, why: Option<&str>, now: i64) -> Result<HeldAnswer> {
+    let q = db.get_question(id)?.context("question not found")?;
+    if q.status == QuestionStatus::Answered {
+        anyhow::bail!("question {id} is already answered");
+    }
+    let question = db.answer_question(id, answer, why)?.context("question not found")?;
+    let run_at = now + UNDO_SECS;
+    let payload = json!({"question_id": id, "run_at": run_at});
+    let event_id = db.add_event(Some(question.task_id), "owner", "approval_pending", &payload)?;
+    Ok(HeldAnswer { question, event_id, run_at })
+}
+
+/// `approval_pending` events not yet cancelled or delivered, oldest first.
+pub fn pending_approvals(db: &Db) -> Result<Vec<rui_core::Event>> {
+    let evs = db.events_of_kinds(&APPROVAL_KINDS)?;
+    let closed: HashSet<i64> =
+        evs.iter().filter(|e| e.kind != "approval_pending").filter_map(|e| e.payload["event_id"].as_i64()).collect();
+    Ok(evs.into_iter().filter(|e| e.kind == "approval_pending" && !closed.contains(&e.id)).collect())
+}
+
+pub fn approval_run_at(e: &rui_core::Event) -> i64 {
+    e.payload["run_at"].as_i64().unwrap_or(0)
+}
+
+pub fn approval_question(e: &rui_core::Event) -> i64 {
+    e.payload["question_id"].as_i64().unwrap_or(0)
+}
+
+/// Delivers a held owner answer, marks it `approval_delivered`, then writes the decisions log.
+/// Does nothing if the event is no longer pending.
+pub fn deliver_held(db: &Db, data_dir: &Path, event_id: i64) -> Result<()> {
+    let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(()) };
+    let q = db.get_question(approval_question(&e))?.context("question not found")?;
+    deliver_answer(db, &q, "owner")?;
+    db.add_event(e.task_id, "scheduler", "approval_delivered", &json!({"event_id": event_id}))?;
+    log_owner_answer(db, data_dir, &q)
+}
+
+/// Undoes a held answer while its window is open: logs `approval_cancelled` and reopens the question.
+/// None when the event is not pending any more or its window has run out.
+pub fn cancel_held(db: &Db, event_id: i64, now: i64) -> Result<Option<Question>> {
+    let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(None) };
+    if now >= approval_run_at(&e) {
+        return Ok(None);
+    }
+    db.add_event(e.task_id, "owner", "approval_cancelled", &json!({"event_id": event_id}))?;
+    db.reopen_question(approval_question(&e))
+}
+
+/// Writes the owner's answer to the client's decisions log, where the Account Lead reads it.
+pub fn log_owner_answer(db: &Db, data_dir: &Path, q: &Question) -> Result<()> {
+    let Some(task) = db.get_task(q.task_id)? else { return Ok(()) };
+    let Some(client) = db.get_client(task.client_id)? else { return Ok(()) };
+    let answer: String = q.answer.as_deref().unwrap_or_default().chars().take(300).collect();
+    let line = format!("Owner answered Q{} (task {}): {answer}", q.id, task.id);
+    client_state::append_decision(data_dir, &client.name, &line)
 }
 
 fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
@@ -429,6 +520,11 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
             });
         }
         Action::Decide { question_id, level } => spawn_decision(db, cfg, running, locks, live, question_id, level),
+        Action::DeliverAnswer { event_id, .. } => {
+            if let Err(e) = deliver_held(db, &cfg.data_dir, event_id) {
+                report_error(db, None, &e);
+            }
+        }
     }
 }
 
@@ -2099,4 +2195,84 @@ mod tests {
         assert!(p.contains(&format!("- Q{}: Which db? \u{2192} postgres", asked.id)));
         assert!(decision_prompt(&q, &member, &parent, None, "", "escalate").contains("Owner answers on this task:\n(none)"));
     }
+
+    fn deliveries(db: &Db, now: i64) -> Vec<Action> {
+        let all = plan_tick_at(db, &HashSet::new(), now).unwrap();
+        all.into_iter().filter(|a| matches!(a, Action::DeliverAnswer { .. })).collect()
+    }
+
+    fn instructions(db: &Db, task: i64) -> usize {
+        db.list_events(Some(task), 100).unwrap().iter().filter(|e| e.kind == "instruction").count()
+    }
+
+    #[test]
+    fn owner_answer_waits_for_the_undo_window() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (m, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", None, 1000).unwrap();
+        assert_eq!(held.run_at, 1000 + UNDO_SECS);
+        assert_eq!(instructions(&db, m), 0);
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::WaitingAnswer);
+        assert!(deliveries(&db, 1000 + UNDO_SECS - 1).is_empty());
+        let want = vec![Action::DeliverAnswer { question_id: q, event_id: held.event_id }];
+        assert_eq!(deliveries(&db, 1000 + UNDO_SECS), want);
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::Open);
+        assert!(deliveries(&db, 2000).is_empty());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        let log = client_state::read_log(data.path(), "acme", 50).unwrap();
+        assert_eq!(log.matches(&format!("Owner answered Q{q}")).count(), 1);
+    }
+
+    #[test]
+    fn cancel_inside_the_window_reopens_and_blocks_delivery() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (m, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", Some("r"), 1000).unwrap();
+        let back = cancel_held(&db, held.event_id, 1005).unwrap().unwrap();
+        assert_eq!((back.status, back.answer, back.why), (QuestionStatus::Open, None, None));
+        assert!(deliveries(&db, 5000).is_empty());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 0);
+        assert!(cancel_held(&db, held.event_id, 1006).unwrap().is_none());
+        assert!(client_state::read_log(data.path(), "acme", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_after_delivery_or_window_is_refused() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (_, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", None, 1000).unwrap();
+        assert!(cancel_held(&db, held.event_id, 1000 + UNDO_SECS).unwrap().is_none());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert!(cancel_held(&db, held.event_id, 1001).unwrap().is_none());
+        assert_eq!(db.get_question(q).unwrap().unwrap().status, QuestionStatus::Answered);
+    }
+
+    #[test]
+    fn held_answer_on_a_top_level_task_does_not_wake_the_lead() {
+        let (db, c) = setup();
+        let top = mk(&db, c, None, TaskStatus::WaitingAnswer);
+        let q = db.create_ladder_question(top.id, Role::Lead, "owner", &[], "which db?").unwrap();
+        let held = answer_with_undo(&db, q.id, "sqlite", None, 1000).unwrap();
+        let wakes = |now| plan_tick_at(&db, &HashSet::new(), now).unwrap().into_iter().filter(|a| matches!(a, Action::StartLead { .. })).count();
+        assert_eq!(wakes(1001), 0);
+        db.add_event(Some(top.id), "scheduler", "approval_delivered", &json!({"event_id": held.event_id})).unwrap();
+        assert_eq!(wakes(1001), 1);
+    }
+
+    #[test]
+    fn non_owner_answers_deliver_at_once() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        assert!(pending_approvals(&db).unwrap().is_empty());
+    }
 }
+

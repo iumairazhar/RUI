@@ -418,6 +418,7 @@ fn question_decisions(ctx: &Ctx) -> Vec<Node> {
     let build = |q: &Question| {
         let mut d = decision("question", q.text.clone(), &["answer"]);
         d.question_id = Some(q.id);
+        d.undo_secs = crate::scheduler::UNDO_SECS;
         d.why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
         d.ladder = q.ladder.clone();
         let to_owner = |e: &&Event| e.payload["question_id"] == q.id && e.payload["to"] == "owner";

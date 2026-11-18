@@ -73,6 +73,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
+        .route("/approvals/{event_id}/cancel", post(cancel_approval))
         .route("/chats", get(list_chats).post(create_chat))
         .route("/chats/{id}", delete(delete_chat))
         .route("/chat", get(list_chat).post(post_chat))
@@ -421,30 +422,45 @@ struct AnswerBody {
     why: Option<String>,
 }
 
+/// The answered question plus how to undo it before it takes effect.
+#[derive(serde::Serialize)]
+struct AnswerReply {
+    #[serde(flatten)]
+    question: Question,
+    undo: Undo,
+}
+
+#[derive(serde::Serialize)]
+struct Undo {
+    event_id: i64,
+    run_at: i64,
+}
+
+/// Stores the owner's answer and holds it for the undo window; the scheduler delivers it after.
 async fn answer_question(
     State(s): State<ApiState>,
     Path(id): Path<i64>,
     Json(b): Json<AnswerBody>,
-) -> ApiResult<Json<Question>> {
+) -> ApiResult<Json<AnswerReply>> {
     require_text(&b.answer, "answer")?;
     let q = s.db.get_question(id)?.ok_or_else(|| not_found("question not found"))?;
     if q.status == QuestionStatus::Answered {
         return Err(conflict("question is already answered"));
     }
     let why = b.why.as_deref().map(str::trim).filter(|w| !w.is_empty());
-    let answered = crate::scheduler::answer_question(&s.db, id, &b.answer, why, "owner")?;
-    log_owner_answer(&s, &answered)?;
-    Ok(Json(answered))
+    let now = crate::thread::now_secs();
+    let held = crate::scheduler::answer_with_undo(&s.db, id, &b.answer, why, now)?;
+    let undo = Undo { event_id: held.event_id, run_at: held.run_at };
+    Ok(Json(AnswerReply { question: held.question, undo }))
 }
 
-/// Writes the owner's answer to the client's decisions log, where the Account Lead reads it.
-fn log_owner_answer(s: &ApiState, q: &Question) -> ApiResult<()> {
-    let Some(task) = s.db.get_task(q.task_id)? else { return Ok(()) };
-    let Some(client) = s.db.get_client(task.client_id)? else { return Ok(()) };
-    let answer: String = q.answer.as_deref().unwrap_or_default().chars().take(300).collect();
-    let line = format!("Owner answered Q{} (task {}): {answer}", q.id, task.id);
-    crate::client_state::append_decision(&s.data_dir, &client.name, &line)?;
-    Ok(())
+/// Undoes a held owner answer inside its window and returns the reopened question.
+async fn cancel_approval(State(s): State<ApiState>, Path(event_id): Path<i64>) -> ApiResult<Json<Question>> {
+    let now = crate::thread::now_secs();
+    match crate::scheduler::cancel_held(&s.db, event_id, now)? {
+        Some(q) => Ok(Json(q)),
+        None => Err(conflict("too late: the answer was already delivered or cancelled")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -900,8 +916,15 @@ mod tests {
         let uri = format!("/questions/{}/answer", owner_q.id);
         let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "go", "why": "scope"}))).await;
         assert_eq!((st, v["why"].as_str()), (StatusCode::OK, Some("scope")));
+        assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::WaitingAnswer);
+        assert!(db.pending_instructions(member.id).unwrap().is_empty());
+        let event_id = v["undo"]["event_id"].as_i64().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        crate::scheduler::deliver_held(&db, data.path(), event_id).unwrap();
         assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::Open);
         assert_eq!(db.pending_instructions(member.id).unwrap().len(), 1);
+        let cancel = format!("/approvals/{event_id}/cancel");
+        assert_eq!(call(&app, "POST", &cancel, None).await.0, StatusCode::CONFLICT);
         let (st, _) = call(&app, "POST", &uri, Some(json!({"answer": "again"}))).await;
         assert_eq!(st, StatusCode::CONFLICT);
         db.set_question_level(lead_q.id, "owner", &[]).unwrap();
@@ -1477,8 +1500,30 @@ mod tests {
         crate::client_state::ensure(dir.path(), "acme", "/repo", None).unwrap();
         let q = db.create_question(tid, Role::Lead, "why?").unwrap();
         let uri = format!("/questions/{}/answer", q.id);
-        assert_eq!(call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await.0, StatusCode::OK);
-        let log = std::fs::read_to_string(dir.path().join("clients/acme/decisions.log")).unwrap();
+        let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await;
+        assert_eq!(st, StatusCode::OK);
+        let log_path = dir.path().join("clients/acme/decisions.log");
+        assert!(std::fs::read_to_string(&log_path).unwrap_or_default().is_empty());
+        crate::scheduler::deliver_held(&db, dir.path(), v["undo"]["event_id"].as_i64().unwrap()).unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap();
         assert!(log.contains(&format!("Owner answered Q{} (task {tid}): because", q.id)), "{log}");
+    }
+
+    #[tokio::test]
+    async fn owner_answer_can_be_undone_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default() };
+        let app = router(state);
+        let (_, tid) = seed_task(&db);
+        let q = db.create_question(tid, Role::Lead, "why?").unwrap();
+        let uri = format!("/questions/{}/answer", q.id);
+        let (_, v) = call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await;
+        assert_eq!(v["status"], "answered");
+        let cancel = format!("/approvals/{}/cancel", v["undo"]["event_id"]);
+        let (st, back) = call(&app, "POST", &cancel, None).await;
+        assert_eq!((st, back["status"].as_str(), back["answer"].is_null()), (StatusCode::OK, Some("open"), true));
+        assert_eq!(call(&app, "POST", &cancel, None).await.0, StatusCode::CONFLICT);
     }
 }

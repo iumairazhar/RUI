@@ -53,6 +53,25 @@ fn question_items(db: &Db) -> Result<Vec<InboxItem>> {
         .collect())
 }
 
+/// Owner answers still inside their undo window, each with an "undo" button keyed by the event id.
+fn undo_items(db: &Db, now: i64) -> Result<Vec<InboxItem>> {
+    let pending = crate::scheduler::pending_approvals(db)?;
+    let live = pending.into_iter().filter(|e| crate::scheduler::approval_run_at(e) > now);
+    Ok(live
+        .map(|e| InboxItem {
+            kind: "undo",
+            id: e.id,
+            task_id: e.task_id,
+            title: "Sending your answer\u{2026}".into(),
+            reason: format!("Question {}", crate::scheduler::approval_question(&e)),
+            actions: strings(&["undo"]),
+            created_at: e.created_at,
+            detail: None,
+            link: None,
+        })
+        .collect())
+}
+
 /// Open chat asks, with their options as buttons.
 fn ask_items(db: &Db) -> Result<Vec<InboxItem>> {
     let asks = db.list_chat_asks(Some("open"))?;
@@ -153,6 +172,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
         .map(top_of)
         .collect();
     items.extend(ask_items(db)?);
+    items.extend(undo_items(db, crate::thread::now_secs())?);
     items.extend(task_items(db, &questioned)?);
     items.extend(checkpoint_items(db, &tasks)?);
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));

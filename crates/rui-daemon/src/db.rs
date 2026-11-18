@@ -487,6 +487,16 @@ impl Db {
         fetch_question(&conn, id)
     }
 
+    /// Clear a question's answer and reason and mark it open again. None if the id does not exist.
+    pub fn reopen_question(&self, id: i64) -> Result<Option<Question>> {
+        let conn = self.conn()?;
+        let sql = "UPDATE questions SET answer = NULL, why = NULL, status = 'open' WHERE id = ?1";
+        if conn.execute(sql, [id])? == 0 {
+            return Ok(None);
+        }
+        fetch_question(&conn, id)
+    }
+
     // ---- chat ----
 
     /// Create an empty chat with the default title.
