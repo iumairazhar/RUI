@@ -474,10 +474,279 @@ pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
     post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))
 }
 
-/// Answer a question by id, with the owner's reason when given.
-pub fn post_answer(question_id: i64, answer: &str, why: Option<&str>) -> Result<()> {
+/// How to undo a held owner answer before `run_at` (unix seconds).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)] // read by the decision card's "Sending… Undo" (thread page step)
+pub struct Undo {
+    pub event_id: i64,
+    #[serde(default)]
+    pub run_at: i64,
+}
+
+/// Answer a question by id, with the owner's reason when given; returns the undo window if any.
+pub fn post_answer(question_id: i64, answer: &str, why: Option<&str>) -> Result<Option<Undo>> {
     let path = format!("/questions/{question_id}/answer");
-    post(&path, serde_json::json!({ "answer": answer, "why": why }))
+    let v = post_value(&path, serde_json::json!({ "answer": answer, "why": why }))?;
+    Ok(serde_json::from_value(v["undo"].clone()).ok())
+}
+
+// ---- threads: mirrors of crates/rui-daemon/src/thread.rs ----
+// Items marked dead_code are read by the thread page and inspector, built in the next step.
+
+/// A thread's client: id and name.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ClientRef {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// One thread on the Work board, from `GET /threads`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ThreadSummary {
+    pub id: i64,
+    #[serde(default)]
+    pub client: ClientRef,
+    #[serde(default)]
+    pub title: String,
+    /// needs_you, failed, stalled, owner, waiting, running, planned or done.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub story: Option<String>,
+    #[serde(default)]
+    pub needs_you_count: usize,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// Loops a subtask used out of its maximum.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Attempts {
+    #[serde(default)]
+    pub used: i64,
+    #[serde(default)]
+    pub max: i64,
+}
+
+/// Where to review the change behind a decision.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct ReviewRef {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub task_id: i64,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// What a node asks the owner to decide.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Decision {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub question_id: Option<i64>,
+    #[serde(default)]
+    pub ask: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub ladder: Vec<rui_core::Rung>,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    #[serde(default)]
+    pub if_approved: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub review: Option<ReviewRef>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub undo_secs: i64,
+}
+
+/// What a node produced: tests, a pull request, a file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Output {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub output_tail: Option<String>,
+}
+
+/// One step of a thread, in lane `in`, `work` or `out`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Node {
+    pub id: String,
+    #[serde(default)]
+    pub lane: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub subtask_id: Option<i64>,
+    #[serde(default)]
+    pub attempts: Option<Attempts>,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub decision: Option<Decision>,
+    #[serde(default)]
+    pub output: Option<Output>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub event_ids: Vec<i64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// One thread with all its nodes, from `GET /threads/{id}`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Thread {
+    pub id: i64,
+    #[serde(default)]
+    pub client: ClientRef,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub story: Option<String>,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub needs_you: Vec<String>,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub last_event_id: i64,
+    #[serde(default)]
+    pub nodes: Vec<Node>,
+}
+
+/// One run of a done check.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct DoneCheck {
+    #[serde(default)]
+    pub passed: bool,
+    #[serde(default)]
+    pub output_tail: String,
+}
+
+/// One page of a node's events, its cost and done checks.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct Inspector {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub events: Vec<Event>,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub done_checks: Vec<DoneCheck>,
+    #[serde(default)]
+    pub next_after_id: Option<i64>,
+}
+
+/// Reply to a take-over: the worktree and branch the owner works in.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct TakeOver {
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub branch: String,
+}
+
+/// Reply to a hand-back: the check result and the step's new status.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct HandBack {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub passed: bool,
+    #[serde(default)]
+    pub output_tail: String,
+}
+
+/// Fetch the threads for the board, needs-you first.
+pub fn get_threads() -> Result<Vec<ThreadSummary>> {
+    Ok(serde_json::from_value(get("/threads")?)?)
+}
+
+/// Fetch one thread with its nodes.
+pub fn get_thread(id: i64) -> Result<Thread> {
+    Ok(serde_json::from_value(get(&format!("/threads/{id}"))?)?)
+}
+
+/// The path of one node's inspector page, after event `after_id` when given.
+fn node_path(id: i64, node_id: &str, after_id: Option<i64>) -> String {
+    let base = format!("/threads/{id}/nodes/{}", encode_path(node_id));
+    match after_id {
+        Some(a) => format!("{base}?after_id={a}"),
+        None => base,
+    }
+}
+
+/// Fetch one page of a node's events, cost and done checks.
+#[allow(dead_code)]
+pub fn get_thread_node(id: i64, node_id: &str, after_id: Option<i64>) -> Result<Inspector> {
+    Ok(serde_json::from_value(get(&node_path(id, node_id, after_id))?)?)
+}
+
+/// Hold a subtask that has not started (`on`), or release it. Errors carry the daemon's text.
+#[allow(dead_code)]
+pub fn set_checkpoint(id: i64, on: bool) -> Result<()> {
+    library("POST", &format!("/tasks/{id}/checkpoint"), Some(serde_json::json!({ "on": on }))).map(|_| ())
+}
+
+/// Stop a subtask's agent so the owner can do the step by hand.
+#[allow(dead_code)]
+pub fn take_over(id: i64) -> Result<TakeOver> {
+    Ok(serde_json::from_value(library("POST", &format!("/tasks/{id}/take-over"), None)?)?)
+}
+
+/// Give a taken-over step back with a note; `force` lands it even if its check fails.
+#[allow(dead_code)]
+pub fn hand_back(id: i64, note: &str, force: bool) -> Result<HandBack> {
+    let body = serde_json::json!({ "note": note, "force": force });
+    Ok(serde_json::from_value(library("POST", &format!("/tasks/{id}/hand-back"), Some(body))?)?)
+}
+
+/// Undo a held owner answer inside its window; returns the reopened question.
+#[allow(dead_code)]
+pub fn cancel_approval(event_id: i64) -> Result<Question> {
+    Ok(serde_json::from_value(library("POST", &format!("/approvals/{event_id}/cancel"), None)?)?)
 }
 
 #[cfg(test)]
@@ -616,6 +885,60 @@ mod tests {
         let v: Vec<ChatMessage> = serde_json::from_str(c).unwrap();
         assert_eq!(v[0].role, ChatRole::User);
         assert_eq!(v[0].chat_id, 4);
+    }
+
+    #[test]
+    fn parses_thread_summaries() {
+        let j = r#"[{"id":7,"client":{"id":1,"name":"acme"},"title":"Add login","state":"needs_you",
+            "story":"Lead asks: which provider?","needs_you_count":2,"updated_at":"2026-11-18 10:00:00"},
+            {"id":8,"title":"bare"}]"#;
+        let v: Vec<ThreadSummary> = serde_json::from_str(j).unwrap();
+        assert_eq!((v[0].client.name.as_str(), v[0].state.as_str(), v[0].needs_you_count), ("acme", "needs_you", 2));
+        assert_eq!(v[0].story.as_deref(), Some("Lead asks: which provider?"));
+        assert_eq!((v[1].state.as_str(), v[1].story.clone(), v[1].client.id), ("", None, 0));
+    }
+
+    #[test]
+    fn parses_thread_with_nodes() {
+        let j = r#"{"id":7,"client":{"id":1,"name":"acme"},"title":"t","state":"running","story":null,
+            "deadline":null,"needs_you":["task:9"],"cost_usd":1.5,"last_event_id":40,"nodes":[
+            {"id":"task:7","lane":"in","kind":"task_in","status":"done","title":"You asked: t","agent":null,
+             "subtask_id":null,"attempts":null,"started_at":"a","ended_at":null,"after":[],"decision":null,
+             "output":null,"cost_usd":null,"event_ids":[]},
+            {"id":"task:9","lane":"work","kind":"subtask","status":"needs_you","title":"Backend: x","agent":"backend",
+             "subtask_id":9,"attempts":{"used":1,"max":5},"started_at":"b","ended_at":null,"after":["task:8"],
+             "decision":{"source":"question","question_id":3,"ask":"Which db?","why":"","ladder":[{"who":"Lead","why":"y"}],
+               "risk":"high","reversible":false,"if_approved":["migrate"],"options":["pg"],"review":{"kind":"pr","task_id":7,"url":null},
+               "actions":["Answer"],"undo_secs":10},
+             "output":{"kind":"test","label":"Tests fail","url":null,"preview":null,"output_tail":"boom"},
+             "cost_usd":0.4,"event_ids":[12],"reason":"You're doing this step"}]}"#;
+        let t: Thread = serde_json::from_str(j).unwrap();
+        assert_eq!((t.nodes.len(), t.needs_you.len(), t.last_event_id), (2, 1, 40));
+        let n = &t.nodes[1];
+        assert_eq!((n.attempts.clone().unwrap().max, n.after.len(), n.reason.is_some()), (5, 1, true));
+        let d = n.decision.as_ref().unwrap();
+        assert_eq!((d.question_id, d.risk.as_str(), d.reversible, d.ladder[0].who.as_str()), (Some(3), "high", Some(false), "Lead"));
+        assert_eq!(n.output.as_ref().unwrap().output_tail.as_deref(), Some("boom"));
+        assert_eq!(t.nodes[0].reason, None);
+    }
+
+    #[test]
+    fn parses_inspector_and_replies() {
+        let j = r#"{"node_id":"task:9","events":[{"id":1,"task_id":9,"agent":"backend","kind":"done_check",
+            "payload":{"passed":true},"created_at":"a"}],"cost_usd":0.2,
+            "done_checks":[{"passed":true,"output_tail":"ok"}],"next_after_id":null}"#;
+        let v: Inspector = serde_json::from_str(j).unwrap();
+        assert_eq!((v.events.len(), v.done_checks[0].passed, v.next_after_id), (1, true, None));
+        let h: HandBack = serde_json::from_str(r#"{"status":"done","passed":false,"output_tail":"x"}"#).unwrap();
+        assert_eq!((h.status.as_str(), h.passed), ("done", false));
+        let u: Undo = serde_json::from_value(serde_json::json!({"event_id":5,"run_at":100})).unwrap();
+        assert_eq!(u, Undo { event_id: 5, run_at: 100 });
+    }
+
+    #[test]
+    fn node_paths_encode_the_node_id() {
+        assert_eq!(node_path(7, "task:9", None), "/threads/7/nodes/task%3A9");
+        assert_eq!(node_path(7, "ev:3", Some(40)), "/threads/7/nodes/ev%3A3?after_id=40");
     }
 
     #[test]

@@ -14,10 +14,10 @@ use team_view::Phase;
 use timeline::ROWS;
 use teams::can_stop;
 use super::section::{Sec, section_top};
-use super::status::{self, Word, word_of};
+use super::status::{self, Word, thread_word, word_of};
 use super::{chip, markdown, primary_button, tag};
 use super::results::row_meta;
-use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
+use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
@@ -203,8 +203,10 @@ struct Thread {
     pod_line: Option<String>,
     /// The task's status word, from the daemon.
     word: Word,
-    /// The daemon's one-line reason for the word.
+    /// The daemon's one-line reason for the word (the thread's story on a board card).
     reason: String,
+    /// Open needs-you items in the thread; set only on board cards.
+    needs: usize,
 }
 
 fn threads_of(s: &Store) -> Vec<Thread> {
@@ -225,7 +227,30 @@ fn thread_of(s: &Store, t: &Task, question: Option<(i64, String)>) -> Thread {
         pod_line: pod_line(t, &s.roles),
         word: word_of(&s.states, t.id),
         reason: s.states.get(&t.id).map_or(String::new(), |o| o.reason.clone()),
+        needs: 0,
     }
+}
+
+/// Board cards, one per thread from `GET /threads`, in the daemon's order.
+fn board_threads(s: &Store) -> Vec<Thread> {
+    s.threads.iter().filter_map(|sum| board_thread(s, sum)).collect()
+}
+
+/// A thread summary as a card; skipped until its task has loaded too (the page needs it).
+fn board_thread(s: &Store, sum: &ThreadSummary) -> Option<Thread> {
+    let task = s.tasks.iter().find(|t| t.id == sum.id)?;
+    let mut t = thread_of(s, task, None);
+    t.client = sum.client.name.clone();
+    t.word = board_word(word_of(&s.states, sum.id), &sum.state);
+    t.reason = sum.story.clone().unwrap_or_default();
+    t.needs = sum.needs_you_count;
+    Some(t)
+}
+
+/// The thread's word, except a task the app already shows as Stopped stays Stopped
+/// (the daemon reports a stopped thread as done).
+fn board_word(task_word: Word, state: &str) -> Word {
+    if task_word == Word::Stopped { Word::Stopped } else { thread_word(state) }
 }
 
 /// Tab of the task page.
@@ -419,20 +444,16 @@ impl ThreadsView {
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
-    /// One agent card: avatar, "Agent · task", "Client · reason · elapsed", and the seat mark when running.
+    /// One thread card: avatar, title with its needs-you count, then "● Client · word · story · elapsed".
     fn row(&self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let id = t.task.id;
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
         let live = self.store.read(cx).live.task(id).cloned();
         let state = if live.is_some() { char_state(&t.task.status, live.as_ref()) } else { status::char_state(t.word) };
-        let reason = live.as_ref().map_or_else(|| t.reason.clone(), live_sub);
-        let parts = [t.client.clone(), reason, elapsed(&t.task.updated_at, now)];
-        let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
-        let title = format!("{} \u{b7} {}", t.name, t.task.title);
-        let name = div().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
-        let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
-        let text = div().flex().flex_col().flex_1().min_w_0().child(name).child(muted_line(sub, th).mt(px(2.)));
+        let story = live.as_ref().map_or_else(|| t.reason.clone(), live_sub);
+        let sub = card_sub(t, story, now, color, th);
+        let text = div().flex().flex_col().flex_1().min_w_0().child(card_title(t, th)).child(sub.mt(px(2.)));
         let group = SharedString::from(format!("thread-card-{id}"));
         let hover = th.surface_2;
         let row = div()
@@ -913,6 +934,22 @@ fn pulse_dot(id: impl Into<gpui::ElementId>, th: &Theme) -> impl IntoElement {
     dot.with_animation(id, anim, move |el, delta| el.opacity(wave(delta)))
 }
 
+/// Card title, with a "N need you" tag when the thread has open items.
+fn card_title(t: &Thread, th: &Theme) -> Div {
+    let name = div().flex_1().min_w_0().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
+    let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(t.task.title.clone());
+    let needs = (t.needs > 0).then(|| tag(&th.block, &format!("{} need you", t.needs)).flex_none());
+    div().flex().items_center().gap(px(6.)).child(name).children(needs)
+}
+
+/// Card sub line: client dot and name, status word, story, time since the last update.
+fn card_sub(t: &Thread, story: String, now: i64, color: Hsla, th: &Theme) -> Div {
+    let parts = [t.client.clone(), t.word.label().to_string(), story, elapsed(&t.task.updated_at, now)];
+    let text = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
+    let dot = div().flex_none().size(px(7.)).rounded_full().bg(color);
+    div().flex().items_center().gap(px(5.)).min_w_0().child(dot).child(muted_line(text, th).flex_1().min_w_0())
+}
+
 fn muted_line(text: String, th: &Theme) -> Div {
     div().truncate().text_size(px(11.)).text_color(th.muted).child(text)
 }
@@ -1059,15 +1096,18 @@ fn lead_line(working: usize, needs: usize, th: &Theme) -> AnyElement {
 impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        // Cards come from /threads; the task page, chart and lead line still read every task.
         let threads = threads_of(self.store.read(cx));
-        self.track_moves(&threads);
+        let cards = board_threads(self.store.read(cx));
+        self.track_moves(&cards);
         self.prune_stopping(cx);
         let now = now_secs();
         let (running, needs) = lead_counts(self.store.read(cx), &threads);
-        let bands = self.bands(&threads);
-        let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
-        self.seen.extend(threads.iter().map(|t| t.task.id));
-        let chart = self.chart(&threads, now, &th, cx);
+        let bands = self.bands(&cards);
+        let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &cards, now, &th, cx)).into();
+        self.seen.extend(cards.iter().map(|t| t.task.id));
+        let mut chart = self.chart(&threads, now, &th, cx);
+        chart.counts = ROWS.map(|(c, _)| bands[&c].len());
         let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
         if let Some(t) = open {
             return self.task_page(&t, &threads, now, &th, cx);
@@ -1193,6 +1233,13 @@ mod tests {
         let s = LiveState { tool: Some("Bash".into()), tool_input: r#"{"command":"cargo te"#.into(), ..Default::default() };
         assert_eq!(live_sub(&s), "Running cargo te\u{2026}");
         assert_eq!(live_sub(&LiveState { thinking: true, ..Default::default() }), "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn board_word_keeps_stopped() {
+        assert_eq!(board_word(Word::Stopped, "done"), Word::Stopped);
+        assert_eq!(board_word(Word::Working, "needs_you"), Word::NeedsYou);
+        assert_eq!(board_word(Word::Waiting, "stalled"), Word::Waiting);
     }
 
     #[test]

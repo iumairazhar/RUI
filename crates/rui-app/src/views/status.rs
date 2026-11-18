@@ -39,6 +39,17 @@ impl Word {
     }
 }
 
+/// A thread's status word from its daemon `state` (see `thread_state` in rui-daemon's thread.rs).
+/// A failed step needs the owner; a step the owner took over counts as Working. Unknown reads as Waiting.
+pub fn thread_word(state: &str) -> Word {
+    match state {
+        "needs_you" | "failed" => Word::NeedsYou,
+        "running" | "owner" => Word::Working,
+        "done" => Word::Done,
+        _ => Word::Waiting,
+    }
+}
+
 /// A task's status word from the daemon's states; a task with no state yet reads as Waiting.
 pub fn word_of(states: &HashMap<i64, OwnerState>, id: i64) -> Word {
     states.get(&id).map_or(Word::Waiting, |o| Word::from_str(&o.word))
@@ -74,6 +85,24 @@ mod tests {
             assert_eq!(Word::from_str(w.label()), w);
         }
         assert_eq!(Word::from_str("Mystery"), Word::Waiting);
+    }
+
+    #[test]
+    fn thread_states_map_to_words() {
+        let cases = [
+            ("needs_you", Word::NeedsYou),
+            ("failed", Word::NeedsYou),
+            ("running", Word::Working),
+            ("owner", Word::Working),
+            ("waiting", Word::Waiting),
+            ("stalled", Word::Waiting),
+            ("planned", Word::Waiting),
+            ("done", Word::Done),
+            ("", Word::Waiting),
+        ];
+        for (state, word) in cases {
+            assert_eq!(thread_word(state), word, "{state}");
+        }
     }
 
     #[test]

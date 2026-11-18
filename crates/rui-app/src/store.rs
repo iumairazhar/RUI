@@ -1,6 +1,6 @@
 //! Shared app state, refreshed from the daemon once a second.
 
-use crate::api::{self, AppInfo, Change, InboxItem, LiveSnapshot, OwnerState, ResultFile, RoleInfo, SkillInfo};
+use crate::api::{self, AppInfo, Change, InboxItem, LiveSnapshot, OwnerState, ResultFile, RoleInfo, SkillInfo, ThreadSummary};
 use crate::notify;
 use crate::views::toast::{SHOW_MS, Toast};
 use gpui::{Context, Entity, Global};
@@ -52,6 +52,11 @@ pub struct Store {
     pub inbox: Vec<InboxItem>,
     /// Status word and reason per task id.
     pub states: HashMap<i64, OwnerState>,
+    /// Threads for the Work board, needs-you first; refreshed every poll.
+    pub threads: Vec<ThreadSummary>,
+    /// Full threads loaded on demand by id (see `load_thread`).
+    #[allow(dead_code)] // read by the thread page (next step)
+    pub thread_cache: HashMap<i64, api::Thread>,
     /// Newest events, oldest first (at most 300).
     pub events: Vec<Event>,
     /// Highest event id seen so far.
@@ -100,6 +105,7 @@ struct Extras {
     runs: Option<Vec<TaskRun>>,
     inbox: Option<Vec<InboxItem>>,
     states: Option<Vec<OwnerState>>,
+    threads: Option<Vec<ThreadSummary>>,
     events: Option<Vec<Event>>,
     apps: Option<Vec<AppInfo>>,
     asks: Option<Vec<ChatAsk>>,
@@ -113,6 +119,7 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
         runs: api::get_task_runs().ok(),
         inbox: api::get_inbox().ok(),
         states: api::get_task_states().ok(),
+        threads: api::get_threads().ok(),
         events: api::get_events_after(after_id, limit).ok(),
         apps: api::get_apps().ok(),
         asks: api::get_asks_open().ok(),
@@ -188,6 +195,8 @@ impl Store {
             runs: HashMap::new(),
             inbox: vec![],
             states: HashMap::new(),
+            threads: vec![],
+            thread_cache: HashMap::new(),
             events: vec![],
             last_event_id: None,
             changes: HashMap::new(),
@@ -290,6 +299,9 @@ impl Store {
         if let Some(states) = extras.states {
             self.states = states.into_iter().map(|s| (s.task_id, s)).collect();
         }
+        if let Some(threads) = extras.threads {
+            self.threads = threads;
+        }
         if let Some(inbox) = extras.inbox {
             self.apply_inbox(inbox);
         }
@@ -386,6 +398,23 @@ impl Store {
                 }
                 s.file_view = Some((id, path, file_text(res)));
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fetch one full thread into `thread_cache`; keep the old copy on error.
+    #[allow(dead_code)] // called by the thread page (next step)
+    pub fn load_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { api::get_thread(id) }).await;
+            this.update(cx, |s, cx| {
+                let Ok(t) = res else { return };
+                if s.thread_cache.get(&id) != Some(&t) {
+                    s.thread_cache.insert(id, t);
+                    cx.notify();
+                }
             })
             .ok();
         })
