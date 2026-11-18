@@ -205,7 +205,7 @@ impl QuestionsView {
         let title = div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis();
         let title = title.text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(first_line(&it.title));
         let top = div().flex().items_center().gap(px(8.)).child(title).child(tag(st, word));
-        let reason = (!it.reason.is_empty()).then(|| div().text_size(px(11.5)).text_color(th.muted).child(it.reason.clone()));
+        let reason = kinds::reason(it).map(|r| div().text_size(px(11.5)).text_color(th.muted).child(r));
         let buttons = kinds::act_buttons("inbox", i, it, &self.store, cx);
         let buttons = (!buttons.is_empty()).then(|| div().flex().flex_wrap().gap(px(8.)).children(buttons));
         let card = div().id(("inbox-item", i)).flex().flex_col().gap(px(8.)).px(px(14.)).py(px(11.)).mb(px(6.));

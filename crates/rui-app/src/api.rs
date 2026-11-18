@@ -6,7 +6,9 @@ use rui_core::{Chat, ChatAsk, ChatMessage, Client, Event, Question, SeatInfo, Ta
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod costs;
 mod support;
+pub use costs::*;
 pub use support::*;
 
 /// Base URL of the daemon (`RUI_URL` or the default local address).

@@ -1,5 +1,6 @@
 //! Client drawer: what the owner knows about one client, and a box to add more.
 
+use super::client_deploy::DeployPanel;
 use super::client_triggers::TriggerPanel;
 use super::library::{self as lib, after_slide, run, slide_overlay, toast};
 use super::{markdown, primary_button};
@@ -40,6 +41,7 @@ pub struct ClientDrawer {
     editor: Entity<TextEditor>,
     busy: bool,
     triggers: Entity<TriggerPanel>,
+    deploy: Entity<DeployPanel>,
 }
 
 impl ClientDrawer {
@@ -47,7 +49,8 @@ impl ClientDrawer {
         let editor = cx.new(|cx| TextEditor::new("", cx));
         cx.subscribe(&editor, |this, _, _: &Save, cx| this.add(cx)).detach();
         let triggers = cx.new(|cx| TriggerPanel::new(store.clone(), cx));
-        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers }
+        let deploy = cx.new(|cx| DeployPanel::new(store.clone(), cx));
+        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers, deploy }
     }
 
     /// Open the drawer for a client and load its knowledge.
@@ -55,6 +58,7 @@ impl ClientDrawer {
         (self.open, self.closing, self.text, self.busy) = (Some((id, name)), false, None, false);
         self.editor.update(cx, |e, cx| e.set_text("", cx));
         self.triggers.update(cx, |t, cx| t.open(id, cx));
+        self.deploy.update(cx, |d, cx| d.open(id, cx));
         run(cx, move || api::get_knowledge(id), move |v, res, cx| v.loaded(id, res, cx));
         cx.notify();
     }
@@ -144,7 +148,8 @@ impl ClientDrawer {
         let known = div().flex().flex_col().gap(px(12.)).child(head).child(self.current(th)).child(self.input(th, cx));
         let known = known.into_any_element();
         let auto = self.triggers.clone().into_any_element();
-        let body = lib::scroll_body("client-drawer-body", vec![known, auto]);
+        let deploy = self.deploy.clone().into_any_element();
+        let body = lib::scroll_body("client-drawer-body", vec![known, auto, deploy]);
         lib::drawer_shell("client-drawer", th).child(self.head(name, th, cx)).child(body).into_any_element()
     }
 }

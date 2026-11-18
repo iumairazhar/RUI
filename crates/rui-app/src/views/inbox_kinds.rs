@@ -12,6 +12,9 @@ pub const EMAIL_KIND: &str = "email";
 pub const BRIEF_KIND: &str = "meeting_brief";
 /// Kind string for a PR closed without merging.
 pub const PR_CLOSED_KIND: &str = "pr_closed";
+/// Kind strings for a deploy waiting for the owner's OK, and one that failed.
+pub const DEPLOY_KIND: &str = "deploy";
+pub const DEPLOY_FAILED_KIND: &str = "deploy_failed";
 
 /// How an Inbox item renders.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +31,8 @@ pub enum Kind {
     Email,
     Brief,
     PrClosed,
+    Deploy,
+    DeployFailed,
     Other,
 }
 
@@ -46,6 +51,8 @@ pub fn kind_of(kind: &str) -> Kind {
         EMAIL_KIND => Kind::Email,
         BRIEF_KIND => Kind::Brief,
         PR_CLOSED_KIND => Kind::PrClosed,
+        DEPLOY_KIND => Kind::Deploy,
+        DEPLOY_FAILED_KIND => Kind::DeployFailed,
         _ => Kind::Other,
     }
 }
@@ -65,6 +72,8 @@ pub fn tag_of(k: Kind, th: &Theme) -> (&'static str, &Status) {
         Kind::Email => ("Email", &th.wait),
         Kind::Brief => ("Meeting", &th.wait),
         Kind::PrClosed => ("PR closed", &th.block),
+        Kind::Deploy => ("Deploy", &th.block),
+        Kind::DeployFailed => ("Deploy failed", &th.block),
         Kind::Other => ("Inbox", &th.wait),
     }
 }
@@ -80,6 +89,9 @@ pub enum ItemAct {
     Release,
     Drop,
     Retry,
+    Deploy,
+    TryAgain,
+    Skip,
 }
 
 impl ItemAct {
@@ -93,6 +105,9 @@ impl ItemAct {
             ItemAct::Release => "Release",
             ItemAct::Drop => "Drop it",
             ItemAct::Retry => "Retry",
+            ItemAct::Deploy => "Deploy",
+            ItemAct::TryAgain => "Try again",
+            ItemAct::Skip => "Skip",
         }
     }
 }
@@ -107,12 +122,26 @@ pub fn acts_of(k: Kind) -> Vec<ItemAct> {
         Kind::Undo => vec![ItemAct::Undo],
         Kind::Checkpoint => vec![ItemAct::Release],
         Kind::PrClosed => vec![ItemAct::Drop, ItemAct::Retry],
+        Kind::Deploy => vec![ItemAct::Deploy, ItemAct::Skip],
+        Kind::DeployFailed => vec![ItemAct::TryAgain, ItemAct::Skip],
         _ => vec![],
     }
 }
 
-/// The item's longer text: markdown for reports, briefs, emails and unknown kinds; a quote for a proposal.
+/// The reason line under the title; deploy kinds show theirs inside the warning box instead.
+pub fn reason(it: &InboxItem) -> Option<String> {
+    let own_box = matches!(kind_of(&it.kind), Kind::Deploy | Kind::DeployFailed);
+    (!own_box && !it.reason.is_empty()).then(|| it.reason.clone())
+}
+
+/// The item's longer text: markdown for reports, briefs, emails and unknown kinds; a quote for a proposal;
+/// a warning box for deploys.
 pub fn body(it: &InboxItem, th: &Theme) -> Option<AnyElement> {
+    match kind_of(&it.kind) {
+        Kind::Deploy => return Some(deploy_box(it, th).into_any_element()),
+        Kind::DeployFailed => return Some(failed_box(it, th).into_any_element()),
+        _ => {}
+    }
     let detail = it.detail.as_deref().filter(|d| !d.trim().is_empty())?;
     match kind_of(&it.kind) {
         Kind::Proposal => Some(quote(detail, th).into_any_element()),
@@ -125,6 +154,39 @@ fn quote(text: &str, th: &Theme) -> Div {
     let label = div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child("ADDS THIS LESSON");
     let text = div().text_size(px(12.5)).text_color(th.fg_2).child(text.to_string());
     div().flex().flex_col().gap(px(4.)).pl(px(10.)).border_l_2().border_color(th.hairline).child(label).child(text)
+}
+
+/// The command a deploy item runs: its reason without the "Runs: " lead.
+pub fn deploy_command(reason: &str) -> &str {
+    reason.strip_prefix("Runs: ").unwrap_or(reason)
+}
+
+/// Text in the monospace font, wrapped, on the well colour.
+fn mono(text: &str, th: &Theme) -> Div {
+    let el = div().px(px(10.)).py(px(8.)).rounded(px(7.)).bg(th.well).font_family("Menlo").text_size(px(11.5));
+    el.text_color(th.fg).child(text.to_string())
+}
+
+/// The block-coloured box that holds a deploy's details.
+fn warn_box(th: &Theme) -> Div {
+    let el = div().flex().flex_col().gap(px(6.)).p(px(10.)).rounded(px(8.)).bg(th.block.dim);
+    el.border_1().border_color(th.block.rim)
+}
+
+fn warn_line(text: &str, th: &Theme) -> Div {
+    div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.block.fg).child(text.to_string())
+}
+
+/// The command it will run and the daemon's warning, like "A production deploy cannot be undone."
+fn deploy_box(it: &InboxItem, th: &Theme) -> Div {
+    let note = it.detail.as_deref().filter(|d| !d.trim().is_empty()).unwrap_or("Nothing runs until you press Deploy.");
+    warn_box(th).child(warn_line("Runs", th)).child(mono(deploy_command(&it.reason), th)).child(warn_line(note, th))
+}
+
+/// What failed and the last lines the command printed.
+fn failed_box(it: &InboxItem, th: &Theme) -> Div {
+    let tail = it.detail.as_deref().filter(|d| !d.trim().is_empty()).unwrap_or("No output.");
+    warn_box(th).child(warn_line(&it.reason, th)).child(mono(tail.trim_end(), th))
 }
 
 /// The kind's buttons; a click runs the act through the store. The first one is the main button.
@@ -152,6 +214,8 @@ mod tests {
         assert_eq!(kind_of(EMAIL_KIND), Kind::Email);
         assert_eq!(kind_of(BRIEF_KIND), Kind::Brief);
         assert_eq!(kind_of(PR_CLOSED_KIND), Kind::PrClosed);
+        assert_eq!(kind_of(DEPLOY_KIND), Kind::Deploy);
+        assert_eq!(kind_of(DEPLOY_FAILED_KIND), Kind::DeployFailed);
         assert_eq!(kind_of("something_new"), Kind::Other);
         assert!(acts_of(Kind::Other).is_empty());
     }
@@ -168,5 +232,14 @@ mod tests {
         assert_eq!(acts_of(Kind::PrClosed), [ItemAct::Drop, ItemAct::Retry]);
         assert_eq!((ItemAct::Drop.label(), ItemAct::Retry.label()), ("Drop it", "Retry"));
         assert!(acts_of(Kind::Question).is_empty());
+        assert_eq!(acts_of(Kind::Deploy), [ItemAct::Deploy, ItemAct::Skip]);
+        assert_eq!(acts_of(Kind::DeployFailed), [ItemAct::TryAgain, ItemAct::Skip]);
+        assert_eq!((ItemAct::Deploy.label(), ItemAct::TryAgain.label(), ItemAct::Skip.label()), ("Deploy", "Try again", "Skip"));
+    }
+
+    #[test]
+    fn deploy_command_drops_the_lead() {
+        assert_eq!(deploy_command("Runs: make deploy"), "make deploy");
+        assert_eq!(deploy_command("make deploy"), "make deploy");
     }
 }
