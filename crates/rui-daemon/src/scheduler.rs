@@ -322,9 +322,17 @@ pub fn approval_question(e: &rui_core::Event) -> i64 {
     e.payload["question_id"].as_i64().unwrap_or(0)
 }
 
+/// Held while an undo or a delivery checks and closes a pending answer, so the two never both win.
+static APPROVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn approval_lock() -> std::sync::MutexGuard<'static, ()> {
+    APPROVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Delivers a held owner answer, marks it `approval_delivered`, then writes the decisions log.
-/// Does nothing if the event is no longer pending.
+/// Does nothing if the event is no longer pending (cancelled or delivered), checked under the lock.
 pub fn deliver_held(db: &Db, data_dir: &Path, event_id: i64) -> Result<()> {
+    let _lock = approval_lock();
     let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(()) };
     let q = db.get_question(approval_question(&e))?.context("question not found")?;
     deliver_answer(db, &q, "owner")?;
@@ -333,8 +341,9 @@ pub fn deliver_held(db: &Db, data_dir: &Path, event_id: i64) -> Result<()> {
 }
 
 /// Undoes a held answer while its window is open: logs `approval_cancelled` and reopens the question.
-/// None when the event is not pending any more or its window has run out.
+/// None when the event is not pending any more (delivered, checked under the lock) or its window has run out.
 pub fn cancel_held(db: &Db, event_id: i64, now: i64) -> Result<Option<Question>> {
+    let _lock = approval_lock();
     let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(None) };
     if now >= approval_run_at(&e) {
         return Ok(None);
@@ -856,10 +865,32 @@ async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str
         let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
     })
     .await;
-    if limit_text(&res).is_some_and(|t| seats::hit_limit(&t)) {
+    if seat_used_up(cli, &res) {
         seats::mark_exhausted(db, &seat, crate::thread::now_secs())?;
     }
     res
+}
+
+/// True when a Claude turn failed on a usage limit. A Codex turn never uses up a Claude seat.
+pub fn seat_used_up(cli: Cli, res: &Result<RunOutcome>) -> bool {
+    cli == Cli::Claude && limit_text(res).is_some_and(|t| seats::hit_limit(&t))
+}
+
+/// A turn that ran over its time limit. The CLI is killed when its future is dropped.
+#[derive(Debug)]
+pub struct TimedOut;
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("timed out")
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Runs `fut` with a time limit; an error of type [`TimedOut`] when it runs over.
+pub async fn within<T>(limit: std::time::Duration, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(limit, fut).await.map_err(|_| anyhow::Error::new(TimedOut))?
 }
 
 /// Adds `seat_id` to a `result` payload.
@@ -2417,6 +2448,46 @@ mod tests {
         assert_eq!(instructions(&db, m), 1);
         let log = client_state::read_log(data.path(), "acme", 50).unwrap();
         assert_eq!(log.matches(&format!("Owner answered Q{q}")).count(), 1);
+    }
+
+    #[test]
+    fn codex_limit_text_never_uses_up_a_seat() {
+        let limited = || RunOutcome { session_id: None, result_text: Some("Claude AI usage limit reached|1700000000".into()), is_error: true, exit_ok: false };
+        assert!(seat_used_up(Cli::Claude, &Ok(limited())));
+        assert!(!seat_used_up(Cli::Codex, &Ok(limited())));
+        assert!(!seat_used_up(Cli::Codex, &Err(anyhow::anyhow!("429 rate_limit_error"))));
+    }
+
+    #[tokio::test]
+    async fn within_reports_a_timeout() {
+        let slow = within(std::time::Duration::from_millis(10), async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(())
+        });
+        assert!(slow.await.unwrap_err().is::<TimedOut>());
+        assert_eq!(within(std::time::Duration::from_secs(1), async { Ok(7) }).await.unwrap(), 7);
+    }
+
+    #[test]
+    fn cancel_and_deliver_racing_close_each_answer_once() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let mut held_ids = vec![];
+        for _ in 0..20 {
+            let (_, q) = waiting_member(&db, c, "owner");
+            held_ids.push(answer_with_undo(&db, q, "yes", None, 0).unwrap().event_id);
+        }
+        let db = std::sync::Arc::new(db);
+        let (d1, d2, ids1, ids2, path) = (db.clone(), db.clone(), held_ids.clone(), held_ids.clone(), data.path().to_path_buf());
+        let a = std::thread::spawn(move || ids1.iter().for_each(|id| deliver_held(&d1, &path, *id).unwrap()));
+        let b = std::thread::spawn(move || ids2.iter().for_each(|id| { cancel_held(&d2, *id, 1).unwrap(); }));
+        a.join().unwrap();
+        b.join().unwrap();
+        let closes = db.events_of_kinds(&["approval_cancelled", "approval_delivered"]).unwrap();
+        for id in held_ids {
+            let n = closes.iter().filter(|e| e.payload["event_id"].as_i64() == Some(id)).count();
+            assert_eq!(n, 1, "approval {id} closed {n} times");
+        }
     }
 
     #[test]
