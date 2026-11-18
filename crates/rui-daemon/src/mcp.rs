@@ -1347,11 +1347,18 @@ mod tests {
     }
 
     /// Db with one client and one top-level task; returns (db, ctx for that task).
+    /// A data dir of its own for each test, so parallel tests never share client files.
+    fn unique_data_dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rui-mcp-test-{}-{n}", std::process::id()))
+    }
+
     fn setup(test_command: Option<&str>) -> (Db, Ctx, tempfile::TempDir) {
         let db = Db::open_test();
         let dir = git_dir();
         let ctx = Ctx { task_id: None, source_ref: Some("chat:12".into()) };
-        logic::create_client(&db, &std::env::temp_dir().join("rui-mcp-test-none"), &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
+        logic::create_client(&db, &unique_data_dir(), &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
         let client = db.get_client_by_name("Acme").unwrap().unwrap();
         let t = db
             .create_task(&NewTask {
