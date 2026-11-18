@@ -16,6 +16,23 @@ pub fn base_url() -> String {
     std::env::var("RUI_URL").unwrap_or_else(|_| "http://127.0.0.1:7878".into())
 }
 
+/// Header the daemon checks on owner routes.
+const OWNER_HEADER: &str = "x-rui-owner";
+
+/// The daemon's data folder (`RUI_DATA_DIR` or the default), where it writes `owner.token`.
+fn data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("RUI_DATA_DIR") {
+        return dir.into();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join("Library/Application Support/RUI")
+}
+
+/// The owner token, read fresh each call because the daemon rewrites it on every boot.
+fn owner_token() -> String {
+    std::fs::read_to_string(data_dir().join("owner.token")).map(|t| t.trim().to_string()).unwrap_or_default()
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
@@ -27,18 +44,18 @@ fn agent() -> ureq::Agent {
 
 fn get(path: &str) -> Result<serde_json::Value> {
     let url = format!("{}{}", base_url(), path);
-    Ok(agent().get(&url).call()?.body_mut().read_json()?)
+    Ok(agent().get(&url).header(OWNER_HEADER, owner_token()).call()?.body_mut().read_json()?)
 }
 
 fn post(path: &str, body: serde_json::Value) -> Result<()> {
     let url = format!("{}{}", base_url(), path);
-    agent().post(&url).send_json(body)?;
+    agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(body)?;
     Ok(())
 }
 
 fn post_value(path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
     let url = format!("{}{}", base_url(), path);
-    Ok(agent().post(&url).send_json(body)?.body_mut().read_json()?)
+    Ok(agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(body)?.body_mut().read_json()?)
 }
 
 /// Fetch all clients.
@@ -64,7 +81,7 @@ pub fn get_chats() -> Result<Vec<Chat>> {
 /// Create a chat; the daemon seeds it with Rui's first message.
 pub fn create_chat() -> Result<Chat> {
     let url = format!("{}/chats", base_url());
-    let body = agent().post(&url).send_json(serde_json::json!({}))?.body_mut().read_json()?;
+    let body = agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(serde_json::json!({}))?.body_mut().read_json()?;
     Ok(serde_json::from_value(body)?)
 }
 
@@ -388,10 +405,10 @@ pub fn library(method: &str, path: &str, body: Option<serde_json::Value>) -> Res
     let url = format!("{}{}", base_url(), path);
     let body = body.unwrap_or_else(|| serde_json::json!({}));
     let mut res = match method {
-        "GET" => agent.get(&url).call()?,
-        "DELETE" => agent.delete(&url).call()?,
-        "PUT" => agent.put(&url).send_json(body)?,
-        _ => agent.post(&url).send_json(body)?,
+        "GET" => agent.get(&url).header(OWNER_HEADER, owner_token()).call()?,
+        "DELETE" => agent.delete(&url).header(OWNER_HEADER, owner_token()).call()?,
+        "PUT" => agent.put(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
+        _ => agent.post(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
     };
     let json: serde_json::Value = res.body_mut().read_json().unwrap_or(serde_json::Value::Null);
     let status = res.status();
