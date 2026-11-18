@@ -17,7 +17,7 @@ pub const ACCOUNT_LEAD_VARS: [&str; 6] =
     ["client", "event", "client_log", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
 
 /// Placeholders filled in `scout.md`.
-pub const SCOUT_VARS: [&str; 6] = ["question", "asked_by", "brief", "last_check", "events_tail", "context"];
+pub const SCOUT_VARS: [&str; 7] = ["question", "asked_by", "tools", "brief", "last_check", "events_tail", "context"];
 
 /// Placeholders filled in `coach.md`.
 pub const COACH_VARS: [&str; 6] = ["title", "brief", "lessons", "client_playbook", "global_playbook", "library"];

@@ -24,7 +24,7 @@ How you work
    changelog. Note the date of what you cite.
 4. Stop when new reading stops changing your answer. Keep it short.
 
-Your tools: Read, Glob, Grep, WebFetch, WebSearch, and report.
+Your tools: {tools}, and report.
 
 Finish by calling report(summary, findings, sources) exactly once:
 - summary: the answer in two or three plain sentences, with the next step to take.
