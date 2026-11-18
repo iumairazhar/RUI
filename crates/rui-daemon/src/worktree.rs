@@ -3,7 +3,8 @@
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -162,6 +163,29 @@ pub enum LandResult {
 
 static LAND_LOCK: Mutex<()> = Mutex::new(());
 
+static WT_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+/// Runs `f` while holding the lock of task worktree `wt`, so a precheck, a reset
+/// and a subtask merge never touch the same worktree at once.
+pub fn with_worktree_lock<T>(wt: &Path, f: impl FnOnce() -> T) -> T {
+    let key = wt.canonicalize().unwrap_or_else(|_| wt.to_path_buf());
+    let lock = {
+        let mut map = WT_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_or_insert_with(HashMap::new).entry(key).or_default().clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// Proves `cmd` fails in `wt`, then resets the worktree, all under the worktree lock.
+pub fn precheck_and_reset(wt: &Path, cmd: &str) -> anyhow::Result<()> {
+    with_worktree_lock(wt, || {
+        let checked = require_failing(wt, cmd);
+        reset_worktree(wt)?;
+        checked
+    })
+}
+
 fn merge_failure(repo: &Path) -> anyhow::Result<LandResult> {
     let files = git_stdout(repo, &["diff", "--name-only", "--diff-filter=U"])?;
     let files: Vec<String> = files.lines().map(String::from).collect();
@@ -185,12 +209,14 @@ pub fn land(repo: &Path, branch: &str, base: &str, message: &str) -> anyhow::Res
 
 /// Merges `branch` into whatever branch worktree `wt` has checked out, with a merge commit.
 pub fn merge_into(wt: &Path, branch: &str, message: &str) -> anyhow::Result<LandResult> {
-    let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
-    if git(wt, &args)?.status.success() {
-        return Ok(LandResult::Merged);
-    }
-    merge_failure(wt)
+    with_worktree_lock(wt, || {
+        let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
+        if git(wt, &args)?.status.success() {
+            return Ok(LandResult::Merged);
+        }
+        merge_failure(wt)
+    })
 }
 
 /// Files touched by the tip commit of `branch` (works after the branch is merged).
@@ -673,6 +699,30 @@ mod tests {
         assert_eq!(merge_into(&task_wt, &sub_branch, "m").unwrap(), LandResult::Merged);
         assert!(task_wt.join("new.txt").exists());
         assert_eq!(head_of(repo.path(), &base), before);
+    }
+
+    #[test]
+    fn merge_waits_while_the_worktree_lock_is_held() {
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let (task_wt, task_branch) = ensure_task_worktree(repo.path(), wts.path(), 1, &base_branch(repo.path()).unwrap()).unwrap();
+        let (sub, sub_branch) = create_worktree(repo.path(), wts.path(), 5, Some(&task_branch)).unwrap();
+        std::fs::write(sub.join("new.txt"), "n").unwrap();
+        assert!(commit_all(&sub, "work").unwrap());
+        let merged = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            with_worktree_lock(&task_wt, || {
+                s.spawn(|| {
+                    merge_into(&task_wt, &sub_branch, "m").unwrap();
+                    merged.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(500));
+                assert!(!merged.load(std::sync::atomic::Ordering::SeqCst), "merge ran while locked");
+            });
+        });
+        assert!(merged.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(task_wt.join("new.txt").exists());
     }
 
     #[test]

@@ -826,9 +826,7 @@ pub mod logic {
         let repo = expand_home(&client.repo_path);
         let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
         let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id, &base)?;
-        let checked = crate::worktree::require_failing(&wt, cmd);
-        crate::worktree::reset_worktree(&wt)?;
-        checked
+        crate::worktree::precheck_and_reset(&wt, cmd)
     }
 
     /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
