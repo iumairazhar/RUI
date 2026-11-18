@@ -72,9 +72,15 @@ pub fn seat_body(kind: Kind, f: &Fields) -> Result<Value, String> {
 fn place(kind: Kind, text: &str, body: &mut Value) -> Result<(), String> {
     match kind {
         Kind::Subscription if text.is_empty() => Ok(()),
-        Kind::Subscription if text.starts_with('/') || text.starts_with('~') => Ok(body["config_dir"] = json!(text)),
+        Kind::Subscription if text.starts_with('/') || text.starts_with('~') => {
+            body["config_dir"] = json!(text);
+            Ok(())
+        }
         Kind::Subscription => Err("The login folder starts with / or ~".into()),
-        Kind::ApiKey if is_env_name(text) => Ok(body["env_var"] = json!(text)),
+        Kind::ApiKey if is_env_name(text) => {
+            body["env_var"] = json!(text);
+            Ok(())
+        }
         Kind::ApiKey => Err("Enter the variable's name, like ANTHROPIC_API_KEY_WORK \u{2014} never the key itself".into()),
     }
 }
