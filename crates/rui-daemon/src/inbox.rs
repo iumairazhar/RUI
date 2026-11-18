@@ -194,6 +194,8 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     items.extend(task_items(db, &questioned)?);
     items.extend(checkpoint_items(db, &tasks)?);
     items.extend(seat_items(db)?);
+    items.extend(crate::scout::inbox_items(db)?);
+    items.extend(crate::coach::inbox_items(db)?);
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)
 }

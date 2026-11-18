@@ -24,7 +24,8 @@ const ACCOUNT_LEAD_PROMPT: &str = include_str!("../prompts/account_lead.md");
 const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
-mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr";
+mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
+mcp__rui__ask_scout";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -49,6 +50,10 @@ pub enum Action {
     Decide { question_id: i64, level: String },
     /// The owner's undo window ran out: deliver the held answer.
     DeliverAnswer { question_id: i64, event_id: i64 },
+    /// Run the Scout once for an unanswered `scout_requested` event.
+    Scout { task_id: i64, request_event_id: i64 },
+    /// Run the Coach once over a finished top-level task.
+    Coach { task_id: i64 },
 }
 
 // ---- pure decision layer ----
@@ -73,6 +78,8 @@ pub fn plan_tick_at(db: &Db, running: &HashSet<i64>, now: i64) -> Result<Vec<Act
     }
     actions.extend(plan_decisions(db, running, &by_id)?);
     actions.extend(plan_deliveries(&pending, now));
+    actions.extend(crate::scout::plan(db, running)?);
+    actions.extend(crate::coach::plan(db, running)?);
     Ok(actions)
 }
 
@@ -555,7 +562,38 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
                 report_error(db, None, &e);
             }
         }
+        Action::Scout { task_id, request_event_id } => {
+            let (db2, cfg2, live2) = (db.clone(), cfg.clone(), live.clone());
+            spawn_keyed(running, crate::scout::run_key(request_event_id), async move {
+                crate::scout::run(&db2, &cfg2, &live2, task_id, request_event_id).await
+            }, db, Some(task_id));
+        }
+        Action::Coach { task_id } => {
+            let (db2, cfg2, live2) = (db.clone(), cfg.clone(), live.clone());
+            spawn_keyed(running, crate::coach::run_key(task_id), async move {
+                crate::coach::run(&db2, &cfg2, &live2, task_id).await
+            }, db, Some(task_id));
+        }
     }
+}
+
+/// Runs one background turn under `key` in the running set; at most one per key. Errors are logged.
+fn spawn_keyed<Fut>(running: &Runs, key: i64, turn: Fut, db: &Arc<Db>, task_id: Option<i64>)
+where
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let Ok(mut map) = running.lock() else { return };
+    if map.contains_key(&key) {
+        return;
+    }
+    let (db, guard) = (db.clone(), RunGuard(running.clone(), key));
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        if let Err(e) = turn.await {
+            report_error(&db, task_id, &e);
+        }
+    });
+    map.insert(key, handle.abort_handle());
 }
 
 /// Runs one decision turn in the background; at most one per question.
@@ -785,7 +823,7 @@ fn client_for(db: &Db, task: &Task) -> Result<Client> {
 
 /// Runs the agent on the picked seat, logging every line as an event for `agent`.
 /// The `result` event carries `seat_id`, which is how usage per seat is counted.
-async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
+pub(crate) async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
     let seat = seats::pick_from(db, &cfg.data_dir, crate::thread::now_secs())?.context("all seats are used up")?;
     run.seat = Some(seat.clone());
     let res = run_agent(&run, |p| {
@@ -1099,7 +1137,9 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
         return Ok(());
     }
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
-    let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent, playbook)?);
+    let mut vars = decide_vars(db, &q, &member, &parent, playbook)?;
+    vars.push(("global_playbook", client_state::read_global_playbook(&cfg.data_dir)?));
+    let system = prompts::fill(DECIDE_PROMPT, &vars);
     run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
 }
@@ -1114,7 +1154,6 @@ fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task, client_playb
         ("lead_why", lead_why),
         ("brief", parent.body.clone()),
         ("client_playbook", client_playbook),
-        ("global_playbook", String::new()),
         ("prior_rulings", prior_rulings(db, parent.id, q.id)?),
     ])
 }
@@ -1526,6 +1565,46 @@ mod tests {
 
     fn plan(db: &Db) -> Vec<Action> {
         plan_tick(db, &HashSet::new()).unwrap()
+    }
+
+    #[test]
+    fn ask_scout_plans_one_scout_turn_and_the_lead_keeps_its_state() {
+        let (db, c) = setup();
+        let t = mk(&db, c, None, TaskStatus::Split);
+        let ctx = crate::mcp::Ctx { task_id: Some(t.id), source_ref: None };
+        let args = crate::mcp::AskScoutArgs { question: "Why does the build fail?".into() };
+        let id = crate::mcp::logic::ask_scout(&db, &ctx, args).unwrap()["request_event_id"].as_i64().unwrap();
+        assert_eq!(plan(&db), vec![Action::Scout { task_id: t.id, request_event_id: id }]);
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Split);
+        let report = crate::scout::Report { summary: "Missing env var".into(), findings: vec![], sources: vec![] };
+        crate::scout::report(&db, id, Some(t.id), report).unwrap();
+        assert!(plan(&db).is_empty());
+        assert!(take_instructions(&db, t.id).unwrap().contains("Missing env var"));
+    }
+
+    #[test]
+    fn members_cannot_ask_the_scout() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        let sub = mk(&db, c, Some(p.id), TaskStatus::InProgress);
+        let ctx = crate::mcp::Ctx { task_id: Some(sub.id), source_ref: None };
+        assert!(crate::mcp::logic::ask_scout(&db, &ctx, crate::mcp::AskScoutArgs { question: "q".into() }).is_err());
+    }
+
+    #[test]
+    fn done_task_with_a_send_back_gets_one_coach_turn() {
+        let (db, c) = setup();
+        let t = mk(&db, c, None, TaskStatus::Done);
+        db.add_event(Some(t.id), "lead", "sent_back", &json!({"remarks": "r"})).unwrap();
+        assert_eq!(plan(&db), vec![Action::Coach { task_id: t.id }]);
+        db.add_event(Some(t.id), "coach", "coach_reviewed", &json!({})).unwrap();
+        assert!(plan(&db).is_empty());
+    }
+
+    #[test]
+    fn support_turns_wait_for_a_free_seat() {
+        let actions = vec![Action::Scout { task_id: 1, request_event_id: 2 }, Action::Coach { task_id: 1 }];
+        assert!(hold_turns(actions, false).is_empty());
     }
 
     #[test]

@@ -34,15 +34,17 @@ pub struct Ctx {
     pub source_ref: Option<String>,
 }
 
-/// Builds the router with `/mcp/rui`, `/mcp/lead` and `/mcp/builder`.
+/// Builds the router with `/mcp/rui`, `/mcp/lead`, `/mcp/builder`, `/mcp/scout` and `/mcp/coach`.
 pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axum::Router {
     axum::Router::new()
         .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs)))
         .nest_service("/mcp/lead", service(LeadServer::new(db.clone(), data_dir.clone())))
-        .nest_service("/mcp/builder", service(BuilderServer::new(db, data_dir)))
+        .nest_service("/mcp/builder", service(BuilderServer::new(db.clone(), data_dir.clone())))
+        .nest_service("/mcp/scout", service(crate::support_mcp::ScoutServer::new(db.clone())))
+        .nest_service("/mcp/coach", service(crate::support_mcp::CoachServer::new(db, data_dir)))
 }
 
-fn service<S: ServerHandler + Clone + Send + 'static>(
+pub(crate) fn service<S: ServerHandler + Clone + Send + 'static>(
     server: S,
 ) -> StreamableHttpService<S, LocalSessionManager> {
     let config = StreamableHttpServerConfig::default()
@@ -52,7 +54,7 @@ fn service<S: ServerHandler + Clone + Send + 'static>(
     StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config)
 }
 
-fn ctx_from(parts: &Parts) -> Ctx {
+pub(crate) fn ctx_from(parts: &Parts) -> Ctx {
     let header = |name: &str| {
         let v = parts.headers.get(name)?.to_str().ok()?.trim();
         (!v.is_empty()).then(|| v.to_string())
@@ -71,14 +73,14 @@ where
     tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(anyhow::anyhow!("task failed: {e}")))
 }
 
-fn finish(res: anyhow::Result<Value>) -> CallToolResult {
+pub(crate) fn finish(res: anyhow::Result<Value>) -> CallToolResult {
     match res {
         Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
         Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
     }
 }
 
-fn info() -> ServerConfig {
+pub(crate) fn info() -> ServerConfig {
     ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
 }
 
@@ -246,6 +248,14 @@ pub struct StatusArgs {
 #[schemars(crate = "rmcp::schemars")]
 pub struct AskLeadArgs {
     /// The question for the Lead. Be specific.
+    pub question: String,
+}
+
+/// Arguments for `ask_scout`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AskScoutArgs {
+    /// What the Scout should research or diagnose. Be specific.
     pub question: String,
 }
 
@@ -1050,6 +1060,18 @@ pub mod logic {
         Ok(json!({"ok": true}))
     }
 
+    /// The Account Lead asks the Scout. It never blocks: the report arrives as an instruction later.
+    pub fn ask_scout(db: &Db, ctx: &Ctx, a: AskScoutArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if task.parent_id.is_some() {
+            anyhow::bail!("only the Account Lead can ask the Scout");
+        }
+        let id = crate::scout::request(db, task.id, &a.question, "lead")?;
+        record(db, ctx, Role::Lead, "ask_scout", &a)?;
+        let note = "The Scout works in the background. Keep going; its report arrives as an instruction on a later turn.";
+        Ok(json!({"ok": true, "request_event_id": id, "note": note}))
+    }
+
     /// Member asks the Lead; the member waits until the question is ruled.
     pub fn ask_lead(db: &Db, data_dir: &Path, ctx: &Ctx, a: AskLeadArgs) -> anyhow::Result<Value> {
         let task = current_task(db, ctx)?;
@@ -1325,6 +1347,15 @@ impl LeadServer {
         Parameters(a): Parameters<SetStoryArgs>,
     ) -> CallToolResult {
         finish(logic::set_story(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Ask the Scout to research a question or diagnose a failure. Does not wait: keep working; the report arrives as an instruction on a later turn.")]
+    async fn ask_scout(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AskScoutArgs>,
+    ) -> CallToolResult {
+        finish(logic::ask_scout(&self.db, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
@@ -2232,12 +2263,14 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
+        let lead = ["ask_scout", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
         let rui = ["approve", "ask_owner", "create_client", "create_task", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "set_up_pod", "stop_apps", "stop_task", "use_repo"];
         assert_eq!(tool_names(&app, "/mcp/rui").await, rui);
+        assert_eq!(tool_names(&app, "/mcp/scout").await, ["report"]);
+        assert_eq!(tool_names(&app, "/mcp/coach").await, ["done", "propose"]);
     }
 
     #[tokio::test]

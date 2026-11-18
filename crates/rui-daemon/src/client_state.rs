@@ -137,6 +137,36 @@ pub fn read_playbook(data_dir: &Path, name: &str) -> Result<String> {
     read_or_empty(data_dir, name, "playbook.md")
 }
 
+/// Appends one bullet to the client's playbook. Existing lines are never touched.
+pub fn append_playbook(data_dir: &Path, name: &str, text: &str) -> Result<()> {
+    append(data_dir, name, "playbook.md", &bullet(text))
+}
+
+/// The Global Playbook every client shares: `<data_dir>/playbook.md`.
+pub fn global_playbook_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("playbook.md")
+}
+
+pub fn read_global_playbook(data_dir: &Path) -> Result<String> {
+    let path = global_playbook_path(data_dir);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(path)?)
+}
+
+/// Appends one bullet to the Global Playbook, creating the file when missing.
+pub fn append_global_playbook(data_dir: &Path, text: &str) -> Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(global_playbook_path(data_dir))?;
+    Ok(f.write_all(bullet(text).as_bytes())?)
+}
+
+/// `text` as one markdown bullet line.
+pub fn bullet(text: &str) -> String {
+    format!("- {}\n", text.replace(['\n', '\r'], " ").trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
