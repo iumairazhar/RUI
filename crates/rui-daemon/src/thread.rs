@@ -711,7 +711,9 @@ pub fn inspect(db: &Db, th: &Thread, node_id: &str, after_id: i64) -> Result<Opt
     let done_checks = done_checks(&own);
     let mut events: Vec<Event> = own.into_iter().filter(|e| e.id > after_id).collect();
     if let Some(sid) = node.subtask_id.filter(|_| node.kind == "subtask") {
-        events.extend(db.events_for_tasks(&[sid], &["tool_call"], after_id, PAGE as i64 + 1)?);
+        // The member's own turns and notes, so a running step shows what it is doing.
+        let kinds = ["assistant", "tool_call", "progress", "result"];
+        events.extend(db.events_for_tasks(&[sid], &kinds, after_id, PAGE as i64 + 1)?);
     }
     let cost_usd = node.cost_usd.unwrap_or(0.0);
     Ok(Some(page(node, events, cost_usd, done_checks)))
@@ -1077,6 +1079,23 @@ mod tests {
         let ids: Vec<i64> = seen.events.iter().map(|e| e.id).collect();
         assert_eq!(ids, [think, call, done], "only the planning turn");
         assert!((seen.cost_usd - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn running_step_shows_its_turns_and_notes_but_not_thinking_pings() {
+        let (db, top, sub) = setup(TaskStatus::InProgress);
+        let said = db.add_event(Some(sub), "builder", "assistant", &json!({"text": "scaffolding"})).unwrap();
+        let note = db.add_event(Some(sub), "builder", "progress", &json!({"note": "next: mock data"})).unwrap();
+        db.add_event(Some(sub), "builder", "other", &json!({"subtype": "thinking_tokens"})).unwrap();
+        db.add_event(Some(sub), "builder", "toolresult", &json!({})).unwrap();
+        let th = get(&db, top, real_now());
+        let step = th.nodes.iter().find(|n| n.subtask_id == Some(sub) && n.kind == "subtask").unwrap();
+        let seen = inspect(&db, &th, &step.id, 0).unwrap().unwrap();
+        let ids: Vec<i64> = seen.events.iter().map(|e| e.id).filter(|id| [said, note].contains(id)).collect();
+        assert_eq!(ids, [said, note]);
+        assert!(seen.events.iter().all(|e| e.kind != "other" && e.kind != "toolresult"));
+        let later = inspect(&db, &th, &step.id, note).unwrap().unwrap();
+        assert!(later.events.iter().all(|e| e.id > note), "follow-up pages only bring newer events");
     }
 
     #[test]

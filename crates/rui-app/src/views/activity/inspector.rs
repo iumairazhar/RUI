@@ -38,6 +38,12 @@ pub fn split_events(evs: &[Event]) -> (Vec<&Event>, Vec<&Event>) {
     evs.iter().filter(|e| !is_empty_turn(e)).partition(|e| e.kind != "tool_call")
 }
 
+/// The last loaded event's id, once every page is loaded; new events come after it.
+fn tail_after(i: &Inspect) -> Option<i64> {
+    let p = i.page.as_ref().filter(|p| p.next_after_id.is_none())?;
+    Some(p.events.last().map_or(0, |e| e.id))
+}
+
 /// "$0.25"
 pub fn cost_text(c: f64) -> String {
     format!("${c:.2}")
@@ -80,7 +86,27 @@ impl ThreadsView {
         self.inspect = Some(Inspect { thread_id, node_id, page: None, error: None, take: None, closing: false });
         self.note.update(cx, |i, cx| i.clear(cx));
         self.fetch_page(None, cx);
+        self.follow(cx);
         cx.notify();
+    }
+
+    /// While this node stays open, load its new events every few seconds.
+    fn follow(&mut self, cx: &mut Context<Self>) {
+        let Some(want) = self.inspect.as_ref().map(|i| i.node_id.clone()) else { return };
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
+            let open = this.update(cx, |v, cx| {
+                let Some(i) = v.inspect.as_ref().filter(|i| i.node_id == want && !i.closing) else { return false };
+                if let Some(after) = tail_after(i) {
+                    v.fetch_page(Some(after), cx);
+                }
+                true
+            });
+            if !open.unwrap_or(false) {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// Load events after `after` (appending), or reload from the start with `None`.
