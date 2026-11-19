@@ -139,8 +139,9 @@ pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, ans
         .flex()
         .items_start()
         .gap(px(8.))
-        .child(svg().path("icons/hand.svg").size(px(15.)).text_color(th.wait.fg))
-        .child(div().flex_1().child(markdown::render(text, th.wait.fg, 13., th)));
+        .child(svg().path("icons/hand.svg").flex_none().size(px(15.)).text_color(th.wait.fg))
+        // min_w_0 lets long text wrap inside the card instead of widening it past its edge.
+        .child(div().flex_1().min_w_0().child(markdown::render(text, th.wait.fg, 13., th)));
     let row = match why {
         Some(why) => div().flex().flex_col().gap(px(8.)).child(input).child(why).child(div().flex().child(answer_btn)),
         None => div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn),
