@@ -16,7 +16,7 @@ use super::activity::{icon, parse_secs, summarize};
 use super::roster::role_title;
 use crate::api::RoleInfo;
 use serde_json::Value;
-use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question};
+use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question, Task};
 use std::collections::{HashMap, HashSet};
 
 /// Chat list, messages of the selected chat, open questions and a composer.
@@ -642,7 +642,8 @@ impl Render for ChatView {
             let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
             let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
-            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks, tools, live_calls)
+            let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat);
+            (s.chat.clone(), s.chats.clone(), s.current_chat, questions, live, state, cards, asks, tools, live_calls)
         };
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
         self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
@@ -676,9 +677,48 @@ impl Render for ChatView {
     }
 }
 
+/// The chat message a task's thread started from: its top task's `chat:<message id>` source.
+fn source_message(task_id: i64, tasks: &[Task]) -> Option<i64> {
+    let mut t = tasks.iter().find(|t| t.id == task_id)?;
+    while let Some(parent) = t.parent_id {
+        t = tasks.iter().find(|p| p.id == parent)?;
+    }
+    t.source_ref.as_deref()?.strip_prefix("chat:")?.parse().ok()
+}
+
+/// Open questions from threads started in this chat; the rest live only in the Inbox.
+fn questions_in_chat(questions: &[Question], tasks: &[Task], chat: &[ChatMessage]) -> Vec<Question> {
+    let here = |q: &&Question| source_message(q.task_id, tasks).is_some_and(|m| chat.iter().any(|c| c.id == m));
+    questions.iter().filter(here).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn task(id: i64, parent: Option<i64>, source: Option<&str>) -> Task {
+        serde_json::from_value(json!({"id": id, "client_id": 1, "parent_id": parent, "title": "t", "body": "", "status": "open",
+            "done_command": null, "max_loops": 3, "loops_used": 0, "role": "lead", "branch": null, "source_kind": "chat",
+            "source_ref": source, "depends_on": [], "created_at": "", "updated_at": ""}))
+        .unwrap()
+    }
+
+    fn question(id: i64, task_id: i64) -> Question {
+        serde_json::from_value(json!({"id": id, "task_id": task_id, "asked_by": "builder", "text": "q", "answer": null,
+            "status": "open", "created_at": ""}))
+        .unwrap()
+    }
+
+    #[test]
+    fn questions_show_only_in_the_chat_that_started_their_thread() {
+        let tasks = vec![task(22, None, Some("chat:7")), task(23, Some(22), Some("task:22")), task(30, None, None)];
+        let qs = vec![question(1, 23), question(2, 30), question(3, 99)];
+        let here: Vec<ChatMessage> = vec![serde_json::from_value(json!({"id": 7, "chat_id": 4, "role": "user", "content": "go", "created_at": ""})).unwrap()];
+        let ids: Vec<i64> = questions_in_chat(&qs, &tasks, &here).iter().map(|q| q.id).collect();
+        assert_eq!(ids, [1]);
+        assert!(questions_in_chat(&qs, &tasks, &[]).is_empty());
+    }
 
     #[test]
     fn live_steps_only_while_waiting_in_this_chat() {
