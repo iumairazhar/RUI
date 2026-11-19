@@ -40,6 +40,8 @@ pub struct TraceRow {
     pub text: String,
     pub error: bool,
     pub detail: Option<Detail>,
+    /// The task whose agent did this, to name the member on a split thread.
+    pub task_id: Option<i64>,
 }
 
 /// What a row shows when expanded.
@@ -101,7 +103,7 @@ fn first_str<'a>(input: &'a Value, keys: &[&str]) -> &'a str {
 }
 
 fn row(kind: Kind, time: &str, code: Option<String>, text: impl Into<String>) -> TraceRow {
-    TraceRow { kind, time: time.to_string(), code, text: text.into(), error: false, detail: None }
+    TraceRow { kind, time: time.to_string(), code, text: text.into(), error: false, detail: None, task_id: None }
 }
 
 fn errored(mut r: TraceRow) -> TraceRow {
@@ -368,11 +370,8 @@ pub fn trace(events: &[Event]) -> Vec<TraceRow> {
     let results = pair_results(events);
     let mut rows = Vec::new();
     for e in events {
-        if e.kind == "assistant" {
-            rows.extend(assistant_rows(e, &results));
-        } else {
-            rows.extend(other_row(e));
-        }
+        let made = if e.kind == "assistant" { assistant_rows(e, &results) } else { other_row(e).into_iter().collect() };
+        rows.extend(made.into_iter().map(|r| TraceRow { task_id: e.task_id, ..r }));
     }
     rows
 }
@@ -456,6 +455,14 @@ mod tests {
         serde_json::from_value(json!({"id":1,"task_id":7,"agent":"builder","kind":kind,
             "payload":payload,"created_at":"2026-11-15 09:41:07"}))
         .unwrap()
+    }
+
+    #[test]
+    fn rows_carry_the_task_they_came_from() {
+        let read = json!({"message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/w/src/a.ts"}}]}});
+        let rows = trace(&[ev("assistant", read)]);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r.task_id == Some(7)));
     }
 
     fn use_ev(id: &str, name: &str, input: Value) -> Event {

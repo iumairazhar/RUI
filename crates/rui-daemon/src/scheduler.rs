@@ -835,8 +835,14 @@ pub fn line_event(p: &ParsedLine) -> Option<(&'static str, Value)> {
         ParsedLine::Assistant(v) => ("assistant", v.clone()),
         ParsedLine::ToolResult(v) => ("toolresult", v.clone()),
         ParsedLine::Result { raw, .. } => ("result", raw.clone()),
+        ParsedLine::Other(v) if is_thinking_ping(v) => return None,
         ParsedLine::Other(v) => ("other", v.clone()),
     })
+}
+
+/// A "still thinking" tick with a token count, sent about once a second; not worth keeping.
+fn is_thinking_ping(v: &Value) -> bool {
+    v["subtype"] == "thinking_tokens"
 }
 
 /// Expands a leading `~/` to the home directory.
@@ -1684,6 +1690,12 @@ mod tests {
     #[test]
     fn stream_lines_are_not_stored() {
         let line = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
+        let p = crate::runner::parse_line(line).unwrap();
+        assert!(line_event(&p).is_none());
+    }
+    #[test]
+    fn thinking_pings_are_not_stored() {
+        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":100}"#;
         let p = crate::runner::parse_line(line).unwrap();
         assert!(line_event(&p).is_none());
     }

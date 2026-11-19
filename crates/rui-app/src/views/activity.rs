@@ -427,12 +427,24 @@ impl ThreadsView {
         if rows.is_empty() {
             return vec![div().text_size(px(12.5)).text_color(th.muted).child("No steps yet.").into_any_element()];
         }
-        rows.iter().enumerate().map(|(i, r)| self.trace_row(i, r, th, cx)).collect()
+        let names = self.member_names(rows, cx);
+        rows.iter().enumerate().map(|(i, r)| self.trace_row(i, r, r.task_id.and_then(|t| names.get(&t).cloned()), th, cx)).collect()
     }
 
-    fn trace_row(&self, i: usize, r: &TraceRow, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// "Frontend Engineer 01" for each task in the rows, only when more than one task appears.
+    fn member_names(&self, rows: &[TraceRow], cx: &Context<Self>) -> HashMap<i64, String> {
+        let ids: HashSet<i64> = rows.iter().filter_map(|r| r.task_id).collect();
+        if ids.len() < 2 {
+            return HashMap::new();
+        }
+        let s = self.store.read(cx);
+        let name = |t: &Task| super::roster::member_name(t, &s.tasks, &s.roles).map(|n| (t.id, n));
+        s.tasks.iter().filter(|t| ids.contains(&t.id)).filter_map(name).collect()
+    }
+
+    fn trace_row(&self, i: usize, r: &TraceRow, who: Option<String>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.expanded.contains(&i);
-        let head = trace_head(i, r, open, th);
+        let head = trace_head(i, r, who, open, th);
         let head = match r.detail {
             Some(_) => head.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.toggle_row(i, cx))).into_any_element(),
             None => head.into_any_element(),
@@ -502,12 +514,18 @@ impl ThreadsView {
         self.input.update(cx, |i, cx| i.set_content(text, cx));
     }
 
+    /// The task's events, plus its steps' events for a split thread, oldest first.
     fn task_data(&self, id: i64, cx: &Context<Self>) -> (Vec<Event>, Vec<Change>) {
         let s = self.store.read(cx);
-        let events = match s.task_events.get(&id) {
-            Some(list) => list.clone(),
-            None => s.events.iter().filter(|e| e.task_id == Some(id)).cloned().collect(),
-        };
+        let steps = s.tasks.iter().filter(|t| t.parent_id == Some(id)).map(|t| t.id);
+        let mut events = Vec::new();
+        for tid in std::iter::once(id).chain(steps) {
+            match s.task_events.get(&tid) {
+                Some(list) => events.extend(list.iter().cloned()),
+                None => events.extend(s.events.iter().filter(|e| e.task_id == Some(tid)).cloned()),
+            }
+        }
+        events.sort_by_key(|e| e.id);
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
@@ -850,14 +868,16 @@ pub(super) fn chevron(open: bool, th: &Theme) -> impl IntoElement {
     svg().path("icons/chevron.svg").size(px(12.)).flex_none().text_color(th.muted).with_transformation(turn)
 }
 
-fn trace_head(i: usize, r: &TraceRow, open: bool, th: &Theme) -> Stateful<Div> {
+fn trace_head(i: usize, r: &TraceRow, who: Option<String>, open: bool, th: &Theme) -> Stateful<Div> {
     let kind_color = if r.error { th.block.fg } else { th.fg_2 };
     let kind = div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(kind_color).child(r.kind.label());
+    let who = who.map(|w| div().text_size(px(11.)).text_color(th.accent_text).child(w));
     let arrow = r.detail.as_ref().map(|_| chevron(open, th));
     let meta = div()
         .flex()
         .items_center()
         .gap(px(8.))
+        .children(who)
         .child(kind)
         .child(mono(10.5, th.muted, r.time.clone()))
         .child(div().flex_1())

@@ -413,11 +413,21 @@ impl Store {
 
     fn reload_changes(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.watched else { return };
+        let steps: Vec<i64> = self.tasks.iter().filter(|t| t.parent_id == Some(id)).map(|t| t.id).collect();
         cx.spawn(async move |this, cx| {
-            let fetch = async move { (api::changes(id).ok(), api::task_events(id).ok(), api::get_results(id).ok()) };
-            let (changes, events, results) = cx.background_executor().spawn(fetch).await;
+            let fetch = async move {
+                let steps: Vec<(i64, Vec<Event>)> = steps.into_iter().filter_map(|s| Some((s, api::task_events(s).ok()?))).collect();
+                (api::changes(id).ok(), api::task_events(id).ok(), api::get_results(id).ok(), steps)
+            };
+            let (changes, events, results, steps) = cx.background_executor().spawn(fetch).await;
             this.update(cx, |s, cx| {
                 let mut changed = false;
+                for (sid, list) in steps {
+                    if s.task_events.get(&sid) != Some(&list) {
+                        s.task_events.insert(sid, list);
+                        changed = true;
+                    }
+                }
                 if let Some(list) = changes.filter(|l| s.changes.get(&id) != Some(l)) {
                     s.changes.insert(id, list);
                     changed = true;
