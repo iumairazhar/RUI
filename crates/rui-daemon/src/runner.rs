@@ -186,15 +186,10 @@ async fn run_claude(
     stream(cmd, &bin, "claude", parse_line, on_line).await
 }
 
-/// Kills a whole process group when dropped, so an aborted, stopped or timed-out run takes its
-/// test runners and builds down with it. Disarmed once the agent exits on its own.
+/// Kills a whole process group when dropped, on every exit: an aborted, stopped or timed-out
+/// run takes its test runners and builds down with it, and a run that ends on its own leaves
+/// nothing it started in the background (for example `npm run dev &`).
 struct GroupKill(Option<u32>);
-
-impl GroupKill {
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
@@ -233,7 +228,7 @@ pub(crate) async fn stream(
         on_line(&p);
     }
     out.exit_ok = child.wait().await?.success();
-    group.disarm();
+    drop(group);
     let err = err_task.await.unwrap_or_default();
     if !out.exit_ok && out.result_text.is_none() {
         let start = err.len().saturating_sub(2048);
@@ -490,6 +485,19 @@ grep -q '"failIfUnavailable": true' "$f" && echo "{\"type\":\"result\",\"result\
         run.abort();
         let _ = run.await;
         assert!(wait_until(false, &marker).await, "the agent's child outlived the abort");
+    }
+
+    #[tokio::test]
+    async fn a_normal_exit_kills_what_the_agent_left_in_the_background() {
+        let d = tempfile::tempdir().unwrap();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        let marker = format!("600.{nanos:09}");
+        let agent = fake(d.path(), "bg.sh", &format!("sleep {marker} >/dev/null 2>&1 &\nexit 0"));
+        let mut cmd = Command::new("sh");
+        cmd.arg(&agent).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let out = stream(cmd, "bg.sh", "bg", parse_line, |_| {}).await.unwrap();
+        assert!(out.exit_ok);
+        assert!(wait_until(false, &marker).await, "the background sleep outlived the agent");
     }
 
     #[tokio::test]
