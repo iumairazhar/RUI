@@ -49,6 +49,9 @@ pub struct AgentRun {
     pub seat: Option<crate::seats::Seat>,
     /// Sandbox for Lead and member runs on Claude; the run's `cwd` is the worktree it fences in.
     pub sandbox: Option<crate::sandbox::Sandbox>,
+    /// For unsandboxed runs that read untrusted text (Rui chat, Scout): the data folder whose
+    /// private files the Read and Edit tools must not touch. Ignored when `sandbox` is set.
+    pub deny_secrets: Option<PathBuf>,
 }
 
 /// Final result of a turn.
@@ -179,9 +182,10 @@ async fn run_claude(
     let dir = crate::sandbox::RunDir::create()?;
     let cfg = dir.path().join("mcp.json");
     std::fs::write(&cfg, serde_json::to_vec(&mcp_config_json(&run.mcp_url))?).context("write mcp config")?;
-    let settings = match &run.sandbox {
-        Some(sb) => Some(crate::sandbox::write_settings(&dir, sb, &run.cwd)?),
-        None => None,
+    let settings = match (&run.sandbox, &run.deny_secrets) {
+        (Some(sb), _) => Some(crate::sandbox::write_settings(&dir, sb, &run.cwd)?),
+        (None, Some(data_dir)) => Some(crate::sandbox::write_deny_settings(&dir, data_dir)?),
+        (None, None) => None,
     };
     let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut cmd = command(&bin, run, &cfg, settings.as_deref())?;
@@ -274,7 +278,7 @@ fn track(out: &mut RunOutcome, p: &ParsedLine) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -295,6 +299,7 @@ mod tests {
             partial: false,
             seat: None,
             sandbox: None,
+            deny_secrets: None,
         }
     }
 
@@ -419,8 +424,50 @@ mod tests {
         p
     }
 
+    /// Fails when a run that has no business reading files could: no built-in tools at all,
+    /// and no Read, Bash or WebFetch among its allowed tools.
+    pub(crate) fn assert_no_file_or_web_tools(run: &AgentRun) {
+        assert_eq!(run.builtin_tools.as_deref(), Some(""), "built-in tools must stay off");
+        let bad = |t: &String| ["Read", "Bash", "WebFetch"].iter().any(|b| t == b || t.starts_with(&format!("{b}(")));
+        assert!(!run.allowed_tools.iter().any(bad), "{:?}", run.allowed_tools);
+    }
+
+    /// Serialises the tests that point RUI_CLAUDE_BIN at a fake binary.
+    pub(crate) static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Runs `run` against a fake claude that copies the file passed with `--settings`; returns
+    /// that file's JSON, or `None` when no `--settings` was passed.
+    pub(crate) async fn captured_settings(run: &AgentRun) -> Option<serde_json::Value> {
+        let _lock = BIN_LOCK.lock().await;
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("captured.json");
+        let body = format!(
+            "for a; do [ \"$prev\" = \"--settings\" ] && cp \"$a\" '{}'; prev=\"$a\"; done\necho '{{\"type\":\"result\",\"result\":\"ok\"}}'",
+            out.display()
+        );
+        let bin = fake(d.path(), "capture.sh", &body);
+        // SAFETY: BIN_LOCK keeps every test that sets this variable sequential.
+        unsafe { std::env::set_var("RUI_CLAUDE_BIN", &bin) };
+        let res = run_agent(run, |_| {}).await;
+        unsafe { std::env::remove_var("RUI_CLAUDE_BIN") };
+        res.unwrap();
+        std::fs::read(&out).ok().map(|b| serde_json::from_slice(&b).unwrap())
+    }
+
+    #[tokio::test]
+    async fn deny_secrets_passes_a_settings_file_with_only_the_deny_rules() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(captured_settings(&run(d.path())).await, None, "a plain run gets no settings");
+        let mut r = run(d.path());
+        r.deny_secrets = Some(d.path().to_path_buf());
+        let v = captured_settings(&r).await.expect("--settings passed");
+        let want = crate::sandbox::secret_deny_rules(&std::fs::canonicalize(d.path()).unwrap());
+        assert_eq!(v, serde_json::json!({ "permissions": { "deny": want } }));
+    }
+
     #[tokio::test]
     async fn fake_claude_success_and_failure() {
+        let _lock = BIN_LOCK.lock().await;
         let d = tempfile::tempdir().unwrap();
         let ok = fake(
             d.path(),

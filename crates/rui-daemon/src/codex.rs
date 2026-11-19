@@ -217,6 +217,7 @@ mod tests {
             partial: true,
             seat: None,
             sandbox: None,
+            deny_secrets: None,
         }
     }
 

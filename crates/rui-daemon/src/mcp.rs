@@ -2432,6 +2432,7 @@ mod tests {
             resume: None,
             seat: None,
             sandbox: None,
+            deny_secrets: None,
             partial: false,
         };
         let out = run_agent(&run, |l| {

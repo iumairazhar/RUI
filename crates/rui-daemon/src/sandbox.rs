@@ -112,6 +112,25 @@ pub fn run_settings(data_dir: &Path, worktree: &Path, repo: &Path, hosts: &[Stri
     })
 }
 
+/// Read and Edit deny rules for unsandboxed runs that read untrusted text (Rui chat, Scout).
+pub fn secret_deny_rules(data_dir: &Path) -> Vec<String> {
+    let d = data_dir.display();
+    let mut out = Vec::new();
+    for tool in ["Read", "Edit"] {
+        out.extend(["owner.token", "rui.db*", "seats.json", "clients/**"].map(|f| format!("{tool}(/{d}/{f})")));
+        out.extend(["~/.ssh/**", "~/.aws/**", "~/.config/gh/**"].map(|f| format!("{tool}({f})")));
+    }
+    out
+}
+
+/// Writes a settings file holding only [`secret_deny_rules`] into `dir`; returns its path.
+pub fn write_deny_settings(dir: &RunDir, data_dir: &Path) -> Result<PathBuf> {
+    let v = json!({ "permissions": { "deny": secret_deny_rules(&real(data_dir)) } });
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&v)?).context("write run settings")?;
+    Ok(path)
+}
+
 /// A private temp folder for one run's files, removed when dropped (end, abort or timeout).
 pub struct RunDir(PathBuf);
 
@@ -245,6 +264,17 @@ mod tests {
         let net = sb["network"].as_object().unwrap();
         assert_eq!(net.len(), 1, "no allowLocalBinding: {net:?}");
         assert_eq!(s(&net["allowedDomains"]), HOSTS);
+    }
+
+    #[test]
+    fn secret_deny_rules_cover_read_and_edit_with_absolute_paths() {
+        let want = [
+            "Read(//d/owner.token)", "Read(//d/rui.db*)", "Read(//d/seats.json)", "Read(//d/clients/**)",
+            "Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gh/**)",
+            "Edit(//d/owner.token)", "Edit(//d/rui.db*)", "Edit(//d/seats.json)", "Edit(//d/clients/**)",
+            "Edit(~/.ssh/**)", "Edit(~/.aws/**)", "Edit(~/.config/gh/**)",
+        ];
+        assert_eq!(secret_deny_rules(Path::new("/d")), want);
     }
 
     #[test]
@@ -389,6 +419,7 @@ mod tests {
             partial: false,
             seat: None,
             sandbox: Some(Sandbox { data_dir: real(&data), repo: real(&repo), hosts: hosts(&[]) }),
+            deny_secrets: None,
         };
         let mut seen = String::new();
         let mut tool_uses = 0;
@@ -459,6 +490,7 @@ mod tests {
             partial: false,
             seat: None,
             sandbox: Some(Sandbox { data_dir: real(&data), repo: real(&repo), hosts: hosts(&[]) }),
+            deny_secrets: None,
         };
         let mut seen = String::new();
         let mut tool_uses = 0;

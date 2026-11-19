@@ -1071,6 +1071,7 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
         partial: true,
         seat: None,
         sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
+        deny_secrets: None,
     })
 }
 
@@ -1282,6 +1283,7 @@ fn rui_decision_run(cfg: &Config, parent: &Task, prompt: String, system_prompt: 
         partial: true,
         seat: None,
         sandbox: None,
+        deny_secrets: None,
     }
 }
 
@@ -1419,6 +1421,7 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         partial: true,
         seat: None,
         sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
+        deny_secrets: None,
     };
     let cli = crate::codex::for_member(&cfg.data_dir, &client.name, task.agent.as_deref().unwrap_or("builder"));
     if cli == Cli::Codex && crate::sandbox::codex_refused() {
@@ -1685,6 +1688,15 @@ mod tests {
     }
     use crate::db::NewTask;
     use rui_core::SourceKind;
+
+    #[test]
+    fn rui_decide_runs_have_no_file_or_web_tools() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Split);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: "/tmp/d".into() };
+        crate::runner::tests::assert_no_file_or_web_tools(&rui_decision_run(&cfg, &t, "q".into(), String::new()));
+    }
 
     #[test]
     fn too_old_claude_stops_the_task_with_an_inbox_alert() {

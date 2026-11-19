@@ -179,6 +179,7 @@ fn scout_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64) -> Result<Age
         partial: false,
         seat: None,
         sandbox: None,
+        deny_secrets: Some(cfg.data_dir.clone()),
     })
 }
 
@@ -327,6 +328,19 @@ mod tests {
 
     fn scout_plans(db: &Db) -> Vec<Action> {
         plan(db, &HashSet::new()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scout_runs_get_the_secret_deny_settings() {
+        let (db, t) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let id = request(&db, t.id, "Which crate?", "lead").unwrap();
+        let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+        let mut run = scout_run(&db, &cfg, t.id, id).unwrap();
+        run.cwd = data.path().to_path_buf();
+        let v = crate::runner::tests::captured_settings(&run).await.expect("--settings passed");
+        let want = crate::sandbox::secret_deny_rules(&std::fs::canonicalize(data.path()).unwrap());
+        assert_eq!(v["permissions"]["deny"], serde_json::json!(want));
     }
 
     #[test]

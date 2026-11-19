@@ -128,6 +128,7 @@ fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
         partial: false,
         seat: None,
         sandbox: None,
+        deny_secrets: None,
     })
 }
 
@@ -335,6 +336,13 @@ mod tests {
         client_state::ensure(data.path(), "acme", "/tmp/acme", None).unwrap();
         let t = task(&db, c.id, None, TaskStatus::Done);
         (db, data, t)
+    }
+
+    #[test]
+    fn coach_runs_have_no_file_or_web_tools() {
+        let (db, data, t) = setup();
+        let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+        crate::runner::tests::assert_no_file_or_web_tools(&coach_run(&db, &cfg, t.id).unwrap());
     }
 
     fn coach_plans(db: &Db) -> Vec<Action> {
