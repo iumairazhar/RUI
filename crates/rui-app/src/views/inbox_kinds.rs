@@ -128,10 +128,11 @@ pub fn acts_of(k: Kind) -> Vec<ItemAct> {
     }
 }
 
-/// The reason line under the title; deploy kinds show theirs inside the warning box instead.
+/// The reason line under the title, cut to one short line; deploy kinds show theirs inside the
+/// warning box instead. The full text is one tap away in the item's drawer.
 pub fn reason(it: &InboxItem) -> Option<String> {
     let own_box = matches!(kind_of(&it.kind), Kind::Deploy | Kind::DeployFailed);
-    (!own_box && !it.reason.is_empty()).then(|| it.reason.clone())
+    (!own_box && !it.reason.is_empty()).then(|| super::decision::short_why(&it.reason))
 }
 
 /// The item's longer text: markdown for reports, briefs, emails and unknown kinds; a quote for a proposal;

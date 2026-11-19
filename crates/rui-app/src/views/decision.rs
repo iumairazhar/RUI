@@ -224,7 +224,8 @@ pub fn rung_chip(who: String, why: Option<String>, th: &Theme) -> Div {
 
 /// "Pod · why → Account Lead · why → You" as chips.
 pub fn ladder_row(ladder: &[Rung], th: &Theme) -> Div {
-    let parts = ladder_parts(ladder);
+    let parts = ladder_parts(ladder).into_iter().map(|(who, why)| (who, why.map(|w| short_why(&w))));
+    let parts: Vec<_> = parts.collect();
     let last = parts.len() - 1;
     let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
     for (i, (who, why)) in parts.into_iter().enumerate() {
@@ -234,6 +235,16 @@ pub fn ladder_row(ladder: &[Rung], th: &Theme) -> Div {
         }
     }
     row
+}
+
+/// A rung's reason on one line: its first line, cut to 80 characters with an ellipsis.
+pub fn short_why(why: &str) -> String {
+    let line = why.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.chars().count() <= 80 {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(80).collect();
+    format!("{}\u{2026}", cut.trim_end())
 }
 
 /// First non-empty line, without markdown marks.
@@ -260,6 +271,8 @@ pub struct DecisionCard {
     why: Entity<TextInput>,
     /// "Ask for changes" was clicked and its input is showing.
     reveal: bool,
+    /// The "Show details" fold is open.
+    details: bool,
 }
 
 impl EventEmitter<CardEvent> for DecisionCard {}
@@ -271,7 +284,7 @@ impl DecisionCard {
         cx.subscribe(&answer, |this, _, _: &Submit, cx| this.submit(cx)).detach();
         let why = cx.new(|cx| TextInput::new(WHY_HINT, cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.submit(cx)).detach();
-        Self { store, data: None, compact, answer, why, reveal: false }
+        Self { store, data: None, compact, answer, why, reveal: false, details: false }
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -431,21 +444,41 @@ impl DecisionCard {
         Some(link.on_click(cx.listener(|this, _, _, cx| this.review_click(cx))).into_any_element())
     }
 
-    fn full(&self, c: &CardData, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let d = &c.decision;
-        let ask = markdown::render(&d.ask, th.fg, 13.5, th);
+    fn details_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let label = if self.details { "Hide details" } else { "Show details" };
+        let chip = chip("decision-details", label, cx);
+        let chip = chip.on_click(cx.listener(|this, _, _, cx| {
+            this.details = !this.details;
+            cx.notify();
+        }));
+        div().flex().child(chip).into_any_element()
+    }
+
+    /// The folded part: why the Lead couldn't decide, the ladder, the long text, the plan and the review link.
+    fn details_block(&self, d: &Decision, th: &Theme, cx: &mut Context<Self>) -> Div {
         let why = (!d.why.trim().is_empty()).then(|| {
             let text = div().text_size(px(12.5)).text_color(th.fg_2).child(d.why.clone());
             div().flex().flex_col().gap(px(4.)).child(heading("Why the Lead couldn't decide", th)).child(text)
         });
         let ladder = (!d.ladder.is_empty()).then(|| ladder_row(&d.ladder, th));
+        let long = (!d.details.trim().is_empty()).then(|| div().max_w(px(660.)).child(markdown::render(&d.details, th.fg_2, 12.5, th)));
+        let block = div().flex().flex_col().gap(px(12.)).children(why).children(ladder).children(long);
+        block.children(if_approved(&d.if_approved, th)).children(self.review_link(d, th, cx))
+    }
+
+    fn full(&self, c: &CardData, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let d = &c.decision;
+        let ask = markdown::render(&d.ask, th.fg, 13.5, th);
         let card = card_shell(format!("decision-{}", c.key()), th).child(eyebrow(&c.client, th)).child(ask);
-        let card = card.child(meta_row(d, th)).children(why).children(ladder).children(if_approved(&d.if_approved, th));
-        let card = card.children(self.review_link(d, th, cx));
-        match self.held(cx) {
-            Some((event_id, left)) => card.child(self.undo_row(event_id, left, th, cx)).into_any_element(),
-            None => card.children(self.actions(d, th, cx)).into_any_element(),
-        }
+        let card = card.child(meta_row(d, th));
+        // Picks sit right under the question; the long story folds away below them.
+        let card = match self.held(cx) {
+            Some((event_id, left)) => card.child(self.undo_row(event_id, left, th, cx)),
+            None => card.children(self.actions(d, th, cx)),
+        };
+        let card = card.child(self.details_chip(cx));
+        let card = if self.details { card.child(self.details_block(d, th, cx)) } else { card };
+        card.into_any_element()
     }
 
     fn compact(&self, c: &CardData, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -564,6 +597,13 @@ mod tests {
         assert_eq!((risk_label("high"), risk_label("")), ("High risk", "Risk unknown"));
         assert_eq!(reversible_text(Some(false)), Some("Can't be undone"));
         assert_eq!(reversible_text(None), None);
+    }
+
+    #[test]
+    fn short_why_takes_first_line_and_cuts_at_80() {
+        assert_eq!(short_why("\n  commercial call\nsecond line"), "commercial call");
+        assert_eq!(short_why(&"a".repeat(80)), "a".repeat(80));
+        assert_eq!(short_why(&"a".repeat(81)), format!("{}\u{2026}", "a".repeat(80)));
     }
 
     #[test]

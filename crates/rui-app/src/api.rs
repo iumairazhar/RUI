@@ -609,6 +609,9 @@ pub struct Decision {
     pub question_id: Option<i64>,
     #[serde(default)]
     pub ask: String,
+    /// The long original text, folded away on the card.
+    #[serde(default)]
+    pub details: String,
     #[serde(default)]
     pub why: String,
     #[serde(default)]

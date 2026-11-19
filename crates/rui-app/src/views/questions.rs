@@ -219,7 +219,7 @@ impl QuestionsView {
         let task = it.task_id.and_then(|id| s.tasks.iter().find(|t| t.id == id));
         let color = th.client_color(task.map_or(0, |t| t.client_id));
         let face = char_state(word);
-        Some(Row { open, id: it.id, key, rise, color, face, title: first_line(&it.title), sub: it.reason.clone(), tag, word })
+        Some(Row { open, id: it.id, key, rise, color, face, title: first_line(&it.title), sub: decision::short_why(&it.reason), tag, word })
     }
 }
 
