@@ -1,7 +1,7 @@
 //! The Inspector: a glass panel that slides in from the right with one Flow node's story and controls.
 
 use super::flow::node_style;
-use super::{ThreadsView, mono, section, summarize};
+use super::{ThreadsView, is_empty_turn, mono, section, summarize};
 use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
 use crate::views::decision::{CardData, first_line};
@@ -33,8 +33,9 @@ pub fn merge(old: Option<Inspector>, new: Inspector, append: bool) -> Inspector 
 }
 
 /// Events split into what happened and the tool calls behind it.
+/// (what happened, tool calls); turns with nothing to show are left out.
 pub fn split_events(evs: &[Event]) -> (Vec<&Event>, Vec<&Event>) {
-    evs.iter().partition(|e| e.kind != "tool_call")
+    evs.iter().filter(|e| !is_empty_turn(e)).partition(|e| e.kind != "tool_call")
 }
 
 /// "$0.25"
@@ -367,6 +368,16 @@ mod tests {
         assert_eq!((happened.len(), tools.len()), (1, 1));
         assert_eq!(tool_line(tools[0]), r#"log_decision({"line":"x"})"#);
         assert_eq!(tool_line(&ev(3, "tool_call", json!({}))), "tool()");
+    }
+
+    #[test]
+    fn empty_assistant_turns_are_hidden() {
+        let think = json!({"message": {"content": [{"type": "thinking", "thinking": "hmm"}]}});
+        let said = json!({"message": {"content": [{"type": "text", "text": "Splitting it"}]}});
+        let used = json!({"message": {"content": [{"type": "tool_use", "name": "mark_split", "input": {}}]}});
+        let evs = vec![ev(1, "assistant", think), ev(2, "assistant", said), ev(3, "assistant", used)];
+        let (happened, _) = split_events(&evs);
+        assert_eq!(happened.iter().map(|e| e.id).collect::<Vec<_>>(), [2, 3]);
     }
 
     #[test]

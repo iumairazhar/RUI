@@ -55,6 +55,12 @@ fn tool_use_part(block: &Value) -> String {
     format!("→ {name}({})", truncate(&input, 80))
 }
 
+/// True for an assistant turn with no text and no tool use (for example only thinking):
+/// it has nothing to show.
+pub fn is_empty_turn(e: &Event) -> bool {
+    e.kind == "assistant" && !content_blocks(&e.payload).iter().any(|b| b["type"] == "text" || b["type"] == "tool_use")
+}
+
 fn summarize_assistant(payload: &Value) -> String {
     let blocks = content_blocks(payload);
     let text: Vec<&str> = blocks
