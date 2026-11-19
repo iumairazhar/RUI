@@ -181,6 +181,9 @@ impl Root {
                 let changes = store.update(cx, |s, _| std::mem::take(&mut s.open_changes));
                 this.activity.update(cx, |v, cx| if changes { v.show_changes(id, cx) } else { v.open_thread(id, cx) });
             }
+            if let Some(id) = store.update(cx, |s, _| s.open_question.take()) {
+                this.open_in_inbox(id, cx);
+            }
             if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
                 this.results.update(cx, |v, cx| v.open(req, cx));
             }
@@ -327,6 +330,15 @@ impl Root {
             self.inbox.update(cx, |p, cx| p.close(cx));
         }
         self.select(Nav::Cost, cx);
+    }
+
+    /// Switch to the Inbox page with one question open, closing the slide-over.
+    fn open_in_inbox(&mut self, qid: i64, cx: &mut Context<Self>) {
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
+        }
+        self.select(Nav::Inbox, cx);
+        self.questions.update(cx, |q, cx| q.open_kind("question", qid, cx));
     }
 
     fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {

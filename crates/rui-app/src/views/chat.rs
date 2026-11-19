@@ -4,7 +4,7 @@ use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
 use super::chat_tools::{ToolCall, results_by_id, tool_calls, tool_output, tool_row_head};
 use super::library::confirm_modal;
-use super::{chip, markdown, primary_button, question_card};
+use super::{chip, markdown, primary_button};
 use crate::api::LiveState;
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 pub struct ChatView {
     store: Entity<Store>,
     input: Entity<TextInput>,
-    answers: HashMap<i64, Entity<TextInput>>,
     ask_inputs: AskInputs,
     scroll: ScrollHandle,
     last_len: usize,
@@ -38,7 +37,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new() }
+        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new() }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -73,44 +72,21 @@ impl ChatView {
         self.store.update(cx, |s, cx| s.send_chat(text, cx));
     }
 
-    fn sync_inputs(&mut self, questions: &[Question], cx: &mut Context<Self>) {
-        self.answers.retain(|id, _| questions.iter().any(|q| q.id == *id));
-        for q in questions {
-            if self.answers.contains_key(&q.id) {
-                continue;
-            }
-            let id = q.id;
-            let input = cx.new(|cx| TextInput::new("Your answer...", cx));
-            cx.subscribe(&input, move |this, _, _: &Submit, cx| this.answer(id, cx)).detach();
-            self.answers.insert(id, input);
-        }
-    }
-
-    fn answer(&mut self, id: i64, cx: &mut Context<Self>) {
-        let Some(input) = self.answers.get(&id).cloned() else { return };
-        let text = input.read(cx).content();
-        if text.trim().is_empty() {
-            return;
-        }
-        input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.answer(id, text, None, cx));
-    }
-
     /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
     fn answer_ask(&mut self, id: i64, text: Option<String>, cx: &mut Context<Self>) {
         let Some(text) = text.or_else(|| self.ask_inputs.take(id, cx)) else { return };
         self.store.update(cx, |s, cx| s.answer_ask(id, text, cx));
     }
 
+    /// A calm one-line pointer to an open owner question; answering happens in the Inbox.
     fn question(&self, q: &Question, cx: &mut Context<Self>) -> AnyElement {
-        let id = q.id;
-        let input = match self.answers.get(&id) {
-            Some(i) => i.clone().into_any_element(),
-            None => div().into_any_element(),
-        };
-        let btn = chip(format!("answer-{id}"), "Answer", cx)
-            .on_click(cx.listener(move |this, _, _, cx| this.answer(id, cx)));
-        question_card(&q.text, None, input, btn.into_any_element(), cx).into_any_element()
+        let (id, th) = (q.id, theme(cx).clone());
+        let icon = svg().path("icons/hand.svg").flex_none().size(px(15.)).text_color(th.wait.fg);
+        let text = div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(th.wait.fg).child(pointer_text(&q.text));
+        let go = chip(format!("answer-{id}"), "Answer in Inbox", cx)
+            .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_question(id, cx))));
+        let row = div().flex().items_center().gap(px(10.)).max_w(px(660.)).px(px(12.)).py(px(10.)).rounded(px(9.));
+        row.bg(th.wait.dim).border_1().border_color(th.wait.rim).child(icon).child(text).child(go).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -447,6 +423,16 @@ fn place_asks(chat: &[ChatMessage], asks: &[ChatAsk]) -> HashMap<i64, Vec<ChatAs
 }
 
 /// "✓ question — You chose: answer".
+/// A question's first line, cut to 100 characters with an ellipsis.
+fn pointer_text(text: &str) -> String {
+    let line = super::decision::first_line(text);
+    if line.chars().count() <= 100 {
+        return line;
+    }
+    let cut: String = line.chars().take(100).collect();
+    format!("{}\u{2026}", cut.trim_end())
+}
+
 fn answered_text(a: &ChatAsk) -> String {
     match a.answer.as_deref().filter(|t| !t.is_empty()) {
         Some(answer) => format!("\u{2713} {} \u{2014} You chose: {answer}", a.text),
@@ -658,7 +644,6 @@ impl Render for ChatView {
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
             (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks, tools, live_calls)
         };
-        self.sync_inputs(&questions, cx);
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
         self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
         if current != self.last_chat {

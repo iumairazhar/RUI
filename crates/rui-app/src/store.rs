@@ -109,6 +109,8 @@ pub struct Store {
     pub open_threads: bool,
     /// Thread to open once the root has switched to Threads; the root clears it.
     pub open_task: Option<i64>,
+    /// Question to open on the Inbox page; the root switches there and clears it.
+    pub open_question: Option<i64>,
     /// Selected sub-tab of each rail section, by section key.
     pub tabs: HashMap<&'static str, usize>,
     /// Toast confirming the last owner action; hides after a few seconds.
@@ -248,6 +250,7 @@ impl Store {
             roles: vec![],
             open_threads: false,
             open_task: None,
+            open_question: None,
             tabs: HashMap::new(),
             toast: None,
             sending: HashMap::new(),
@@ -300,6 +303,12 @@ impl Store {
     /// Ask the root to switch to the Threads page.
     pub fn go_to_threads(&mut self, cx: &mut Context<Self>) {
         self.open_threads = true;
+        cx.notify();
+    }
+
+    /// Ask the root to switch to the Inbox page and open one question there.
+    pub fn open_question(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_question = Some(id);
         cx.notify();
     }
 
