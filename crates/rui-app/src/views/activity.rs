@@ -23,6 +23,7 @@ use super::{chip, markdown, primary_button, tag};
 use super::decision::{self, CardEvent, Cards};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
+use super::inbox::is_snoozed;
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
@@ -395,7 +396,9 @@ impl ThreadsView {
     fn needs_cards(&self, cx: &Context<Self>) -> Vec<decision::CardData> {
         let s = self.store.read(cx);
         let ids: Vec<i64> = s.threads.iter().filter(|t| t.needs_you_count > 0).map(|t| t.id).collect();
-        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).collect();
+        let now = crate::store::now_secs();
+        let awake = |c: &decision::CardData| c.decision.question_id.is_none_or(|q| !is_snoozed(&s.snoozed, &("question".into(), q), now));
+        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).filter(awake).collect();
         let mut cards = decision::with_sending(cards, s, |_| true);
         decision::sort_cards(&mut cards);
         cards

@@ -6,7 +6,8 @@ use super::chat_tools::{ToolCall, results_by_id, tool_calls, tool_output, tool_r
 use super::library::confirm_modal;
 use super::{chip, markdown, primary_button};
 use crate::api::LiveState;
-use crate::store::{self, Store};
+use super::inbox::is_snoozed;
+use crate::store::{self, ItemKey, Store, now_secs};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{
@@ -642,7 +643,7 @@ impl Render for ChatView {
             let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
             let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
-            let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat);
+            let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat, &s.snoozed);
             (s.chat.clone(), s.chats.clone(), s.current_chat, questions, live, state, cards, asks, tools, live_calls)
         };
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
@@ -687,9 +688,11 @@ fn source_message(task_id: i64, tasks: &[Task]) -> Option<i64> {
 }
 
 /// Open questions from threads started in this chat; the rest live only in the Inbox.
-fn questions_in_chat(questions: &[Question], tasks: &[Task], chat: &[ChatMessage]) -> Vec<Question> {
+/// Snoozed questions stay hidden here too.
+fn questions_in_chat(questions: &[Question], tasks: &[Task], chat: &[ChatMessage], snoozed: &HashMap<ItemKey, i64>) -> Vec<Question> {
     let here = |q: &&Question| source_message(q.task_id, tasks).is_some_and(|m| chat.iter().any(|c| c.id == m));
-    questions.iter().filter(here).cloned().collect()
+    let awake = |q: &&Question| !is_snoozed(snoozed, &("question".to_string(), q.id), now_secs());
+    questions.iter().filter(here).filter(awake).cloned().collect()
 }
 
 #[cfg(test)]
@@ -715,9 +718,11 @@ mod tests {
         let tasks = vec![task(22, None, Some("chat:7")), task(23, Some(22), Some("task:22")), task(30, None, None)];
         let qs = vec![question(1, 23), question(2, 30), question(3, 99)];
         let here: Vec<ChatMessage> = vec![serde_json::from_value(json!({"id": 7, "chat_id": 4, "role": "user", "content": "go", "created_at": ""})).unwrap()];
-        let ids: Vec<i64> = questions_in_chat(&qs, &tasks, &here).iter().map(|q| q.id).collect();
+        let ids: Vec<i64> = questions_in_chat(&qs, &tasks, &here, &HashMap::new()).iter().map(|q| q.id).collect();
         assert_eq!(ids, [1]);
-        assert!(questions_in_chat(&qs, &tasks, &[]).is_empty());
+        assert!(questions_in_chat(&qs, &tasks, &[], &HashMap::new()).is_empty());
+        let snoozed = HashMap::from([(("question".to_string(), 1), i64::MAX)]);
+        assert!(questions_in_chat(&qs, &tasks, &here, &snoozed).is_empty());
     }
 
     #[test]

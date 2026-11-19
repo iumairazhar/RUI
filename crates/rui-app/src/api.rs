@@ -20,7 +20,7 @@ pub fn base_url() -> String {
 const OWNER_HEADER: &str = "x-rui-owner";
 
 /// The daemon's data folder (`RUI_DATA_DIR` or the default), where it writes `owner.token`.
-fn data_dir() -> std::path::PathBuf {
+pub fn data_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("RUI_DATA_DIR") {
         return dir.into();
     }

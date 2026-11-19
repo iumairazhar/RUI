@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 mod support;
+pub mod snooze_file;
 
 const MAX_EVENTS: usize = 300;
 const FIRST_EVENT_LIMIT: usize = 200;
@@ -117,7 +118,7 @@ pub struct Store {
     pub toast: Option<Toast>,
     /// Answers still inside their undo window, by question id.
     pub sending: HashMap<i64, Sending>,
-    /// Inbox items hidden until a unix time. Kept in memory only: the app has no saved prefs yet.
+    /// Inbox items hidden until a unix time, saved in `snoozes.json`.
     pub snoozed: HashMap<ItemKey, i64>,
     /// Set with `open_task` to show the task page's Changes tab; the root clears it.
     pub open_changes: bool,
@@ -254,7 +255,7 @@ impl Store {
             tabs: HashMap::new(),
             toast: None,
             sending: HashMap::new(),
-            snoozed: HashMap::new(),
+            snoozed: snooze_file::load(&snooze_file::path()),
             open_changes: false,
             needs_marks: HashMap::new(),
             watched: None,
@@ -599,12 +600,14 @@ impl Store {
     /// Hide an inbox item until `until` (unix seconds).
     pub fn snooze(&mut self, key: ItemKey, until: i64, cx: &mut Context<Self>) {
         self.snoozed.insert(key, until);
+        snooze_file::save(&snooze_file::path(), &self.snoozed, now_secs());
         self.show_toast("Snoozed", vec![], cx);
     }
 
     /// Show a snoozed inbox item again.
     pub fn unsnooze(&mut self, key: &ItemKey, cx: &mut Context<Self>) {
         self.snoozed.remove(key);
+        snooze_file::save(&snooze_file::path(), &self.snoozed, now_secs());
         cx.notify();
     }
 
