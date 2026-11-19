@@ -281,9 +281,11 @@ impl ThreadsView {
     }
 }
 
+/// The panel floats over the thread. gpui has no backdrop blur, so it uses the mock's
+/// no-blur fallback (a 97% solid surface) instead of see-through glass.
 fn panel_shell(th: &Theme) -> Stateful<Div> {
     let side = div().id("inspector-panel").occlude().absolute().right(px(10.)).top(px(10.)).bottom(px(10.)).w(px(PANEL_W));
-    let side = side.flex().flex_col().overflow_hidden().rounded(px(16.)).bg(th.glass);
+    let side = side.flex().flex_col().overflow_hidden().rounded(px(16.)).bg(th.surface.opacity(0.97));
     side.shadow(th.card_shadow()).border_1().border_color(th.glass_rim)
 }
 

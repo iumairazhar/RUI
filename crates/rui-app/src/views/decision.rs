@@ -214,10 +214,12 @@ pub fn ladder_text(ladder: &[Rung]) -> String {
 
 /// One rung: bold who, then the reason.
 pub fn rung_chip(who: String, why: Option<String>, th: &Theme) -> Div {
-    let who = div().font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(who);
-    let chip = div().flex().gap(px(5.)).px(px(9.)).py(px(4.)).rounded(px(7.)).max_w(px(560.));
+    let who = div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(who);
+    // Never wider than the card it sits in; the why text wraps instead of pushing the card wide.
+    let chip = div().flex().min_w_0().gap(px(5.)).px(px(9.)).py(px(4.)).rounded(px(7.)).max_w(gpui::relative(1.));
     let chip = chip.bg(th.fg.opacity(0.08)).text_size(px(11.)).text_color(th.muted).child(who);
-    chip.children(why.map(|w| format!("\u{b7} {w}")))
+    let why = why.map(|w| div().flex_1().min_w_0().whitespace_normal().child(format!("\u{b7} {w}")));
+    chip.children(why)
 }
 
 /// "Pod · why → Account Lead · why → You" as chips.
@@ -377,7 +379,7 @@ fn if_approved(steps: &[String], th: &Theme) -> Option<Div> {
 }
 
 fn field(input: Entity<TextInput>, th: &Theme) -> Div {
-    div().px(px(10.)).py(px(4.)).rounded(px(8.)).bg(th.well).border_1().border_color(th.hairline).child(input)
+    div().min_w_0().overflow_hidden().px(px(10.)).py(px(4.)).rounded(px(8.)).bg(th.well).border_1().border_color(th.hairline).child(input)
 }
 
 fn card_shell(id: String, th: &Theme) -> Stateful<Div> {
