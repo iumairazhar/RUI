@@ -1,6 +1,6 @@
 //! RUI daemon entry point: HTTP API, MCP server, scheduler and chat loop.
 
-use rui_daemon::{api, apps, chat, db::Db, deploy, live, mcp, owner_auth, roster, scheduler, seat, skills, state};
+use rui_daemon::{api, apps, chat, cli_version, db::Db, deploy, live, mcp, owner_auth, roster, scheduler, seat, skills, state};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ async fn main() {
         eprintln!("create data dir: {e}");
         std::process::exit(1);
     }
+    cli_version::init();
     let db = match Db::open(&state::db_path()) {
         Ok(db) => Arc::new(db),
         Err(e) => {

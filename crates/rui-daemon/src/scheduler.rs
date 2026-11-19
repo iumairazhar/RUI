@@ -1134,11 +1134,19 @@ fn review_prompt(db: &Db, data_dir: &Path, task: &Task, client: &Client) -> Resu
     ))
 }
 
-/// When a Claude run stopped at startup because no sandbox is available, stops the task with
-/// reason "sandbox unavailable" and returns true. The run is never retried unsandboxed.
+/// When a Claude run stopped at startup because no sandbox is available, or was refused
+/// because Claude Code is too old, stops the task with that reason and returns true. The run
+/// is never retried unsandboxed.
 fn sandbox_missing(db: &Db, task_id: i64, res: &Result<RunOutcome>) -> Result<bool> {
-    let Some(text) = limit_text(res).filter(|t| crate::sandbox::unavailable_text(t)) else { return Ok(false) };
-    stop_for_sandbox(db, task_id, &text, crate::sandbox::UNAVAILABLE)?;
+    let Some(text) = limit_text(res) else { return Ok(false) };
+    let reason = if text.starts_with(crate::cli_version::TOO_OLD) {
+        crate::cli_version::TOO_OLD
+    } else if crate::sandbox::unavailable_text(&text) {
+        crate::sandbox::UNAVAILABLE
+    } else {
+        return Ok(false);
+    };
+    stop_for_sandbox(db, task_id, &text, reason)?;
     Ok(true)
 }
 
@@ -1677,6 +1685,22 @@ mod tests {
     }
     use crate::db::NewTask;
     use rui_core::SourceKind;
+
+    #[test]
+    fn too_old_claude_stops_the_task_with_an_inbox_alert() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Clarifying);
+        let why = crate::cli_version::refusal(true, Some("Claude Code 2.1.200 is installed; v2.1.314 or later is needed")).unwrap();
+        assert!(sandbox_missing(&db, t.id, &Err(anyhow::anyhow!(why))).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(t.id), 10).unwrap();
+        let e = events.iter().find(|e| e.kind == "agent_error").unwrap();
+        assert_eq!(e.payload["reason"], crate::cli_version::TOO_OLD);
+        let items = crate::inbox::inbox(&db).unwrap();
+        let item = items.iter().find(|i| i.kind == "claude_too_old").unwrap();
+        assert!(item.title.contains("v2.1.314"), "{}", item.title);
+    }
 
     #[test]
     fn missing_sandbox_stops_the_task_and_other_failures_do_not() {

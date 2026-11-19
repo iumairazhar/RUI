@@ -172,6 +172,9 @@ async fn run_claude(
     token: &str,
     on_line: impl FnMut(&ParsedLine),
 ) -> anyhow::Result<RunOutcome> {
+    if let Some(why) = crate::cli_version::refusal(run.sandbox.is_some(), crate::cli_version::problem().as_deref()) {
+        bail!(why);
+    }
     // Removed when this future ends or is dropped, so an aborted run leaves no files behind.
     let dir = crate::sandbox::RunDir::create()?;
     let cfg = dir.path().join("mcp.json");

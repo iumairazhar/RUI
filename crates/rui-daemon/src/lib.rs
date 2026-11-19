@@ -2,6 +2,7 @@ pub mod api;
 pub mod apps;
 pub mod asks;
 pub mod chat;
+pub mod cli_version;
 pub mod client_state;
 pub mod codex;
 pub mod coach;

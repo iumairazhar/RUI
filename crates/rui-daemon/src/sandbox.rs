@@ -160,6 +160,7 @@ fn alert(reason: &str) -> Option<(&'static str, &'static str)> {
     match reason {
         UNAVAILABLE => Some(("sandbox_unavailable", "Agents can't run: the sandbox isn't available on this machine")),
         CODEX_REFUSED => Some(("codex_unsandboxed", "Codex runs can still read RUI's data folder; use Claude for this client")),
+        crate::cli_version::TOO_OLD => Some(("claude_too_old", "Agents can't run: update Claude Code to v2.1.314 or later")),
         _ => None,
     }
 }
