@@ -43,7 +43,7 @@ fn question_items(db: &Db) -> Result<Vec<InboxItem>> {
             kind: "question",
             id: q.id,
             task_id: Some(q.task_id),
-            title: first_line(&q.text),
+            title: crate::thread::owner_short(db, &q).unwrap_or_else(|| first_line(&q.text)),
             reason: q.ladder.last().map(|r| r.why.clone()).unwrap_or_else(|| q.asked_by.as_str().to_string()),
             actions: vec![],
             created_at: q.created_at,
@@ -245,6 +245,18 @@ mod tests {
         let stuck_items = find("stuck");
         assert_eq!((stuck_items.len(), stuck_items[0].id), (1, stuck.id));
         assert_eq!(stuck_items[0].actions, ["Retry", "New instructions", "Drop it"]);
+    }
+
+    #[test]
+    fn question_title_uses_the_short_question() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = make(&db, c.id, None, TaskStatus::Stuck);
+        let q = db.create_ladder_question(t.id, Role::Lead, "owner", &[], "Long text\nmore").unwrap();
+        let p = json!({"question_id": q.id, "from": "rui", "to": "owner", "why": "w", "question": "Short one?"});
+        db.add_event(Some(t.id), "scheduler", "escalated", &p).unwrap();
+        let items = inbox(&db).unwrap();
+        assert_eq!(items.iter().find(|i| i.kind == "question").unwrap().title, "Short one?");
     }
 
     #[test]

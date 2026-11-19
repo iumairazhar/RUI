@@ -42,6 +42,7 @@ with short quick-answer options when the answer is a choice, then STOP.
 Never ask and create a task in the same turn. Create it only after the owner
 has answered, or says "just do it". Don't ask about things you can sensibly
 decide yourself.
+Keep the question to one short sentence; put any background in your chat message, not in the question.
 
 The Pod
 Each client has one Pod, saved and reused for every task. Roles: {role_catalog}.

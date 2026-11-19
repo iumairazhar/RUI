@@ -14,9 +14,9 @@ pub const REVIEW_REASON: &str = "Finished, review the result";
 pub const PR_CLOSED_REASON: &str = "PR closed without merge";
 const CAUSES: [&str; 8] =
     ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "pr_closed"];
-const KINDS: [&str; 13] = [
+const KINDS: [&str; 14] = [
     "stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "resumed", "dropped",
-    "reviewed", "pr_closed", "pr_merged", "forwarded",
+    "reviewed", "pr_closed", "pr_merged", "forwarded", "escalated",
 ];
 
 /// What the owner sees for one task.
@@ -84,7 +84,8 @@ fn state_in(task: &Task, facts: &Facts, all: &[Task]) -> OwnerState {
 
 fn decide(t: &Task, facts: &Facts, all: &[Task]) -> (&'static str, String) {
     if let Some(q) = facts.questions.get(&t.id) {
-        return ("Needs you", first_line(&q.text));
+        let short = crate::thread::owner_escalation(facts.events_of(t.id), q).and_then(|e| crate::thread::short_question(&e.payload));
+        return ("Needs you", short.unwrap_or_else(|| first_line(&q.text)));
     }
     if parent_dropped(t, facts) {
         return ("Done", "Dropped by you".into());

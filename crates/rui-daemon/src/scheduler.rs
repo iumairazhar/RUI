@@ -1173,7 +1173,8 @@ pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: O
          Output of the member's last check:\n{check}\n\n\
          Task brief: {brief}\nPod: {pod}\n\n\
          Owner answers on this task:\n{owner}\n\n\
-         Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why). \
+         Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why, question, options), \
+         where question is one short plain sentence for the owner and options are 2 to 4 short answers, recommendation first. \
          You must call one of them.",
         id = q.id,
         mid = member.id,

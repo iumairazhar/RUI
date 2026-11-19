@@ -46,6 +46,8 @@ pub struct Decision {
     pub source: &'static str,
     pub question_id: Option<i64>,
     pub ask: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub details: String,
     pub why: String,
     pub ladder: Vec<Rung>,
     pub risk: &'static str,
@@ -391,7 +393,7 @@ fn review_nodes(ctx: &Ctx) -> Vec<Node> {
 
 fn decision(source: &'static str, ask: String, actions: &[&str]) -> Decision {
     Decision {
-        source, question_id: None, ask, why: String::new(), ladder: vec![], risk: "unknown", reversible: None,
+        source, question_id: None, ask, details: String::new(), why: String::new(), ladder: vec![], risk: "unknown", reversible: None,
         if_approved: vec![], options: vec![], review: None, actions: actions.iter().map(|a| a.to_string()).collect(), undo_secs: 0,
     }
 }
@@ -410,6 +412,30 @@ fn meta_from(payload: &serde_json::Value) -> (&'static str, Option<bool>, Vec<St
 
 fn apply_meta(d: &mut Decision, payload: &serde_json::Value) {
     (d.risk, d.reversible, d.if_approved) = meta_from(payload);
+    if let Some(short) = short_question(payload) {
+        d.details = std::mem::replace(&mut d.ask, short);
+    }
+    if let Some(opts) = payload["options"].as_array() {
+        d.options = opts.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    }
+}
+
+/// The newest `escalated` event that sent question `q` to the owner, among `events`.
+pub fn owner_escalation<'a>(events: impl IntoIterator<Item = &'a Event>, q: &Question) -> Option<&'a Event> {
+    let to_owner = |e: &&Event| e.kind == "escalated" && e.payload["question_id"] == q.id && e.payload["to"] == "owner";
+    events.into_iter().filter(to_owner).max_by_key(|e| e.id)
+}
+
+/// The short question the escalating agent wrote for the owner, if any.
+pub fn short_question(payload: &serde_json::Value) -> Option<String> {
+    let s = payload["question"].as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The short owner question for `q`, read from its escalation event.
+pub fn owner_short(db: &Db, q: &Question) -> Option<String> {
+    let events = db.list_events(Some(q.task_id), 500).ok()?;
+    short_question(&owner_escalation(&events, q)?.payload)
 }
 
 fn decision_node(id: String, title: String, at: &str, d: Decision) -> Node {
@@ -426,12 +452,12 @@ fn question_decisions(ctx: &Ctx) -> Vec<Node> {
         d.undo_secs = crate::scheduler::UNDO_SECS;
         d.why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
         d.ladder = q.ladder.clone();
-        let to_owner = |e: &&Event| e.payload["question_id"] == q.id && e.payload["to"] == "owner";
-        let esc = ctx.evs(q.task_id).into_iter().filter(|e| e.kind == "escalated").filter(to_owner).max_by_key(|e| e.id);
+        let esc = owner_escalation(ctx.evs(q.task_id), q);
         if let Some(e) = esc {
             apply_meta(&mut d, &e.payload);
         }
-        let mut n = decision_node(format!("q:{}", q.id), first_line(&q.text), &q.created_at, d);
+        let title = esc.and_then(|e| short_question(&e.payload)).unwrap_or_else(|| first_line(&q.text));
+        let mut n = decision_node(format!("q:{}", q.id), title, &q.created_at, d);
         n.subtask_id = (q.task_id != ctx.top.id).then_some(q.task_id);
         n
     };
@@ -835,6 +861,22 @@ mod tests {
         owner_question(&db, sub, "A", json!({}));
         let d = get(&db, top, real_now()).nodes.iter().find_map(|n| n.decision.clone()).unwrap();
         assert_eq!((d.risk, d.reversible, d.if_approved.len()), ("unknown", None, 0));
+    }
+
+    #[test]
+    fn short_question_and_options_split_off_the_details() {
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "Long original text\nmore", json!({"question": "Use sqlite?", "options": ["Yes", "No"]}));
+        let th = get(&db, top, real_now());
+        let n = th.nodes.iter().find(|n| n.decision.is_some()).unwrap();
+        let d = n.decision.as_ref().unwrap();
+        assert_eq!((d.ask.as_str(), d.details.as_str()), ("Use sqlite?", "Long original text\nmore"));
+        assert_eq!((d.options.clone(), n.title.as_str()), (vec!["Yes".to_string(), "No".to_string()], "Use sqlite?"));
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "Plain\nmore", json!({}));
+        let n = get(&db, top, real_now()).nodes.into_iter().find(|n| n.decision.is_some()).unwrap();
+        let d = n.decision.unwrap();
+        assert_eq!((d.ask.as_str(), d.details.as_str(), d.options.len(), n.title.as_str()), ("Plain\nmore", "", 0, "Plain"));
     }
 
     #[test]

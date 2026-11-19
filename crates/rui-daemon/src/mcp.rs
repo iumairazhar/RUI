@@ -316,6 +316,12 @@ pub struct EscalateArgs {
     /// 2 to 5 short steps that run after the owner approves.
     #[serde(default)]
     pub if_approved: Option<Vec<String>>,
+    /// The question for the owner in one short plain sentence (at most 140 characters). No ids or jargon.
+    #[serde(default)]
+    pub question: Option<String>,
+    /// 2 to 4 short answers the owner can tap, each under 60 characters. Put your recommendation first.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
 }
 
 /// Arguments for `set_limit`.
@@ -966,6 +972,20 @@ pub mod logic {
         Ok(Value::Object(meta))
     }
 
+    /// Adds the short owner question and its tap options to an escalation's meta, when given.
+    fn add_owner_question(meta: &mut Value, question: &Option<String>, options: &Option<Vec<String>>) {
+        let Some(map) = meta.as_object_mut() else { return };
+        let short: String = question.iter().flat_map(|q| q.trim().chars()).take(140).collect();
+        if !short.is_empty() {
+            map.insert("question".into(), json!(short));
+        }
+        let cut = |o: &String| o.trim().chars().take(80).collect::<String>();
+        let opts: Vec<String> = options.iter().flatten().map(cut).filter(|o| !o.is_empty()).take(4).collect();
+        if !opts.is_empty() {
+            map.insert("options".into(), json!(opts));
+        }
+    }
+
     /// Lead declares the task split into its subtasks.
     pub fn mark_split(db: &Db, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
         let task = current_task(db, ctx)?;
@@ -1069,7 +1089,8 @@ pub mod logic {
     pub fn escalate(db: &Db, ctx: &Ctx, level: &str, a: EscalateArgs) -> anyhow::Result<Value> {
         let q = decidable(db, ctx, level, a.question_id)?;
         let who = if level == "lead" { "Lead" } else { "Rui" };
-        let meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
+        let mut meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
+        add_owner_question(&mut meta, &a.question, &a.options);
         let up = scheduler::escalate_question_with(db, q.id, who, a.why.trim(), &meta)?;
         record(db, ctx, role_of(level), "escalate", &a)?;
         Ok(json!({"ok": true, "level": up.level}))
@@ -2022,6 +2043,7 @@ mod tests {
         let args = |risk: &str| EscalateArgs {
             question_id: qid, why: "w".into(), risk: Some(risk.into()), reversible: Some(false),
             if_approved: Some(["a", " b ", "", "c", "d", "e", "f", "g"].map(String::from).to_vec()),
+            ..Default::default()
         };
         assert!(logic::escalate(&db, &lead, "lead", args("extreme")).is_err());
         logic::escalate(&db, &lead, "lead", args(" HIGH ")).unwrap();
@@ -2029,6 +2051,20 @@ mod tests {
         let e = events.iter().find(|e| e.kind == "escalated").unwrap();
         assert_eq!((e.payload["risk"].as_str(), e.payload["reversible"].as_bool()), (Some("high"), Some(false)));
         assert_eq!(e.payload["if_approved"], json!(["a", "b", "c", "d", "e"]));
+    }
+
+    #[test]
+    fn escalate_saves_short_question_and_options() {
+        let (db, data, lead, member) = staffed();
+        let qid = ask(&db, data.path(), &member);
+        let long = "q".repeat(200);
+        let opts = [" Yes ", "", "No", "a", "b", "c"].map(String::from).to_vec();
+        let a = EscalateArgs { question_id: qid, why: "w".into(), question: Some(long), options: Some(opts), ..Default::default() };
+        logic::escalate(&db, &lead, "lead", a).unwrap();
+        let events = db.list_events(member.task_id, 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "escalated").unwrap();
+        assert_eq!(e.payload["question"].as_str().map(str::len), Some(140));
+        assert_eq!(e.payload["options"], json!(["Yes", "No", "a", "b"]));
     }
 
     #[test]
