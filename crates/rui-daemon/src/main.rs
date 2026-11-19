@@ -12,6 +12,10 @@ fn env_num(name: &str, default: u64) -> u64 {
 async fn main() {
     let port = env_num("RUI_PORT", 7878) as u16;
     let tick = Duration::from_secs(env_num("RUI_TICK_SECS", 5));
+    if let Err(e) = std::fs::create_dir_all(state::data_dir()) {
+        eprintln!("create data dir: {e}");
+        std::process::exit(1);
+    }
     let db = match Db::open(&state::db_path()) {
         Ok(db) => Arc::new(db),
         Err(e) => {
