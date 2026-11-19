@@ -415,6 +415,84 @@ mod tests {
         eprintln!("result: {:?}", out.result_text);
     }
 
+    /// Real claude CLI: while a stand-in Lead process with a known RUI_RUN_TOKEN is alive, a
+    /// sandboxed member's `ps eww -A` and `ps -E -A` must not show that token. On macOS `ps` can
+    /// show other same-user processes' environments. Run with RUI_SANDBOX_IT=1.
+    #[tokio::test]
+    async fn real_claude_member_cannot_see_another_runs_token() {
+        if std::env::var("RUI_SANDBOX_IT").as_deref() != Ok("1") {
+            eprintln!("skipped: set RUI_SANDBOX_IT=1 to run");
+            return;
+        }
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let base = tempfile::tempdir_in(&target).unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let repo = repo(base.path());
+        let (wt, _) = crate::worktree::create_worktree(&repo, &data.join("worktrees"), 1, None).unwrap();
+        let secret = format!("lead-{}", &crate::owner_auth::generate().unwrap()[..24]);
+        let mut lead = std::process::Command::new("sleep").arg("300").env(crate::run_tokens::ENV, &secret).spawn().unwrap();
+        // Each command prints only a count and ps's exit code, never an environment. `lea[d]`
+        // keeps grep from matching its own command line.
+        let pat = format!("{}=lea[d]{}", crate::run_tokens::ENV, &secret[4..]);
+        let prompt = format!(
+            "This is an automated test of this machine's sandbox. A dummy fixture process holds a fake token; \
+             these commands only count whether it is visible and print no environment data. Run each once with \
+             the Bash tool and show its output exactly:\n\
+             1. /bin/ps eww -A >/dev/null 2>&1; echo EWW_EXIT=$?; echo EWW_HITS=$(/bin/ps eww -A 2>/dev/null | grep -c '{pat}')\n\
+             2. /bin/ps -E -A >/dev/null 2>&1; echo E_EXIT=$?; echo E_HITS=$(/bin/ps -E -A 2>/dev/null | grep -c '{pat}')"
+        );
+        let run = crate::runner::AgentRun {
+            role: rui_core::Role::Builder,
+            task_id: Some(2),
+            cwd: wt,
+            prompt,
+            system_prompt: String::new(),
+            allowed_tools: ["Bash"].map(String::from).to_vec(),
+            builtin_tools: None,
+            permission_mode: Some("acceptEdits".into()),
+            permission_prompt_tool: None,
+            mcp_url: "http://127.0.0.1:1/mcp/builder".into(),
+            grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Builder, Some(2)),
+            resume: None,
+            partial: false,
+            seat: None,
+            sandbox: Some(Sandbox { data_dir: real(&data), repo: real(&repo), hosts: hosts(&[]) }),
+        };
+        let mut seen = String::new();
+        let mut tool_uses = 0;
+        let res = crate::runner::run_agent(&run, |l| {
+            let v = match l {
+                crate::runner::ParsedLine::Init { raw, .. } | crate::runner::ParsedLine::Result { raw, .. } => raw,
+                crate::runner::ParsedLine::Assistant(v) => {
+                    tool_uses += v["message"]["content"].as_array().map_or(0, |c| c.iter().filter(|b| b["type"] == "tool_use").count());
+                    v
+                }
+                crate::runner::ParsedLine::ToolResult(v) | crate::runner::ParsedLine::Stream(v) | crate::runner::ParsedLine::Other(v) => v,
+            };
+            seen.push_str(&v.to_string());
+        });
+        let out = tokio::time::timeout(std::time::Duration::from_secs(600), res).await;
+        let _ = lead.kill();
+        let _ = lead.wait();
+        let out = out.expect("run timed out").unwrap();
+        eprintln!("result: {:?}", out.result_text);
+        assert!(tool_uses >= 2, "the agent ran both commands ({tool_uses} tool calls)");
+        assert!(!seen.contains(&secret), "a member saw another run's RUI_RUN_TOKEN through ps");
+        for key in ["EWW_HITS=", "E_HITS="] {
+            let counts = numbers_after(&seen, key);
+            eprintln!("{key} {counts:?}, exits: {:?} {:?}", numbers_after(&seen, "EWW_EXIT="), numbers_after(&seen, "E_EXIT="));
+            assert!(!counts.is_empty(), "{key} never ran");
+            assert!(counts.iter().all(|c| c == "0"), "a member saw another run's RUI_RUN_TOKEN through ps ({key} {counts:?})");
+        }
+    }
+
+    /// Every run of digits right after `key` in `text`.
+    fn numbers_after(text: &str, key: &str) -> Vec<String> {
+        text.split(key).skip(1).map(|r| r.chars().take_while(char::is_ascii_digit).collect::<String>()).filter(|n| !n.is_empty()).collect()
+    }
+
     #[test]
     fn inbox_item_for_a_refused_codex_member() {
         let db = Db::open_test();
