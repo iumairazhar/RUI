@@ -345,7 +345,7 @@ mod tests {
         let member = task(3, Some(1), TaskStatus::Done, NEW);
         let fwd = ev(1, 1, "forwarded", json!({"remarks": "ok"}));
         assert_eq!(word(&top, &[], &[]), ("Done", "Finished".into()));
-        assert_eq!(word(&top, &[fwd.clone()], &[]), ("Needs you", REVIEW_REASON.into()));
+        assert_eq!(word(&top, std::slice::from_ref(&fwd), &[]), ("Needs you", REVIEW_REASON.into()));
         let member_fwd = [ev(1, 3, "forwarded", json!({}))];
         assert_eq!(word(&member, &member_fwd, &[]), ("Done", "Finished".into()));
         let ok = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "ok"}))];

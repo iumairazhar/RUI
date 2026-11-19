@@ -2392,7 +2392,7 @@ mod tests {
     fn member_tools_allow_bash_broadly_only_with_shell() {
         let skill = skills::parse("---\nname: x\ndescription: d\nbash: [\"uv *\"]\n---\nb\n").unwrap();
         let client = client_with(&["ls"]);
-        let no_shell = member_tools(Some(&role(&["Read", "Edit", "Run tests"])), &[skill.clone()], &client, "make t");
+        let no_shell = member_tools(Some(&role(&["Read", "Edit", "Run tests"])), std::slice::from_ref(&skill), &client, "make t");
         assert!(no_shell.contains(&"Edit".to_string()) && no_shell.contains(&"Write".to_string()));
         assert!(!no_shell.contains(&"Bash".to_string()));
         for want in ["Bash(make t)", "Bash(ls)", "Bash(uv *)", "mcp__rui__ask_lead", "mcp__rui__report_status"] {
