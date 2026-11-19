@@ -337,7 +337,7 @@ impl ThreadsView {
     /// Build the threads view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let input = cx.new(|cx| TextInput::new("Answer it, or pass down new instructions…", cx));
+        let input = cx.new(|cx| TextInput::new("Write to the thread", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         let why = cx.new(|cx| TextInput::new("Why? (optional)", cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.stop_now(cx)).detach();
@@ -510,10 +510,6 @@ impl ThreadsView {
         self.store.update(cx, |s, cx| s.instruct_task(id, text, cx));
     }
 
-    fn fill(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.input.update(cx, |i, cx| i.set_content(text, cx));
-    }
-
     /// The task's events, plus its steps' events for a split thread, oldest first.
     fn task_data(&self, id: i64, cx: &Context<Self>) -> (Vec<Event>, Vec<Change>) {
         let s = self.store.read(cx);
@@ -596,9 +592,10 @@ impl ThreadsView {
         ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
-    fn tabs(&self, has_flow: bool, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = if has_flow { vec![(Tab::Flow, "Flow")] } else { vec![] };
-        tabs.extend([(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
+    fn tabs(&self, has_flow: bool, has_results: bool, compact: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let list = if has_flow { "List" } else { "Trace" };
+        let mut tabs = if has_flow { vec![(Tab::Flow, "Map")] } else { vec![] };
+        tabs.extend([(Tab::Trace, list), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
         if has_results {
             tabs.push((Tab::Results, "Results"));
         }
@@ -610,7 +607,8 @@ impl ThreadsView {
                 div()
                     .id(("task-tab", i))
                     .flex()
-                    .flex_1()
+                    .when(!compact, |d| d.flex_1())
+                    .px(px(if compact { 12. } else { 0. }))
                     .items_center()
                     .justify_center()
                     .h(px(28.))
@@ -747,46 +745,24 @@ impl ThreadsView {
         wrap.border_t_1().border_color(th.hairline).child(bar).into_any_element()
     }
 
+    /// Suite's composer: one rounded bar with a Message segment, the field and Send.
     fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if let Some((qid, text)) = &t.question {
             return self.answer_bar(*qid, text, th, cx);
         }
-        let mut chips: Vec<AnyElement> = Vec::new();
-        for (i, text) in ["Narrow the scope", "Show me the diff before you continue"].into_iter().enumerate() {
-            let c = small_chip(format!("suggest-{i}"), text, cx);
-            chips.push(c.on_click(cx.listener(move |this, _, _, cx| this.fill(text, cx))).into_any_element());
-        }
-        let send = primary_button("thread-send", "Send down", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
-        let row = div().flex().items_center().gap(px(8.)).child(div().flex_1().child(self.input.clone())).child(send);
-        div()
-            .id("threads-composer")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(px(10.))
-            .pt(px(16.))
-            .px(px(20.))
-            .pb(px(20.))
-            .border_t_1()
-            .border_color(th.hairline)
-            .children((!chips.is_empty()).then(|| div().flex().flex_wrap().gap(px(8.)).children(chips)))
-            .child(row)
-            .child(composer_hint(t, th))
-            .into_any_element()
+        let seg = div().flex().items_center().flex_none().p(px(3.)).rounded(px(9.)).bg(th.well);
+        let on = div().flex().items_center().h(px(26.)).px(px(12.)).rounded(px(7.)).bg(th.surface);
+        let on = on.text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Message");
+        let field = div().flex_1().min_w_0().child(self.input.clone());
+        let send = chip("thread-send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
+        let bar = div().flex().items_center().gap(px(10.)).p(px(6.)).rounded(px(14.)).bg(th.surface_2);
+        let bar = bar.border_1().border_color(th.hairline).child(seg.child(on)).child(field).child(send);
+        div().id("threads-composer").flex_none().px(px(14.)).pb(px(14.)).pt(px(4.)).child(bar).into_any_element()
     }
-}
-
-fn small_chip(id: String, text: &str, cx: &mut Context<ThreadsView>) -> Stateful<Div> {
-    chip(id, text, cx).h(px(26.)).px(px(10.)).text_size(px(11.5))
 }
 
 pub(super) fn muted_status(th: &Theme) -> Status {
     Status { base: th.muted, fg: th.muted, dim: th.hairline, rim: th.hairline }
-}
-
-fn composer_hint(t: &Thread, th: &Theme) -> Div {
-    let text = format!("Goes to {}. If it can't run yet, RUI resumes what it waits on and tells you.", t.name);
-    div().mt(px(-2.)).text_size(px(11.)).text_color(th.muted).child(text)
 }
 
 /// First line of `s`, cut to `max` chars with an ellipsis.

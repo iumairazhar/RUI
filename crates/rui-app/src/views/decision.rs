@@ -113,7 +113,7 @@ pub fn risk_label(risk: &str) -> &'static str {
     }
 }
 
-fn risk_style(risk: &str, th: &Theme) -> Status {
+pub fn risk_style(risk: &str, th: &Theme) -> Status {
     match risk {
         "high" => th.block.clone(),
         "medium" => th.wait.clone(),
@@ -267,6 +267,8 @@ pub struct DecisionCard {
     store: Entity<Store>,
     data: Option<CardData>,
     compact: bool,
+    /// Only the buttons (and the undo row), for the thread inspector's "If approved" box.
+    bare: bool,
     answer: Entity<TextInput>,
     why: Entity<TextInput>,
     /// "Ask for changes" was clicked and its input is showing.
@@ -284,7 +286,7 @@ impl DecisionCard {
         cx.subscribe(&answer, |this, _, _: &Submit, cx| this.submit(cx)).detach();
         let why = cx.new(|cx| TextInput::new(WHY_HINT, cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.submit(cx)).detach();
-        Self { store, data: None, compact, answer, why, reveal: false, details: false }
+        Self { store, data: None, compact, bare: false, answer, why, reveal: false, details: false }
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -481,6 +483,15 @@ impl DecisionCard {
         card.into_any_element()
     }
 
+    /// Just the answer fields and buttons, or the undo row while an answer is held.
+    fn bare(&self, d: &Decision, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let rows = match self.held(cx) {
+            Some((event_id, left)) => vec![self.undo_row(event_id, left, th, cx)],
+            None => self.actions(d, th, cx),
+        };
+        div().flex().flex_col().gap(px(10.)).children(rows).into_any_element()
+    }
+
     fn compact(&self, c: &CardData, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let d = &c.decision;
         let ask = div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).truncate().child(first_line(&d.ask));
@@ -497,7 +508,11 @@ impl Render for DecisionCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let Some(c) = self.data.clone() else { return div().into_any_element() };
-        if self.compact { self.compact(&c, &th, cx) } else { self.full(&c, &th, cx) }
+        match (self.bare, self.compact) {
+            (true, _) => self.bare(&c.decision, &th, cx),
+            (_, true) => self.compact(&c, &th, cx),
+            _ => self.full(&c, &th, cx),
+        }
     }
 }
 
@@ -513,12 +528,25 @@ pub struct Cards {
 impl Cards {
     /// The card for `data`, created on first use and refreshed with the latest data.
     pub fn get<V: 'static>(&mut self, data: &CardData, compact: bool, store: &Entity<Store>, on: OnCard<V>, cx: &mut Context<V>) -> Entity<DecisionCard> {
-        let key = (data.key(), compact);
+        self.make((data.key(), compact), false, data, store, on, cx)
+    }
+
+    /// The buttons-only card for `data` (see `DecisionCard::bare`), kept apart from the full card.
+    pub fn bare<V: 'static>(&mut self, data: &CardData, store: &Entity<Store>, on: OnCard<V>, cx: &mut Context<V>) -> Entity<DecisionCard> {
+        self.make((format!("bare:{}", data.key()), false), true, data, store, on, cx)
+    }
+
+    fn make<V: 'static>(&mut self, key: (String, bool), bare: bool, data: &CardData, store: &Entity<Store>, on: OnCard<V>, cx: &mut Context<V>) -> Entity<DecisionCard> {
         let card = match self.map.get(&key) {
             Some(c) => c.clone(),
             None => {
                 let store = store.clone();
-                let card = cx.new(|cx| DecisionCard::new(store, compact, cx));
+                let compact = key.1;
+                let card = cx.new(|cx| {
+                    let mut card = DecisionCard::new(store, compact, cx);
+                    card.bare = bare;
+                    card
+                });
                 cx.subscribe(&card, move |this, _, ev: &CardEvent, cx| on(this, ev, cx)).detach();
                 self.map.insert(key, card.clone());
                 card
