@@ -125,9 +125,10 @@ async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
 async fn restart_apps(State(s): State<ApiState>, Path(project): Path<String>) -> ApiResult<StatusCode> {
     let client = s.db.get_client_by_name(&project)?.ok_or_else(|| not_found("project not found"))?;
     let repo = crate::scheduler::expand_home(&client.repo_path);
+    let sb = crate::sandbox::for_client(&s.data_dir, &client.name, &repo);
     let apps = s.apps.clone();
     tokio::spawn(async move {
-        apps::start_project(&apps, &client.name, &repo).await;
+        apps::start_project(&apps, &sb, &client.name, &repo).await;
     });
     Ok(StatusCode::ACCEPTED)
 }

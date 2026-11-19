@@ -880,7 +880,14 @@ pub mod logic {
         let repo = expand_home(&client.repo_path);
         let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
         let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id, &base)?;
-        crate::worktree::precheck_and_reset(&wt, cmd)
+        let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
+        let checked = crate::worktree::precheck_and_reset(&sb, &wt, cmd);
+        if let Err(e) = &checked
+            && crate::srt::is_unavailable(e)
+        {
+            crate::scheduler::stop_for_sandbox(db, parent.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE)?;
+        }
+        checked
     }
 
     /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
@@ -1267,7 +1274,8 @@ impl RuiServer {
             .get_client_by_name(project)?
             .ok_or_else(|| anyhow::anyhow!("project '{project}' not found"))?;
         let repo = crate::scheduler::expand_home(&client.repo_path);
-        let infos = apps::start_project(&self.apps, &client.name, &repo).await;
+        let sb = crate::sandbox::for_client(&self.data_dir, &client.name, &repo);
+        let infos = apps::start_project(&self.apps, &sb, &client.name, &repo).await;
         Ok(serde_json::to_value(infos)?)
     }
 }
@@ -1910,6 +1918,21 @@ mod tests {
         let mut ok = sub_args("backend", "s");
         ok.done_command = "test -f nope.txt".into();
         assert!(logic::create_subtask(&db, data.path(), &ctx, ok).is_ok());
+    }
+
+    #[test]
+    fn missing_srt_refuses_the_precheck_and_stops_the_task() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        crate::srt::tests::set_override(data.path(), None);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "touch ran.txt; false".into();
+        let err = logic::create_subtask(&db, data.path(), &ctx, a).unwrap_err();
+        assert!(crate::srt::is_unavailable(&err), "{err:#}");
+        let parent = db.get_task(ctx.task_id.unwrap()).unwrap().unwrap();
+        assert_eq!(parent.status, TaskStatus::Stuck);
+        let wt = data.path().join("worktrees").join(format!("task-{}", parent.id));
+        assert!(!wt.join("ran.txt").exists());
     }
 
     #[test]

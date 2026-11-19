@@ -1,14 +1,15 @@
 //! Git worktree helpers and the "done command" runner.
 
+use crate::sandbox::Sandbox;
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::process::Command;
 
 /// Result of running a task's done command.
+#[derive(Debug)]
 pub struct DoneCheck {
     pub passed: bool,
     pub output_tail: String,
@@ -178,9 +179,9 @@ pub fn with_worktree_lock<T>(wt: &Path, f: impl FnOnce() -> T) -> T {
 }
 
 /// Proves `cmd` fails in `wt`, then resets the worktree, all under the worktree lock.
-pub fn precheck_and_reset(wt: &Path, cmd: &str) -> anyhow::Result<()> {
+pub fn precheck_and_reset(sb: &Sandbox, wt: &Path, cmd: &str) -> anyhow::Result<()> {
     with_worktree_lock(wt, || {
-        let checked = require_failing(wt, cmd);
+        let checked = require_failing(sb, wt, cmd);
         reset_worktree(wt)?;
         checked
     })
@@ -426,61 +427,53 @@ fn tail(bytes: &[u8], max: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
-/// `sh -c cmd` with every seat key and ANTHROPIC_API_KEY removed from its environment.
-pub fn done_shell(cmd: &str) -> Command {
-    let mut c = Command::new("sh");
-    c.args(["-c", cmd]);
-    crate::seats::scrub_env(c.as_std_mut(), &crate::state::data_dir());
-    c
+/// Runs `cmd` in `cwd` inside srt with a 10 minute timeout. Errors with
+/// [`crate::srt::Unavailable`] when the sandbox can't start; then nothing ran.
+pub async fn run_done_command(sb: &Sandbox, cwd: &Path, cmd: &str) -> anyhow::Result<DoneCheck> {
+    let (sb, cwd, cmd) = (sb.clone(), cwd.to_path_buf(), cmd.to_string());
+    tokio::task::spawn_blocking(move || done_check_with(crate::srt::bin_for(&sb), &sb, &cwd, &cmd, Duration::from_secs(600))).await?
 }
 
-/// Runs `sh -c cmd` in `cwd` with a 10 minute timeout.
-pub async fn run_done_command(cwd: &Path, cmd: &str) -> anyhow::Result<DoneCheck> {
-    let child = done_shell(cmd)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .output();
-    let timeout = Duration::from_secs(600);
-    let Ok(res) = tokio::time::timeout(timeout, child).await else {
-        return Ok(DoneCheck { passed: false, output_tail: "timed out".into() });
-    };
-    let out = res.context("run done command")?;
-    let mut all = out.stdout;
-    all.extend_from_slice(&out.stderr);
-    Ok(DoneCheck { passed: out.status.success(), output_tail: tail(&all, 4096) })
+/// The done check with an explicit srt binary. Output goes to a file in the run folder, so
+/// a full pipe can't stall the command while it is polled.
+pub fn done_check_with(bin: Option<PathBuf>, sb: &Sandbox, cwd: &Path, cmd: &str, limit: Duration) -> anyhow::Result<DoneCheck> {
+    let (status, out) = run_sandboxed(bin, sb, cwd, cmd, limit)?;
+    Ok(match status {
+        None => DoneCheck { passed: false, output_tail: "timed out".into() },
+        Some(s) => DoneCheck { passed: s.success(), output_tail: tail(&out, 4096) },
+    })
 }
 
-/// Runs `cmd` with `sh -c` in `wt` (5 minute limit). Errors if it exits 0
-/// (it proves nothing) or times out (inconclusive).
-pub fn require_failing(wt: &Path, cmd: &str) -> anyhow::Result<()> {
-    require_failing_within(wt, cmd, Duration::from_secs(300))
-}
-
-fn require_failing_within(wt: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut child = done_shell(cmd)
-        .as_std_mut()
-        .process_group(0)
-        .current_dir(wt)
+/// Runs `cmd` under srt in `cwd`; `None` status means it timed out. The whole process group
+/// is killed when it ends, so nothing it started in the background keeps running.
+fn run_sandboxed(bin: Option<PathBuf>, sb: &Sandbox, cwd: &Path, cmd: &str, limit: Duration) -> anyhow::Result<(Option<std::process::ExitStatus>, Vec<u8>)> {
+    let p = crate::srt::prepare(bin, sb, cwd, false)?;
+    let log = p.dir.path().join("out.log");
+    let f = std::fs::File::create(&log).context("create check log")?;
+    let mut child = p
+        .command(cmd, cwd)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(f.try_clone()?)
+        .stderr(f)
         .spawn()
         .context("run done command")?;
-    let start = std::time::Instant::now();
-    while start.elapsed() < limit {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                bail!("done_command already passes; write one that proves the job");
-            }
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    let status = crate::srt::wait_or_kill(&mut child, limit)?;
+    crate::srt::kill_group(child.id());
+    Ok((status, std::fs::read(&log).unwrap_or_default()))
+}
+
+/// Runs `cmd` under srt in `wt` (5 minute limit). Errors if it exits 0 (it proves nothing)
+/// or times out (inconclusive).
+pub fn require_failing(sb: &Sandbox, wt: &Path, cmd: &str) -> anyhow::Result<()> {
+    require_failing_with(crate::srt::bin_for(sb), sb, wt, cmd, Duration::from_secs(300))
+}
+
+fn require_failing_with(bin: Option<PathBuf>, sb: &Sandbox, wt: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
+    match run_sandboxed(bin, sb, wt, cmd, limit)?.0 {
+        Some(s) if s.success() => bail!("done_command already passes; write one that proves the job"),
+        Some(_) => Ok(()),
+        None => bail!("done_command timed out: inconclusive; write a faster check"),
     }
-    // Kill the whole group so pytest, npm or make die with sh.
-    let _ = StdCommand::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
-    let _ = child.wait();
-    bail!("done_command timed out: inconclusive; write a faster check")
 }
 
 /// Discards edits and untracked files left in `wt` (ignored files stay).
@@ -493,12 +486,6 @@ pub fn reset_worktree(wt: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn done_commands_never_inherit_the_api_key() {
-        let c = done_shell("true");
-        assert!(c.as_std().get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()));
-    }
 
     fn init_repo(dir: &Path) {
         let run = |args: &[&str]| {
@@ -567,39 +554,81 @@ mod tests {
         assert!(err.to_string().contains("git worktree add failed"));
     }
 
-    #[tokio::test]
-    async fn done_command_pass_and_fail() {
+    /// A fake srt (plain `sh -c`) and a sandbox for `d`.
+    fn fake(d: &Path) -> (Option<PathBuf>, Sandbox) {
+        let tools = d.join(".tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        (Some(crate::srt::tests::fake_srt(&tools)), crate::srt::tests::sandbox(d, d))
+    }
+
+    fn within(d: &Path, cmd: &str, limit: Duration) -> anyhow::Result<()> {
+        let (bin, sb) = fake(d);
+        require_failing_with(bin, &sb, d, cmd, limit)
+    }
+
+    #[test]
+    fn done_command_pass_and_fail() {
         let d = tempfile::tempdir().unwrap();
-        assert!(run_done_command(d.path(), "true").await.unwrap().passed);
-        let r = run_done_command(d.path(), "echo hi; exit 1").await.unwrap();
+        let (bin, sb) = fake(d.path());
+        assert!(done_check_with(bin.clone(), &sb, d.path(), "true", Duration::from_secs(5)).unwrap().passed);
+        let r = done_check_with(bin, &sb, d.path(), "echo hi; exit 1", Duration::from_secs(5)).unwrap();
         assert!(!r.passed);
         assert!(r.output_tail.contains("hi"));
     }
 
     #[test]
+    fn done_commands_never_inherit_the_api_key() {
+        let d = tempfile::tempdir().unwrap();
+        let (bin, sb) = fake(d.path());
+        let p = crate::srt::prepare(bin, &sb, d.path(), false).unwrap();
+        let c = p.command("true", d.path());
+        assert!(c.get_envs().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()));
+        let script = c.get_args().last().unwrap().to_string_lossy().into_owned();
+        assert_eq!(script, format!("export TMPDIR='{}'; true", p.tmp.display()));
+    }
+
+    #[test]
+    fn missing_srt_runs_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = crate::srt::tests::sandbox(d.path(), d.path());
+        let e = done_check_with(None, &sb, d.path(), "touch ran.txt", Duration::from_secs(5)).unwrap_err();
+        assert!(crate::srt::is_unavailable(&e));
+        let e = require_failing_with(None, &sb, d.path(), "touch ran.txt; false", Duration::from_secs(5)).unwrap_err();
+        assert!(crate::srt::is_unavailable(&e));
+        assert!(!d.path().join("ran.txt").exists());
+    }
+
+    #[test]
     fn require_failing_rejects_only_a_passing_command() {
         let d = tempfile::tempdir().unwrap();
-        assert!(require_failing(d.path(), "false").is_ok());
-        let e = require_failing(d.path(), "true").unwrap_err();
+        assert!(within(d.path(), "false", Duration::from_secs(5)).is_ok());
+        let e = within(d.path(), "true", Duration::from_secs(5)).unwrap_err();
         assert!(e.to_string().contains("already passes"));
     }
 
     #[test]
     fn require_failing_times_out_as_inconclusive() {
         let d = tempfile::tempdir().unwrap();
-        let e = require_failing_within(d.path(), "sleep 5", Duration::from_millis(200)).unwrap_err();
+        let e = within(d.path(), "sleep 5", Duration::from_millis(200)).unwrap_err();
         assert!(e.to_string().contains("inconclusive"));
-        let e = require_failing_within(d.path(), "true", Duration::from_secs(5)).unwrap_err();
-        assert!(e.to_string().contains("already passes"));
-        assert!(require_failing_within(d.path(), "false", Duration::from_secs(5)).is_ok());
     }
 
     #[test]
     fn require_failing_timeout_kills_the_whole_group() {
         let d = tempfile::tempdir().unwrap();
         let cmd = "sh -c 'sleep 2; touch late.txt' & sleep 5";
-        let e = require_failing_within(d.path(), cmd, Duration::from_millis(300)).unwrap_err();
+        let e = within(d.path(), cmd, Duration::from_millis(300)).unwrap_err();
         assert!(e.to_string().contains("timed out"));
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!d.path().join("late.txt").exists());
+    }
+
+    #[test]
+    fn a_finished_check_leaves_no_background_process() {
+        let d = tempfile::tempdir().unwrap();
+        let (bin, sb) = fake(d.path());
+        let cmd = "sh -c 'sleep 2; touch late.txt' & exit 1";
+        assert!(!done_check_with(bin, &sb, d.path(), cmd, Duration::from_secs(5)).unwrap().passed);
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!d.path().join("late.txt").exists());
     }

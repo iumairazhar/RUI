@@ -38,6 +38,7 @@ pub mod seats;
 pub mod seats_api;
 pub mod prompts;
 pub mod shell;
+pub mod srt;
 pub mod skills;
 pub mod state;
 pub mod support_api;

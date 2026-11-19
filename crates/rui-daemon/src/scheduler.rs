@@ -559,7 +559,7 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
             if let Err(e) = res {
                 report_error(db, Some(task_id), &e);
             } else if status == TaskStatus::Done {
-                launch_apps(db, apps, task_id);
+                launch_apps(db, &cfg.data_dir, apps, task_id);
             } else if status == TaskStatus::Stuck {
                 let reason = stuck_reason(db, task_id).ok().flatten();
                 if let Some(r) = reason {
@@ -663,23 +663,24 @@ fn lock_for_task(db: &Db, locks: &ClientLocks, task_id: i64) -> Option<Arc<tokio
 }
 
 /// After a top-level chat task is done, starts its project's apps and tells the chat.
-fn launch_apps(db: &Arc<Db>, apps: &Apps, task_id: i64) {
+fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
     let Ok(Some(task)) = db.get_task(task_id) else { return };
     if task.parent_id.is_some() || task.source_kind != SourceKind::Chat {
         return;
     }
-    let (db, apps) = (db.clone(), apps.clone());
+    let (db, apps, data_dir) = (db.clone(), apps.clone(), data_dir.to_path_buf());
     tokio::spawn(async move {
-        if let Err(e) = launch_and_report(&db, &apps, &task).await {
+        if let Err(e) = launch_and_report(&db, &data_dir, &apps, &task).await {
             report_error(&db, Some(task.id), &e);
         }
     });
 }
 
-async fn launch_and_report(db: &Db, apps: &Apps, task: &Task) -> Result<()> {
+async fn launch_and_report(db: &Db, data_dir: &Path, apps: &Apps, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
     let repo = expand_home(&client.repo_path);
-    let infos = apps::start_project(apps, &client.name, &repo).await;
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
+    let infos = apps::start_project(apps, &sb, &client.name, &repo).await;
     db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
     post_done_notice(db, task, &client.repo_path, &infos)
 }
@@ -1142,7 +1143,7 @@ fn sandbox_missing(db: &Db, task_id: i64, res: &Result<RunOutcome>) -> Result<bo
 }
 
 /// Records an `agent_error` carrying `reason` and sends the task down the stuck path.
-fn stop_for_sandbox(db: &Db, task_id: i64, error: &str, reason: &str) -> Result<()> {
+pub(crate) fn stop_for_sandbox(db: &Db, task_id: i64, error: &str, reason: &str) -> Result<()> {
     db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": error, "reason": reason}))?;
     db.set_task_status(task_id, TaskStatus::Stuck)?;
     raise_stuck_question(db, task_id, reason)
@@ -1450,7 +1451,12 @@ async fn finish_builder(db: &Arc<Db>, cfg: &Config, task: &Task, wt: &Path, done
     if reject_protected(db, cfg, task, wt)? {
         return Ok(());
     }
-    let check = run_done_command(wt, done_command).await?;
+    let client = client_for(db, task)?;
+    let sb = crate::sandbox::for_client(&cfg.data_dir, &client.name, &expand_home(&client.repo_path));
+    let check = match run_done_command(&sb, wt, done_command).await {
+        Err(e) if crate::srt::is_unavailable(&e) => return stop_for_sandbox(db, task.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE),
+        other => other?,
+    };
     if after_done_check(db, &cfg.data_dir, task.id, &check)? != TaskStatus::Done {
         return Ok(());
     }
@@ -1484,7 +1490,13 @@ pub async fn hand_back(db: &Arc<Db>, data_dir: &Path, task: &Task, note: &str, f
     // In progress while the check runs, so the scheduler does not start the agent meanwhile.
     db.set_task_status(task.id, TaskStatus::InProgress)?;
     db.add_event(Some(task.id), "owner", "handed_back", &json!({"note": note, "force": force}))?;
-    let check = hand_back_check(data_dir, task).await;
+    let check = match hand_back_check(db, data_dir, task).await {
+        Err(e) if crate::srt::is_unavailable(&e) => {
+            stop_for_sandbox(db, task.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE)?;
+            return Ok(HandBack { status: TaskStatus::Stuck, passed: false, output_tail: format!("{e:#}") });
+        }
+        res => res.unwrap_or_else(|e| DoneCheck { passed: false, output_tail: format!("{e:#}") }),
+    };
     record_check(db, task.id, &check)?;
     let status = if check.passed || force {
         land_handed_back(db, data_dir, task, !check.passed).await?
@@ -1494,15 +1506,14 @@ pub async fn hand_back(db: &Arc<Db>, data_dir: &Path, task: &Task, note: &str, f
     Ok(HandBack { status, passed: check.passed, output_tail: check.output_tail })
 }
 
-/// Runs the subtask's done_command in its worktree; a missing command or a spawn error fails.
-async fn hand_back_check(data_dir: &Path, task: &Task) -> DoneCheck {
+/// Runs the subtask's done_command in its worktree under srt; a missing command fails the check.
+async fn hand_back_check(db: &Db, data_dir: &Path, task: &Task) -> Result<DoneCheck> {
     let Some(cmd) = task.done_command.as_deref() else {
-        return DoneCheck { passed: false, output_tail: "this step has no done_command".into() };
+        return Ok(DoneCheck { passed: false, output_tail: "this step has no done_command".into() });
     };
-    let wt = subtask_worktree(data_dir, task.id);
-    run_done_command(&wt, cmd)
-        .await
-        .unwrap_or_else(|e| DoneCheck { passed: false, output_tail: format!("{e:#}") })
+    let client = client_for(db, task)?;
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &expand_home(&client.repo_path));
+    run_done_command(&sb, &subtask_worktree(data_dir, task.id), cmd).await
 }
 
 /// Marks the step done (logging `forced_done` when forced), then commits and merges it.
@@ -2102,6 +2113,35 @@ mod tests {
 
     fn has_event(db: &Db, id: i64, kind: &str) -> bool {
         db.list_events(Some(id), 1000).unwrap().iter().any(|e| e.kind == kind)
+    }
+
+    fn assert_stopped_for_sandbox(db: &Db, id: i64) {
+        assert_eq!(db.get_task(id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(id), 1000).unwrap();
+        let e = events.iter().rev().find(|e| e.kind == "agent_error").expect("agent_error event");
+        assert_eq!(e.payload["reason"], crate::sandbox::UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn missing_srt_stops_the_done_check_and_runs_nothing() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        crate::srt::tests::set_override(data.path(), None);
+        let db = Arc::new(db);
+        finish_builder(&db, &cfg, &sub, &wt, "touch ran.txt").await.unwrap();
+        assert_stopped_for_sandbox(&db, sub.id);
+        assert!(!wt.join("ran.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_srt_stops_a_hand_back_and_runs_nothing() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, wt) = handed_setup(data.path(), repo.path(), "touch ran.txt");
+        crate::srt::tests::set_override(data.path(), None);
+        let out = hand_back(&db, data.path(), &sub, "", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Stuck, false));
+        assert_stopped_for_sandbox(&db, sub.id);
+        assert!(!wt.join("ran.txt").exists());
     }
 
     #[tokio::test]
