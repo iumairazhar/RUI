@@ -305,8 +305,12 @@ fn plan_node(ctx: &Ctx) -> Option<Node> {
     if n == 0 {
         return None;
     }
-    let title = format!("Lead split it into {n} step{}", if n == 1 { "" } else { "s" });
-    Some(node(format!("plan:{}", ctx.top.id), "work", "plan", "done", title, &ctx.top.created_at))
+    let steps = if n == 1 { "step" } else { "steps" };
+    let title = format!("Lead split it into {n} {steps}");
+    let mut node = node(format!("plan:{}", ctx.top.id), "work", "plan", "done", title, &ctx.top.created_at);
+    let list: Vec<String> = ctx.subs.iter().enumerate().map(|(i, t)| format!("{}. {}", i + 1, t.title)).collect();
+    node.output = Some(Output { kind: "plan", label: format!("{n} {steps}"), url: None, preview: Some(list.join("\n")), output_tail: None });
+    Some(node)
 }
 
 fn role_name(t: &Task) -> String {
@@ -674,19 +678,40 @@ fn summary(th: Thread, updated_at: String) -> ThreadSummary {
 /// One node with its events, oldest first, one page at a time. A subtask also shows its tool calls.
 pub fn inspect(db: &Db, th: &Thread, node_id: &str, after_id: i64) -> Result<Option<Inspector>> {
     let Some(node) = th.nodes.iter().find(|n| n.id == node_id) else { return Ok(None) };
+    if node.kind == "plan" {
+        return plan_inspect(db, th.id, node, after_id).map(Some);
+    }
     let own = db.events_by_ids(&node.event_ids)?;
     let done_checks = done_checks(&own);
     let mut events: Vec<Event> = own.into_iter().filter(|e| e.id > after_id).collect();
     if let Some(sid) = node.subtask_id.filter(|_| node.kind == "subtask") {
         events.extend(db.events_for_tasks(&[sid], &["tool_call"], after_id, PAGE as i64 + 1)?);
     }
+    let cost_usd = node.cost_usd.unwrap_or(0.0);
+    Ok(Some(page(node, events, cost_usd, done_checks)))
+}
+
+/// One page of a node's events, oldest first, with the id to continue after.
+fn page(node: &Node, mut events: Vec<Event>, cost_usd: f64, done_checks: Vec<DoneCheck>) -> Inspector {
     events.sort_by_key(|e| e.id);
     events.dedup_by_key(|e| e.id);
     let more = events.len() > PAGE;
     events.truncate(PAGE);
     let next_after_id = if more { events.last().map(|e| e.id) } else { None };
-    let cost_usd = node.cost_usd.unwrap_or(0.0);
-    Ok(Some(Inspector { node_id: node.id.clone(), events, cost_usd, done_checks, next_after_id }))
+    Inspector { node_id: node.id.clone(), events, cost_usd, done_checks, next_after_id }
+}
+
+/// The plan node's story: the Account Lead's turns on the top task up to the one that
+/// created the last step, and what those turns cost.
+fn plan_inspect(db: &Db, top: i64, node: &Node, after_id: i64) -> Result<Inspector> {
+    let last_step = db.subtasks(top)?.into_iter().map(|t| t.created_at).max().unwrap_or_default();
+    let kinds = ["assistant", "tool_call", "result"];
+    let lead: Vec<Event> = db.events_for_tasks(&[top], &kinds, 0, i64::MAX)?.into_iter().filter(|e| e.agent == "lead").collect();
+    let end = lead.iter().find(|e| e.kind == "result" && e.created_at >= last_step).map_or(i64::MAX, |e| e.id);
+    let turn: Vec<Event> = lead.into_iter().filter(|e| e.id <= end).collect();
+    let cost = turn.iter().filter(|e| e.kind == "result").filter_map(|e| e.payload["total_cost_usd"].as_f64()).sum();
+    let events = turn.into_iter().filter(|e| e.id > after_id).collect();
+    Ok(page(node, events, cost, vec![]))
 }
 
 #[cfg(test)]
@@ -992,6 +1017,24 @@ mod tests {
         assert!(["task_in", "instruction", "answer", "plan", "subtask", "app"].iter().all(|x| k.contains(x)));
         let app = th.nodes.iter().find(|n| n.kind == "app").unwrap();
         assert_eq!(app.output.as_ref().unwrap().label, "App running on :3000");
+    }
+
+    #[test]
+    fn plan_node_shows_the_planning_turn_steps_and_cost() {
+        let (db, top, _sub) = setup(TaskStatus::InProgress);
+        let think = db.add_event(Some(top), "lead", "assistant", &json!({"text": "two parts"})).unwrap();
+        let call = db.add_event(Some(top), "lead", "tool_call", &json!({"tool": "create_subtask"})).unwrap();
+        let done = db.add_event(Some(top), "lead", "result", &json!({"total_cost_usd": 0.4})).unwrap();
+        db.add_event(Some(top), "lead", "assistant", &json!({"text": "reviewing"})).unwrap();
+        db.add_event(Some(top), "lead", "result", &json!({"total_cost_usd": 0.3})).unwrap();
+        let th = get(&db, top, real_now());
+        let plan = th.nodes.iter().find(|n| n.kind == "plan").unwrap();
+        let out = plan.output.as_ref().expect("the plan lists its steps");
+        assert_eq!((out.label.as_str(), out.preview.as_deref()), ("1 step", Some("1. work")));
+        let seen = inspect(&db, &th, &plan.id, 0).unwrap().unwrap();
+        let ids: Vec<i64> = seen.events.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [think, call, done], "only the planning turn");
+        assert!((seen.cost_usd - 0.4).abs() < 1e-9);
     }
 
     #[test]
