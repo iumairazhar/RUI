@@ -328,6 +328,8 @@ pub struct ThreadsView {
     note: Entity<TextInput>,
     /// Decision cards for the Home strip and the inspector.
     cards: Cards,
+    /// The task page's Details section (model, team, effort) is open.
+    details: bool,
 }
 
 impl ThreadsView {
@@ -343,7 +345,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default() }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -356,6 +358,7 @@ impl ThreadsView {
         self.open = Some(id);
         self.stop_open = false;
         self.abandon_armed = false;
+        self.details = false;
         self.why.update(cx, |i, cx| i.clear(cx));
         let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
         self.set_tab(if top { Tab::Flow } else { Tab::Trace });
@@ -488,15 +491,8 @@ impl ThreadsView {
         if text.trim().is_empty() {
             return;
         }
-        let open_q = self.store.read(cx).questions.iter().find(|q| {
-            q.task_id == id && q.status == QuestionStatus::Open
-        });
-        let qid = open_q.map(|q| q.id);
         self.input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| match qid {
-            Some(q) => s.answer(q, text, None, cx),
-            None => s.instruct_task(id, text, cx),
-        });
+        self.store.update(cx, |s, cx| s.instruct_task(id, text, cx));
     }
 
     fn fill(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -717,13 +713,27 @@ impl ThreadsView {
             .into_any_element()
     }
 
+    /// A calm bar pointing at the Inbox while the thread waits on an answer.
+    fn answer_bar(&self, qid: i64, text: &str, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = format!("Waiting on you: {}", first_line(text, 100));
+        let msg = div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(th.fg).child(label);
+        let go = primary_button("thread-answer-inbox", "Answer in Inbox", cx);
+        let go = go.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_question(qid, cx))));
+        let bar = div().flex().items_center().gap(px(10.)).px(px(14.)).py(px(10.)).rounded(px(10.));
+        let bar = bar.bg(th.wait.dim).border_1().border_color(th.wait.rim);
+        let bar = bar.child(icon("hand", 14., th.wait.fg)).child(msg).child(go);
+        let wrap = div().id("threads-answer-bar").flex().flex_none().pt(px(16.)).px(px(20.)).pb(px(20.));
+        wrap.border_t_1().border_color(th.hairline).child(bar).into_any_element()
+    }
+
     fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some((qid, text)) = &t.question {
+            return self.answer_bar(*qid, text, th, cx);
+        }
         let mut chips: Vec<AnyElement> = Vec::new();
-        if t.question.is_none() {
-            for (i, text) in ["Narrow the scope", "Show me the diff before you continue"].into_iter().enumerate() {
-                let c = small_chip(format!("suggest-{i}"), text, cx);
-                chips.push(c.on_click(cx.listener(move |this, _, _, cx| this.fill(text, cx))).into_any_element());
-            }
+        for (i, text) in ["Narrow the scope", "Show me the diff before you continue"].into_iter().enumerate() {
+            let c = small_chip(format!("suggest-{i}"), text, cx);
+            chips.push(c.on_click(cx.listener(move |this, _, _, cx| this.fill(text, cx))).into_any_element());
         }
         let send = primary_button("thread-send", "Send down", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
         let row = div().flex().items_center().gap(px(8.)).child(div().flex_1().child(self.input.clone())).child(send);
@@ -756,6 +766,16 @@ pub(super) fn muted_status(th: &Theme) -> Status {
 fn composer_hint(t: &Thread, th: &Theme) -> Div {
     let text = format!("Goes to {}. If it can't run yet, RUI resumes what it waits on and tells you.", t.name);
     div().mt(px(-2.)).text_size(px(11.)).text_color(th.muted).child(text)
+}
+
+/// First line of `s`, cut to `max` chars with an ellipsis.
+pub(super) fn first_line(s: &str, max: usize) -> String {
+    let line = s.trim().lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{}\u{2026}", cut.trim_end())
 }
 
 fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
@@ -1205,6 +1225,14 @@ pub(super) fn shown(closing: bool, d: f32) -> f32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn first_line_takes_first_line_and_cuts_safely() {
+        assert_eq!(first_line("  first\nsecond", 20), "first");
+        assert_eq!(first_line("", 5), "");
+        assert_eq!(first_line("h\u{e9}llo world", 5), "h\u{e9}ll\u{2026}");
+        assert_eq!(first_line("12345", 5), "12345");
+    }
 
     fn ev(kind: &str, payload: Value) -> Event {
         serde_json::from_value(json!({"id":1,"task_id":2,"agent":"builder","kind":kind,

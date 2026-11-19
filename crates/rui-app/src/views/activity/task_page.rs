@@ -1,7 +1,7 @@
 //! The task page: one task's header, team strip, tabs and composer, shown in place of the board.
 
 use super::teams::can_stop;
-use super::{Tab, Thread, ThreadsView, effort_section, elapsed, icon, live_row, mono, role_name, scroll_sig, section};
+use super::{Tab, Thread, ThreadsView, effort_section, elapsed, icon, live_row, first_line, role_name, scroll_sig, section};
 use crate::theme::Theme;
 use crate::views::character::character;
 use crate::views::library::danger_button;
@@ -50,17 +50,17 @@ impl ThreadsView {
             Tab::Results => section("Files it produced", self.result_rows(&results, th, cx)),
         };
         let scroll = div().id("task-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll);
-        let scroll = scroll.flex().flex_col().gap(px(20.)).px(px(40.)).py(px(20.)).child(effort_section(&t.task, th)).child(body);
+        let scroll = scroll.flex().flex_col().gap(px(20.)).px(px(40.)).py(px(20.)).child(body);
         let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
         let face = character(char_state(&t.task.status, live.as_ref()), px(58.), ("task-rui", t.task.id as usize), th.client_color(t.task.client_id), th);
-        let head = self.page_head(t, now, face, th, cx);
+        let head = self.page_head(t, face, th, cx);
         let story = flow.as_ref().and_then(|f| story_line(f.story.as_deref(), th));
-        let strip = self.team_strip(t, all, th, cx);
+        let details = self.details.then(|| self.details_section(t, all, now, th, cx));
         let has_flow = t.task.parent_id.is_none();
         let tabs = div().id("task-tabs-wrap").px(px(40.)).pt(px(16.)).child(self.tabs(has_flow, !results.is_empty(), th, cx));
         let inspector = self.inspector_view(flow.as_ref(), th, cx);
         let page = div().id("task-page").relative().flex().flex_col().size_full().child(self.back_button(th, cx)).child(head);
-        page.children(story).children(strip).child(tabs).child(scroll).children(composer).children(inspector).into_any_element()
+        page.children(details).children(story).child(tabs).child(scroll).children(composer).children(inspector).into_any_element()
     }
 
     fn back_button(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -73,22 +73,36 @@ impl ThreadsView {
     }
 
     /// Eyebrow, title, status word with its reason, model and time, and Stop or Resume on the right.
-    fn page_head(&self, t: &Thread, now: i64, face: AnyElement, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn page_head(&self, t: &Thread, face: AnyElement, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let eyebrow = format!("{} \u{b7} {}", t.client, role_name(&t.task.role)).to_uppercase();
         let eyebrow = div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child(eyebrow);
         let title = div().text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(t.task.title.clone());
-        let reason = (!t.reason.is_empty()).then(|| div().text_size(px(12.5)).text_color(th.fg_2).child(t.reason.clone()));
-        let model = t.model.clone().map(|m| mono(11., th.muted, m));
-        let time = mono(10.5, th.muted, elapsed(&t.task.updated_at, now));
+        let reason = first_line(&t.reason, 120);
+        let reason = (!reason.is_empty()).then(|| div().min_w_0().truncate().text_size(px(12.5)).text_color(th.fg_2).child(reason));
         let word = tag(status::style(t.word, th), t.word.label());
-        let meta = div().id("task-meta").flex().flex_wrap().items_center().gap(px(8.)).child(word).children(reason).children(model).child(time);
-        let pod = t.pod_line.clone().map(|l| div().text_size(px(11.5)).text_color(th.muted).child(l));
+        let label = if self.details { "Hide details" } else { "Details" };
+        let toggle = chip("task-details", label, cx).on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
+        let meta = div().id("task-meta").flex().items_center().gap(px(8.)).min_w_0().child(word).children(reason).child(toggle);
         let info = div().id("task-info").flex().flex_col().flex_1().min_w_0().gap(px(6.));
-        let info = info.child(eyebrow).child(title).child(meta).children(pod);
+        let info = info.child(eyebrow).child(title).child(meta);
         let actions = div().id("task-actions").flex().items_center().gap(px(8.));
         let actions = actions.children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx));
         let row = div().id("task-head").flex().flex_none().items_start().gap(px(14.)).px(px(40.)).pt(px(8.));
         row.child(face).child(info).child(actions).into_any_element()
+    }
+
+    fn toggle_details(&mut self, cx: &mut Context<Self>) {
+        self.details = !self.details;
+        cx.notify();
+    }
+
+    /// Model, time and pod line, then the team strip and the effort meter.
+    fn details_section(&self, t: &Thread, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let parts = [t.model.clone(), Some(elapsed(&t.task.updated_at, now)), t.pod_line.clone()];
+        let line = parts.into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ");
+        let line = div().px(px(40.)).pt(px(8.)).text_size(px(11.5)).text_color(th.muted).child(line);
+        let effort = div().px(px(40.)).pt(px(8.)).child(effort_section(&t.task, th));
+        div().id("task-details-section").flex().flex_col().child(line).children(self.team_strip(t, all, th, cx)).child(effort).into_any_element()
     }
 
     /// "Abandon" for a task that isn't done; a second click drops the whole task (its top-level
