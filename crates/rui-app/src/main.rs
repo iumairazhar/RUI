@@ -332,13 +332,12 @@ impl Root {
         self.select(Nav::Cost, cx);
     }
 
-    /// Switch to the Inbox page with one question open, closing the slide-over.
+    /// Open the Inbox slide-over on the Decisions tab with one question's row expanded.
     fn open_in_inbox(&mut self, qid: i64, cx: &mut Context<Self>) {
-        if self.inbox_open {
-            self.inbox.update(cx, |p, cx| p.close(cx));
+        if !self.inbox_open {
+            self.toggle_inbox(cx);
         }
-        self.select(Nav::Inbox, cx);
-        self.questions.update(cx, |q, cx| q.open_kind("question", qid, cx));
+        self.inbox.update(cx, |p, cx| p.open_item("question", qid, cx));
     }
 
     fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {

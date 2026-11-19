@@ -29,6 +29,8 @@ fn icon_bytes(path: &str) -> Option<&'static [u8]> {
         "icons/nav-analytics.svg" => include_bytes!("../assets/icons/nav-analytics.svg"),
         "icons/nav-settings.svg" => include_bytes!("../assets/icons/nav-settings.svg"),
         "icons/nav-filter.svg" => include_bytes!("../assets/icons/nav-filter.svg"),
+        "icons/moon.svg" => include_bytes!("../assets/icons/moon.svg"),
+        "icons/arrow.svg" => include_bytes!("../assets/icons/arrow.svg"),
         "icons/claude.svg" => include_bytes!("../assets/icons/claude.svg"),
         "rui/shadow.svg" => include_bytes!("../assets/rui/shadow.svg"),
         "rui/stem.svg" => include_bytes!("../assets/rui/stem.svg"),

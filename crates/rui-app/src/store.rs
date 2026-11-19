@@ -110,7 +110,7 @@ pub struct Store {
     pub open_threads: bool,
     /// Thread to open once the root has switched to Threads; the root clears it.
     pub open_task: Option<i64>,
-    /// Question to open on the Inbox page; the root switches there and clears it.
+    /// Question to open in the Inbox slide-over; the root opens it and clears this.
     pub open_question: Option<i64>,
     /// Selected sub-tab of each rail section, by section key.
     pub tabs: HashMap<&'static str, usize>,
@@ -307,7 +307,7 @@ impl Store {
         cx.notify();
     }
 
-    /// Ask the root to switch to the Inbox page and open one question there.
+    /// Ask the root to open the Inbox slide-over with one question expanded.
     pub fn open_question(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open_question = Some(id);
         cx.notify();
