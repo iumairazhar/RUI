@@ -135,27 +135,23 @@ pub fn chip(id: impl Into<SharedString>, label: &str, cx: &App) -> Stateful<Div>
 /// Amber card holding a question, an optional "why" input, an answer input and its button.
 pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
     let th = theme(cx);
-    let head = div()
-        .flex()
-        .items_start()
-        .gap(px(8.))
-        .child(svg().path("icons/hand.svg").flex_none().size(px(15.)).text_color(th.wait.fg))
-        // min_w_0 lets long text wrap inside the card instead of widening it past its edge.
-        .child(div().flex_1().min_w_0().child(markdown::render(text, th.wait.fg, 13., th)));
+    // Text as a plain block with the icon in its left margin, like a chat bubble.
+    let icon = svg().path("icons/hand.svg").absolute().left_0().top(px(2.)).size(px(15.)).text_color(th.wait.fg);
+    let head = div().relative().pl(px(23.)).child(icon).child(markdown::render(text, th.wait.fg, 13., th));
     let row = match why {
         Some(why) => div().flex().flex_col().gap(px(8.)).child(input).child(why).child(div().flex().child(answer_btn)),
         None => div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn),
     };
+    // A plain block with a max width, like a chat bubble: gpui measures wrapped text height
+    // correctly there, but not inside a flex column, where the card stayed one line per
+    // paragraph tall and its text spilled over the next card.
     div()
-        .flex()
-        .flex_col()
-        .gap(px(12.))
+        .max_w(px(660.))
         .p(px(16.))
         .rounded(px(9.))
         .bg(th.wait.dim)
         .border_1()
         .border_color(th.wait.rim)
-        .max_w(px(660.))
         .child(head)
-        .child(row)
+        .child(row.mt(px(12.)))
 }

@@ -127,9 +127,11 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let th = theme(cx).clone();
-        let open: Vec<AnyElement> = questions.iter().map(|q| self.question(q, cx)).collect();
+        // Cards sit in a flex row, like message bubbles, so they shrink to their max width.
+        let row = |el: AnyElement| div().flex().child(el).into_any_element();
+        let open: Vec<AnyElement> = questions.iter().map(|q| row(self.question(q, cx))).collect();
         let open_asks = asks.iter().filter(|a| a.status == "open");
-        let ask_cards: Vec<AnyElement> = open_asks.map(|a| ask_card(a, &self.ask_inputs, Self::answer_ask, cx)).collect();
+        let ask_cards: Vec<AnyElement> = open_asks.map(|a| row(ask_card(a, &self.ask_inputs, Self::answer_ask, cx))).collect();
         let placed = place_asks(chat, asks);
         let steps = live.or_else(|| state.map(|_| vec![]));
         let working = steps.map(|steps| working_bubble(&steps, state, &th));
