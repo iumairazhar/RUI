@@ -199,9 +199,14 @@ fn spawn_app(apps: &Apps, key: &Key, sb: &Sandbox, repo: &Path, spec: &AppSpec, 
     Ok(())
 }
 
+/// True when the app answers HTTP on IPv4 or IPv6 loopback (dev servers like Vite bind `::1`).
 async fn http_ok(port: u16) -> bool {
+    http_ok_at("127.0.0.1", port).await || http_ok_at("::1", port).await
+}
+
+async fn http_ok_at(host: &str, port: u16) -> bool {
     let probe = async {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let mut s = tokio::net::TcpStream::connect((host, port)).await.ok()?;
         s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.ok()?;
         let mut buf = [0u8; 5];
         s.read_exact(&mut buf).await.ok()?;
@@ -315,6 +320,18 @@ mod tests {
 
     fn spec(name: &str) -> AppSpec {
         AppSpec { name: name.into(), dir: ".".into(), command: "x".into() }
+    }
+
+    #[tokio::test]
+    async fn an_app_listening_only_on_ipv6_loopback_counts_as_up() {
+        let Ok(l) = tokio::net::TcpListener::bind(("::1", 0)).await else { return };
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+            }
+        });
+        assert!(http_ok(port).await);
     }
 
     #[test]
