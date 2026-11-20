@@ -4,6 +4,7 @@ Question: {question}
 Asked by: {member_role} on subtask "{subtask_title}"
 Why the Account Lead passed it up: {lead_why}
 Task brief: {brief}
+Owner preferences (owner's own lines win): {owner_preferences}
 Owner knowledge (always wins over anything inferred): {owner_knowledge}
 Client Playbook: {client_playbook}
 Global Playbook: {global_playbook}

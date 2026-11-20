@@ -1,6 +1,7 @@
 //! HTTP routes for the owner's inputs:
 //! POST /tasks/{id}/limit (change a subtask's loop limit),
 //! GET/POST /clients/{id}/knowledge (owner knowledge, append-only),
+//! GET/POST/PUT /preferences (the owner's preferences; POST appends, PUT replaces the file),
 //! POST /inputs/email and POST /inputs/email/{event_id} (make_task or dismiss),
 //! POST /inputs/meeting (a meeting to prepare a brief for),
 //! GET/POST /clients/{id}/triggers (the client's triggers; POST replaces the whole list),
@@ -8,7 +9,7 @@
 //! POST /deploys/{event_id} (deploy or skip a requested deploy; never runs on its own).
 
 use crate::api::ApiState;
-use crate::{client_state, control, deploy, email, meeting, triggers};
+use crate::{client_state, control, deploy, email, meeting, memory, triggers};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -38,6 +39,7 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/tasks/{id}/limit", post(set_limit))
         .route("/clients/{id}/knowledge", get(get_knowledge).post(add_knowledge))
+        .route("/preferences", get(get_prefs).post(add_prefs).put(put_prefs))
         .route("/inputs/email", post(post_email))
         .route("/inputs/email/{event_id}", post(act_on_email))
         .route("/inputs/meeting", post(post_meeting))
@@ -72,7 +74,7 @@ fn client_name(s: &ApiState, id: i64) -> Result<String, Fail> {
 async fn get_knowledge(State(s): State<ApiState>, Path(id): Path<i64>) -> Reply {
     let name = client_name(&s, id)?;
     let text = client_state::read_knowledge(&s.data_dir, &name).map_err(internal)?;
-    Ok(Json(json!({ "text": text })))
+    Ok(Json(memory::reply(&text)))
 }
 
 #[derive(Deserialize)]
@@ -85,7 +87,24 @@ async fn add_knowledge(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): 
     let name = client_name(&s, id)?;
     client_state::append_knowledge(&s.data_dir, &name, &b.text).map_err(bad)?;
     let text = client_state::read_knowledge(&s.data_dir, &name).map_err(internal)?;
-    Ok(Json(json!({ "text": text })))
+    Ok(Json(memory::reply(&text)))
+}
+
+async fn get_prefs(State(s): State<ApiState>) -> Reply {
+    let text = memory::read(&s.data_dir).map_err(internal)?;
+    Ok(Json(memory::reply(&text)))
+}
+
+/// Appends one dated bullet to the owner's preferences.
+async fn add_prefs(State(s): State<ApiState>, Json(b): Json<TextBody>) -> Reply {
+    memory::append(&s.data_dir, &b.text).map_err(bad)?;
+    get_prefs(State(s)).await
+}
+
+/// Replaces the whole preferences file with the owner's edited text.
+async fn put_prefs(State(s): State<ApiState>, Json(b): Json<TextBody>) -> Reply {
+    memory::replace(&s.data_dir, &b.text).map_err(internal)?;
+    get_prefs(State(s)).await
 }
 
 #[derive(Deserialize)]
@@ -278,13 +297,32 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (app, _db, cid) = app(d.path());
         let uri = format!("/clients/{cid}/knowledge");
-        assert_eq!(call(&app, "GET", &uri, json!({})).await.1, json!({"text": ""}));
+        assert_eq!(call(&app, "GET", &uri, json!({})).await.1, json!({"text": "", "chars": 0, "limit": 4000}));
         assert_eq!(call(&app, "POST", &uri, json!({"text": "Bob signs off"})).await.0, StatusCode::OK);
         let (_, v) = call(&app, "POST", &uri, json!({"text": "Uses Postgres"})).await;
         let text = v["text"].as_str().unwrap();
         assert!(text.lines().count() == 2 && text.contains("Bob signs off") && text.ends_with("Uses Postgres\n"));
         assert_eq!(call(&app, "POST", &uri, json!({"text": " "})).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(call(&app, "GET", "/clients/999/knowledge", json!({})).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn preferences_round_trip_and_need_the_owner_token() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _db, _cid) = app(d.path());
+        assert_eq!(call(&app, "GET", "/preferences", json!({})).await.1, json!({"text": "", "chars": 0, "limit": 4000}));
+        assert!(d.path().join("preferences.md").exists());
+        let (code, v) = call(&app, "POST", "/preferences", json!({"text": "Short replies"})).await;
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!((code, v["text"].as_str()), (StatusCode::OK, Some(format!("- {day}: Short replies\n").as_str())));
+        assert_eq!(call(&app, "POST", "/preferences", json!({"text": " "})).await.0, StatusCode::BAD_REQUEST);
+        let (code, v) = call(&app, "PUT", "/preferences", json!({"text": "- Only this"})).await;
+        assert_eq!((code, v["text"].as_str(), v["chars"].as_u64()), (StatusCode::OK, Some("- Only this\n"), Some(12)));
+        assert_eq!(call(&app, "GET", "/preferences", json!({})).await.1["text"], "- Only this\n");
+        let req = Request::builder().method("PUT").uri("/preferences").header("content-type", "application/json");
+        let resp = app.clone().oneshot(req.body(Body::from(json!({"text": "x"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, "GET", "/preferences", json!({})).await.1["text"], "- Only this\n");
     }
 
     #[tokio::test]

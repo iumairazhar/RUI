@@ -1023,6 +1023,9 @@ mod tests {
             req.body(Body::from(init)).unwrap()
         };
         assert_eq!(app.clone().oneshot(mcp(Some("test-owner-token"))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let builder = crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Builder, Some(1));
+        let builder = crate::run_tokens::global().issue(builder).unwrap();
+        assert_eq!(app.clone().oneshot(mcp(Some(builder.value()))).await.unwrap().status(), StatusCode::UNAUTHORIZED, "remember lives on /mcp/rui only");
         let grant = crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None);
         let run = crate::run_tokens::global().issue(grant).unwrap();
         assert_eq!(app.oneshot(mcp(Some(run.value()))).await.unwrap().status(), StatusCode::OK);

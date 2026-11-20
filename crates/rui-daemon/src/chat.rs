@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__create_client,mcp__rui__set_up_pod,mcp__rui__create_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__create_client,mcp__rui__set_up_pod,mcp__rui__create_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner,mcp__rui__remember";
 
 /// Clients the owner picked for a message, kept in memory until that message's turn starts.
 static PICKED: Mutex<Option<HashMap<i64, String>>> = Mutex::new(None);
@@ -31,6 +31,21 @@ fn take_picked(msg_id: i64) -> Option<String> {
 fn turn_prompt(text: &str, client: Option<&str>) -> String {
     let Some(name) = client else { return text.to_string() };
     format!("The owner picked the client for this message: {name}. Use this client for any client work (report_status, create_task client={name}, run_apps).\n\n{text}")
+}
+
+/// The picked client's knowledge above the turn prompt, when there is any.
+fn with_knowledge(prompt: String, client: Option<&str>, knowledge: &str) -> String {
+    let Some(name) = client.filter(|_| !knowledge.trim().is_empty()) else { return prompt };
+    format!("What the owner told you about {name} (owner's own lines win):\n{}\n\n{prompt}", knowledge.trim_end())
+}
+
+/// The turn prompt for one message, with the picked client's knowledge (newest part only).
+fn full_prompt(data_dir: &Path, text: &str, client: Option<&str>) -> Result<String> {
+    let knowledge = match client {
+        Some(name) => crate::memory::knowledge_for_prompt(data_dir, name)?,
+        None => String::new(),
+    };
+    Ok(with_knowledge(turn_prompt(text, client), client, &knowledge))
 }
 
 /// Processes chat message ids one at a time, forever.
@@ -54,9 +69,10 @@ fn load_message(db: &Db, id: i64) -> Result<ChatMessage> {
     db.get_chat_message(id)?.context("chat message not found")
 }
 
-/// Rui's prompt with the catalog of roles it can staff filled in.
-fn system_prompt(data_dir: &Path) -> String {
-    crate::prompts::fill(RUI_PROMPT, &[("role_catalog", roster::catalog(data_dir))])
+/// Rui's prompt with the catalog of roles it can staff and the owner's preferences filled in.
+fn system_prompt(data_dir: &Path) -> Result<String> {
+    let prefs = crate::memory::prefs_for_prompt(data_dir)?;
+    Ok(crate::prompts::fill(RUI_PROMPT, &[("role_catalog", roster::catalog(data_dir)), ("owner_preferences", prefs)]))
 }
 
 /// Tools Rui may use without asking: its MCP tools plus read-only built-ins (not Bash).
@@ -73,8 +89,8 @@ fn chat_run(db: &Db, cfg: &Config, msg: ChatMessage) -> Result<AgentRun> {
         role: Role::Rui,
         task_id: None,
         cwd: cfg.data_dir.clone(),
-        prompt: turn_prompt(&msg.content, take_picked(id).as_deref()),
-        system_prompt: system_prompt(&cfg.data_dir),
+        prompt: full_prompt(&cfg.data_dir, &msg.content, take_picked(id).as_deref())?,
+        system_prompt: system_prompt(&cfg.data_dir)?,
         allowed_tools: allowed_tools(),
         // Rui reads and researches with real tools; risky Bash calls go through
         // `mcp__rui__approve`, which holds them for the owner's OK.
@@ -123,6 +139,20 @@ mod tests {
     }
 
     #[test]
+    fn rui_gets_preferences_and_the_picked_clients_knowledge() {
+        let d = tempfile::tempdir().unwrap();
+        crate::memory::append(d.path(), "Short replies please").unwrap();
+        crate::client_state::ensure(d.path(), "Acme", "/r", None).unwrap();
+        crate::client_state::append_knowledge(d.path(), "Acme", "Bob signs off").unwrap();
+        let sys = system_prompt(d.path()).unwrap();
+        let head = sys.find("Your owner's preferences (owner's own lines win):").expect("header");
+        assert!(sys[head..].contains("Short replies please"));
+        let p = full_prompt(d.path(), "hello", Some("Acme")).unwrap();
+        assert!(p.starts_with("What the owner told you about Acme") && p.contains("Bob signs off") && p.ends_with("hello"));
+        assert_eq!(full_prompt(d.path(), "hello", None).unwrap(), "hello");
+    }
+
+    #[test]
     fn picked_client_is_taken_once() {
         pick_client(987_654, "Acme");
         assert_eq!(take_picked(987_654).as_deref(), Some("Acme"));
@@ -146,7 +176,7 @@ mod tests {
 
     #[test]
     fn prompt_and_tools_cover_stop_and_instruct() {
-        for t in ["stop_task", "instruct_task", "ask_owner"] {
+        for t in ["stop_task", "instruct_task", "ask_owner", "remember"] {
             assert!(RUI_PROMPT.contains(t), "{t} missing from rui.md");
             assert!(RUI_TOOLS.contains(&format!("mcp__rui__{t}")), "{t} missing from RUI_TOOLS");
         }

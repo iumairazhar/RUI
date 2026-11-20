@@ -3,18 +3,18 @@
 //! with the templates, so a new placeholder can't reach an agent as literal text.
 
 /// Placeholders filled in `builder.md`.
-pub const BUILDER_VARS: [&str; 6] = ["role", "title", "job", "done_command", "progress_file", "playbook"];
+pub const BUILDER_VARS: [&str; 7] = ["role", "title", "job", "done_command", "progress_file", "playbook", "owner_preferences"];
 /// Placeholders filled in `decide.md`.
-pub const DECIDE_VARS: [&str; 9] = [
+pub const DECIDE_VARS: [&str; 10] = [
     "question", "member_role", "subtask_title", "lead_why", "brief", "owner_knowledge", "client_playbook", "global_playbook",
-    "prior_rulings",
+    "prior_rulings", "owner_preferences",
 ];
 /// Placeholders filled in `rui.md`.
-pub const RUI_VARS: [&str; 1] = ["role_catalog"];
+pub const RUI_VARS: [&str; 2] = ["role_catalog", "owner_preferences"];
 
 /// Placeholders filled in `account_lead.md`.
-pub const ACCOUNT_LEAD_VARS: [&str; 6] =
-    ["client", "event", "client_log", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
+pub const ACCOUNT_LEAD_VARS: [&str; 7] =
+    ["client", "event", "client_log", "owner_preferences", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
 
 /// Placeholders filled in `scout.md`.
 pub const SCOUT_VARS: [&str; 7] = ["question", "asked_by", "tools", "brief", "last_check", "events_tail", "context"];

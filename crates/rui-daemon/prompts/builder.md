@@ -5,6 +5,7 @@ Job: {job}
 done_command: {done_command}
 Progress so far: {progress_file}
 Playbook: {playbook}
+Owner preferences (owner's own lines win): {owner_preferences}
 
 Start by reading the progress so far; continue from there, don't redo work.
 

@@ -1028,7 +1028,7 @@ fn account_lead_tools(role: Option<&roster::Role>) -> Vec<String> {
 }
 
 /// Last `max` chars of `text`, cut at a char boundary, with a leading "…" when cut.
-fn tail_chars(text: &str, max: usize) -> String {
+pub(crate) fn tail_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_string();
@@ -1060,7 +1060,8 @@ fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Ve
         ("client", client.name.clone()),
         ("event", event.to_string()),
         ("client_log", format!("Briefs:\n{briefs}\n\nDecisions log (latest last):\n{log}")),
-        ("owner_knowledge", client_state::read_knowledge(data_dir, &client.name)?),
+        ("owner_preferences", crate::memory::prefs_for_prompt(data_dir)?),
+        ("owner_knowledge", crate::memory::knowledge_for_prompt(data_dir, &client.name)?),
         ("client_playbook", client_state::read_playbook(data_dir, &client.name)?),
         ("pod_roles_and_skills", pod_roles_and_skills(data_dir, client)?),
     ])
@@ -1279,7 +1280,8 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
     let mut vars = decide_vars(db, &q, &member, &parent, playbook)?;
     vars.push(("global_playbook", client_state::read_global_playbook(&cfg.data_dir)?));
-    vars.push(("owner_knowledge", client_state::read_knowledge(&cfg.data_dir, &client.name)?));
+    vars.push(("owner_knowledge", crate::memory::knowledge_for_prompt(&cfg.data_dir, &client.name)?));
+    vars.push(("owner_preferences", crate::memory::prefs_for_prompt(&cfg.data_dir)?));
     let system = prompts::fill(DECIDE_PROMPT, &vars);
     run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
@@ -1370,8 +1372,15 @@ fn member_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str,
     let loaded: Vec<Skill> = names.iter().filter_map(|n| skills::load(&cfg.data_dir, n)).collect();
     let tools = member_tools(role.as_ref(), &loaded, client, done);
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
-    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done, playbook)?);
+    let prompt = member_prompt(db, &cfg.data_dir, task, role.as_ref(), done, playbook)?;
     Ok((role_prompt(role.as_ref(), &prompt), tools))
+}
+
+/// builder.md filled for one member, with the owner's preferences.
+fn member_prompt(db: &Db, data_dir: &Path, task: &Task, role: Option<&roster::Role>, done: &str, playbook: String) -> Result<String> {
+    let mut vars = builder_vars(db, task, role, done, playbook)?;
+    vars.push(("owner_preferences", crate::memory::prefs_for_prompt(data_dir)?));
+    Ok(prompts::fill(BUILDER_PROMPT, &vars))
 }
 
 /// Values for builder.md: who the member is, its job, and its own progress notes so far.
@@ -1953,6 +1962,23 @@ mod tests {
         let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &vars);
         assert!(prompts::unfilled(&filled).is_empty());
         assert!(filled.find("no Docker").unwrap() < filled.find("Client Playbook").unwrap());
+    }
+
+    #[test]
+    fn lead_and_member_prompts_get_the_owner_preferences() {
+        let (db, c) = setup();
+        let client = db.get_client(c).unwrap().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        client_state::ensure(data.path(), "acme", "/repo", None).unwrap();
+        client_state::append_knowledge(data.path(), "acme", "Owner says: no Docker").unwrap();
+        crate::memory::append(data.path(), "Always write tests first").unwrap();
+        let lead = prompts::fill(ACCOUNT_LEAD_PROMPT, &account_lead_vars(data.path(), &client, "a new task").unwrap());
+        let prefs = lead.find("Always write tests first").expect("lead gets preferences");
+        assert!(prefs < lead.find("no Docker").unwrap(), "preferences sit above the client knowledge");
+        let task = mk(&db, c, None, TaskStatus::Open);
+        let member = member_prompt(&db, data.path(), &task, None, "true", String::new()).unwrap();
+        assert!(member.contains("Owner preferences (owner's own lines win): - ") && member.contains("Always write tests first"));
+        assert!(prompts::unfilled(&member).is_empty());
     }
 
     #[test]

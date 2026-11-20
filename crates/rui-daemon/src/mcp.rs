@@ -215,6 +215,22 @@ pub struct AskOwnerArgs {
     pub options: Option<Vec<String>>,
 }
 
+/// Arguments for `remember`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct RememberArgs {
+    /// "me" for the owner's own preference, "client" for a fact about one client.
+    pub scope: String,
+    /// The client's name; required when scope is "client".
+    #[serde(default)]
+    pub client: Option<String>,
+    /// One plain sentence in the owner's words, at most 300 characters.
+    pub text: String,
+    /// Why this is worth keeping, in a few words.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
 /// Arguments for `stop_task`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -475,7 +491,7 @@ pub mod logic {
     }
 
     /// Existing client by name, or by the slug of the name.
-    fn find_client(db: &Db, name: &str) -> anyhow::Result<Option<rui_core::Client>> {
+    pub(crate) fn find_client(db: &Db, name: &str) -> anyhow::Result<Option<rui_core::Client>> {
         let name = name.trim();
         let slug = crate::projects::slug(name);
         for n in [name, slug.as_str()] {
@@ -1262,6 +1278,15 @@ impl RuiServer {
         Parameters(a): Parameters<AskOwnerArgs>,
     ) -> CallToolResult {
         finish(logic::ask_owner(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Save a lasting preference or client fact the owner stated in this chat. scope \"me\" saves to the owner's preferences; scope \"client\" saves to that client's knowledge. Only the owner's own words, one plain sentence.")]
+    async fn remember(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<RememberArgs>,
+    ) -> CallToolResult {
+        finish(crate::memory::remember(&self.db, &self.data_dir, &ctx_from(&parts), &a.scope, a.client.as_deref(), &a.text))
     }
 
     #[tool(description = "Permission prompt for built-in tools: holds dangerous Bash commands for the owner's OK. Not for the agent to call.")]
@@ -2423,7 +2448,7 @@ mod tests {
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
-        let rui = ["approve", "ask_owner", "create_client", "create_task", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "set_up_pod", "stop_apps", "stop_task", "use_repo"];
+        let rui = ["approve", "ask_owner", "create_client", "create_task", "escalate_to_owner", "instruct_task", "remember", "report_status", "rule", "run_apps", "set_up_pod", "stop_apps", "stop_task", "use_repo"];
         assert_eq!(tool_names(&app, "/mcp/rui", Server::Rui).await, rui);
         assert_eq!(tool_names(&app, "/mcp/scout", Server::Scout).await, ["report"]);
         assert_eq!(tool_names(&app, "/mcp/coach", Server::Coach).await, ["done", "propose"]);
