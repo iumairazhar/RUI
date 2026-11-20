@@ -108,8 +108,16 @@ fn bar(used_pct: f64, th: &Theme) -> Div {
     div().relative().w_full().h(px(6.)).rounded(px(3.)).bg(th.well).child(fill)
 }
 
-/// "42% used" with the status as a fallback when no utilization came.
-fn used_text(w: &LimitWindow) -> String {
+/// True when the window's reset time has passed, so the last numbers no longer apply.
+pub fn has_reset(w: &LimitWindow, now: i64) -> bool {
+    w.resets_at.is_some_and(|at| at <= now)
+}
+
+/// "42% used" with the status as a fallback when no utilization came; "0% used" after a reset.
+fn used_text(w: &LimitWindow, now: i64) -> String {
+    if has_reset(w, now) {
+        return "0% used".to_string();
+    }
     match (w.used_pct, w.status.as_deref()) {
         (Some(p), _) => format!("{p:.0}% used"),
         (None, Some(st)) => st.to_string(),
@@ -120,11 +128,20 @@ fn used_text(w: &LimitWindow) -> String {
 /// Name and "42% used" on one line, the bar, then when it resets.
 fn window_row(w: &LimitWindow, now: i64, th: &Theme) -> Div {
     let name = div().flex_1().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(window_label(&w.name));
-    let used = div().text_size(px(12.)).text_color(th.fg_2).child(used_text(w));
+    let used = div().text_size(px(12.)).text_color(th.fg_2).child(used_text(w, now));
     let top = div().flex().items_center().gap(px(8.)).child(name).child(used);
-    let reset = w.resets_at.map(|at| small(format!("{} ({})", reset_text(at, now, local_offset()), clock(at, local_offset())), th));
-    let bar = w.used_pct.map(|p| bar(p, th));
+    let reset = w.resets_at.map(|at| small(reset_line(at, now), th));
+    let bar = w.used_pct.map(|p| bar(if has_reset(w, now) { 0.0 } else { p }, th));
     div().flex().flex_col().gap(px(5.)).child(top).children(bar).children(reset)
+}
+
+/// "resets in 3h 12m (19:50)", or after the reset "Reset at 19:50. New numbers come with the next agent run."
+fn reset_line(at: i64, now: i64) -> String {
+    let off = local_offset();
+    if at <= now {
+        return format!("Reset at {}. New numbers come with the next agent run.", clock(at, off));
+    }
+    format!("{} ({})", reset_text(at, now, off), clock(at, off))
 }
 
 /// The one card, or the empty note.
@@ -192,8 +209,17 @@ mod tests {
     #[test]
     fn row_text_falls_back_to_status() {
         let w = LimitWindow { name: "x".into(), used_pct: Some(42.0), ..Default::default() };
-        assert_eq!(used_text(&w), "42% used");
+        assert_eq!(used_text(&w, 0), "42% used");
         let w = LimitWindow { status: Some("rejected".into()), ..Default::default() };
-        assert_eq!(used_text(&w), "rejected");
+        assert_eq!(used_text(&w, 0), "rejected");
+    }
+
+    #[test]
+    fn a_passed_reset_reads_as_zero_used() {
+        let w = LimitWindow { name: "five_hour".into(), used_pct: Some(80.0), resets_at: Some(3600), status: None };
+        assert!(!has_reset(&w, 3599));
+        assert_eq!(used_text(&w, 3599), "80% used");
+        assert!(has_reset(&w, 3600));
+        assert_eq!(used_text(&w, 7200), "0% used");
     }
 }

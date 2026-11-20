@@ -124,6 +124,8 @@ pub struct Store {
     pub toast: Option<Toast>,
     /// Answers still inside their undo window, by question id.
     pub sending: HashMap<i64, Sending>,
+    /// The minute last drawn: time-based text ("resets in 12m") needs a redraw each minute.
+    drawn_minute: i64,
     /// Inbox items hidden until a unix time, saved in `snoozes.json`.
     pub snoozed: HashMap<ItemKey, i64>,
     /// Client picked per chat id (0 while there is no chat yet), saved in `chat_clients.json`.
@@ -272,6 +274,7 @@ impl Store {
             tabs: HashMap::new(),
             toast: None,
             sending: HashMap::new(),
+            drawn_minute: 0,
             snoozed: snooze_file::load(&snooze_file::path()),
             chat_clients: chat_clients_file::load(&chat_clients_file::path()),
             open_changes: false,
@@ -424,6 +427,7 @@ impl Store {
         self.sending.retain(|_, s| s.undo.run_at > now);
         // An undo countdown is on screen: it ticks every second.
         changed |= before != self.sending.len() || !self.sending.is_empty();
+        changed |= put(&mut self.drawn_minute, now / 60);
         if let Some(id) = self.watched_thread {
             self.load_thread(id, cx);
         }
