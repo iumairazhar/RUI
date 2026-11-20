@@ -207,13 +207,14 @@ fn pending_loop<'a>(ctx: &'a Ctx, t: &Task) -> Option<&'a Event> {
     (t.status == TaskStatus::Stuck && hit.id > max_id(&evs, "resumed")).then_some(hit)
 }
 
-/// The top task's newest `forwarded` event while it is neither approved nor landed.
+/// The top task's newest `forwarded` event while the owner hasn't answered it (approved or sent
+/// back for changes) and it hasn't landed.
 fn pending_review<'a>(ctx: &'a Ctx) -> Option<&'a Event> {
     let evs = ctx.evs(ctx.top.id);
     let fwd = latest(&evs, "forwarded")?;
-    let approved = evs.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
+    let answered = max_id(&evs, "reviewed");
     let settled = max_id(&evs, "landed").max(max_id(&evs, "pr_merged")).max(max_id(&evs, "pr_closed"));
-    (fwd.id > approved && fwd.id > settled).then_some(fwd)
+    (fwd.id > answered && fwd.id > settled).then_some(fwd)
 }
 
 fn last_is_failure(evs: &[&Event]) -> bool {
@@ -888,6 +889,18 @@ mod tests {
         db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": null, "risk": "low", "reversible": true, "if_approved": ["merge"]})).unwrap();
         let d = get(&db, top, real_now()).nodes.iter().find_map(|n| n.decision.clone()).unwrap();
         assert_eq!((d.source, d.risk, d.reversible, d.if_approved), ("review", "low", Some(true), vec!["merge".to_string()]));
+    }
+
+    #[test]
+    fn sending_work_back_answers_the_review_until_new_work_comes() {
+        let (db, top, _) = setup(TaskStatus::Done);
+        db.set_task_status(top, TaskStatus::Done).unwrap();
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "first"})).unwrap();
+        db.add_event(Some(top), "owner", "reviewed", &json!({"verdict": "changes"})).unwrap();
+        let reviews = |db: &Db| get(db, top, real_now()).nodes.iter().filter(|n| n.decision.as_ref().is_some_and(|d| d.source == "review")).count();
+        assert_eq!(reviews(&db), 0, "sent back: nothing waits on the owner");
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "second"})).unwrap();
+        assert_eq!(reviews(&db), 1, "new work asks again");
     }
 
     #[test]

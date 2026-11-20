@@ -201,7 +201,8 @@ fn done_state(t: &Task, ev: &[Event]) -> (&'static str, String) {
     if t.parent_id.is_none() && latest_id(ev, "pr_merged") > forwarded && forwarded > 0 {
         return ("Done", "Merged on GitHub".into());
     }
-    if t.parent_id.is_none() && forwarded > approved {
+    // Sending it back for changes answers the review too; new work forwarded later asks again.
+    if t.parent_id.is_none() && forwarded > latest_id(ev, "reviewed") {
         return ("Needs you", REVIEW_REASON.into());
     }
     if approved > 0 {
@@ -352,7 +353,7 @@ mod tests {
         let ok = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "ok"}))];
         assert_eq!(word(&top, &ok, &[]), ("Done", "Reviewed by you".into()));
         let changes = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "changes"}))];
-        assert_eq!(word(&top, &changes, &[]).0, "Needs you");
+        assert_ne!(word(&top, &changes, &[]).0, "Needs you", "sending it back answers the review");
         let again = [fwd, ev(2, 1, "reviewed", json!({"verdict": "ok"})), ev(3, 1, "forwarded", json!({}))];
         assert_eq!(word(&top, &again, &[]), ("Needs you", REVIEW_REASON.into()));
     }
