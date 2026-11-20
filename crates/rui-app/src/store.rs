@@ -615,7 +615,8 @@ impl Store {
     pub fn snooze(&mut self, key: ItemKey, until: i64, cx: &mut Context<Self>) {
         self.snoozed.insert(key, until);
         snooze_file::save(&snooze_file::path(), &self.snoozed, now_secs());
-        self.show_toast("Snoozed", vec![], cx);
+        let word = if until == crate::views::inbox::DISMISSED { "Dismissed" } else { "Snoozed" };
+        self.show_toast(word, vec![], cx);
     }
 
     /// Show a snoozed inbox item again.

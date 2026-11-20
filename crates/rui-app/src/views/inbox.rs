@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 const PAGE_W: f32 = 760.;
 const EMPTY_TEXT: &str = "Nothing is waiting on you. Every thread settled below you.";
-const NONE_SNOOZED: &str = "Nothing is snoozed.";
+const NONE_SNOOZED: &str = "Nothing is snoozed or dismissed.";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -31,13 +31,19 @@ pub enum Snooze {
     Hour,
     /// Until 9:00 tomorrow, local time.
     Tomorrow,
+    /// Hidden until the owner brings it back.
+    Dismiss,
 }
+
+/// The snooze end a dismissed item gets.
+pub const DISMISSED: i64 = i64::MAX;
 
 /// Unix time a snooze ends, with `offset` the local UTC offset in seconds.
 pub fn snooze_until(s: Snooze, now: i64, offset: i64) -> i64 {
     match s {
         Snooze::Hour => now + 3600,
         Snooze::Tomorrow => ((now + offset).div_euclid(86_400) + 1) * 86_400 + 9 * 3600 - offset,
+        Snooze::Dismiss => DISMISSED,
     }
 }
 
@@ -57,6 +63,9 @@ pub fn awake_count(items: &[InboxItem], snoozed: &HashMap<ItemKey, i64>, now: i6
 
 /// "Until 14:05", or "Until tomorrow 09:00" when it ends on a later day.
 pub fn until_text(until: i64, now: i64, offset: i64) -> String {
+    if until == DISMISSED {
+        return "Dismissed".into();
+    }
     let day = |t: i64| (t + offset).div_euclid(86_400);
     let secs = (until + offset).rem_euclid(86_400);
     let clock = format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
@@ -301,8 +310,14 @@ impl InboxPanel {
         let name = div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(11.5)).text_color(th.muted).child(name);
         let key = item_key(it);
         let moon = round_button(format!("inbox-p-snooze-{i}"), "moon", th);
-        let moon = moon.on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(key.clone(), cx)));
-        div().flex().items_center().gap(px(8.)).child(kind_chip(word, st)).child(name).children(snoozable.then_some(moon))
+        let moon = moon.on_click(cx.listener({
+            let key = key.clone();
+            move |this, _, _, cx| this.toggle_menu(key.clone(), cx)
+        }));
+        let close = round_button(format!("inbox-p-dismiss-{i}"), "close", th);
+        let close = close.on_click(cx.listener(move |this, _, _, cx| this.snooze(key.clone(), Snooze::Dismiss, cx)));
+        let row = div().flex().items_center().gap(px(8.)).child(kind_chip(word, st)).child(name);
+        row.children(snoozable.then_some(moon)).children(snoozable.then_some(close))
     }
 
     /// The one short line under the title: a risk chip, the failure in red, or the reason.
@@ -426,7 +441,8 @@ impl InboxPanel {
 
     fn snoozed_buttons(&self, i: usize, it: &InboxItem, until: i64, th: &Theme, cx: &mut Context<Self>) -> Div {
         let key = item_key(it);
-        let wake = chip(format!("inbox-p-wake-{i}"), "Unsnooze", cx);
+        let label = if until == DISMISSED { "Bring back" } else { "Unsnooze" };
+        let wake = chip(format!("inbox-p-wake-{i}"), label, cx);
         let wake = wake.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.unsnooze(&key, cx))));
         let when = div().text_size(px(11.5)).text_color(th.muted).child(until_text(until, now_secs(), local_offset()));
         div().flex().items_center().gap(px(10.)).child(wake).child(when)
@@ -447,7 +463,7 @@ impl InboxPanel {
         let s = self.store.read(cx);
         let n = tab_count(Tab::Decisions, &s.inbox, &s.snoozed, now_secs());
         let decisions = if n > 0 { format!("Decisions {n}") } else { "Decisions".to_string() };
-        let tabs = [(Tab::All, "All".to_string()), (Tab::Decisions, decisions), (Tab::Snoozed, "Snoozed".to_string())];
+        let tabs = [(Tab::All, "All".to_string()), (Tab::Decisions, decisions), (Tab::Snoozed, "Snoozed & dismissed".to_string())];
         let items: Vec<AnyElement> = tabs.into_iter().enumerate().map(|(i, (tab, label))| self.tab_button(i, tab, label, th, cx)).collect();
         let bar = div().id("inbox-p-tabs").flex().gap(px(2.)).p(px(3.)).rounded(px(10.)).bg(th.well).border_1().border_color(th.hairline);
         div().pb(px(12.)).child(bar.children(items)).into_any_element()
@@ -505,6 +521,15 @@ mod tests {
 
     fn item(kind: &str, id: i64) -> InboxItem {
         InboxItem { kind: kind.into(), id, task_id: None, title: "t".into(), reason: String::new(), actions: vec![], created_at: String::new(), detail: None, link: None }
+    }
+
+    #[test]
+    fn dismissed_items_stay_hidden_and_say_so() {
+        let until = snooze_until(Snooze::Dismiss, 1000, 0);
+        let mut snoozed = HashMap::new();
+        snoozed.insert(("question".to_string(), 1), until);
+        assert!(is_snoozed(&snoozed, &("question".to_string(), 1), i64::MAX - 1));
+        assert_eq!(until_text(until, 1000, 0), "Dismissed");
     }
 
     #[test]
