@@ -759,14 +759,15 @@ impl Db {
         Ok(stmt.query_map([], event_from_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Epoch seconds of the newest activity per task: its newest event (heartbeat
-    /// and sweep bookkeeping like `stalled` or `worktree_kept` does not count), or its own update.
+    /// Epoch seconds of the newest activity per task: its newest event (heartbeat,
+    /// sweep bookkeeping like `stalled` or `worktree_kept`, and hiding a thread do not count), or its own update.
     pub fn last_activity(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
         let conn = self.conn()?;
         let sql = format!(
             "SELECT t.id, CAST(strftime('%s', MAX(t.updated_at, \
                COALESCE((SELECT MAX(created_at) FROM events WHERE task_id = t.id \
-               AND kind NOT IN ('stalled', 'heartbeat', 'worktree_kept', 'worktree_removed')), t.updated_at))) AS INTEGER) \
+               AND kind NOT IN ('stalled', 'heartbeat', 'worktree_kept', 'worktree_removed', \
+               'thread_hidden', 'thread_unhidden', 'thread_removed')), t.updated_at))) AS INTEGER) \
              FROM tasks t WHERE t.id IN ({})",
             id_list(ids)
         );

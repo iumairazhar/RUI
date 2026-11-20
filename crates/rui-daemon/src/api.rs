@@ -91,6 +91,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/threads", get(list_threads))
         .route("/threads/{id}", get(get_thread))
         .route("/threads/{id}/nodes/{node_id}", get(get_thread_node))
+        .route("/threads/{id}/hide", post(hide_thread))
+        .route("/threads/{id}/unhide", post(unhide_thread))
+        .route("/threads/{id}/remove", post(remove_thread))
         .route("/inbox", get(get_inbox))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
@@ -320,8 +323,10 @@ fn greeting_counts(db: &Db) -> anyhow::Result<(usize, usize, usize)> {
     let top = || tasks.iter().filter(|t| t.parent_id.is_none());
     let open = top().filter(|t| t.status != TaskStatus::Done).count();
     let in_loop = top().filter(|t| t.status == TaskStatus::InProgress).count();
+    let hidden = crate::hide::hidden(db)?;
+    let top_of = |id: i64| tasks.iter().find(|t| t.id == id).map_or(id, |t| t.parent_id.unwrap_or(t.id));
     let questions = db.list_questions(Some(QuestionStatus::Open))?;
-    let owner_qs = questions.iter().filter(|q| q.level == "owner").count();
+    let owner_qs = questions.iter().filter(|q| q.level == "owner" && !hidden.is_hidden(top_of(q.task_id))).count();
     let needs_you = owner_qs + db.list_chat_asks(Some("open"))?.len();
     Ok((in_loop, needs_you, open))
 }
@@ -427,13 +432,41 @@ struct ThreadsQuery {
     client_id: Option<i64>,
     state: Option<String>,
     all: Option<String>,
+    hidden: Option<String>,
+}
+
+fn flag(v: Option<&str>) -> bool {
+    matches!(v, Some("1" | "true"))
 }
 
 /// Threads (top-level tasks as conversations), needs-you first.
 async fn list_threads(State(s): State<ApiState>, Query(q): Query<ThreadsQuery>) -> ApiResult<Json<Vec<crate::thread::ThreadSummary>>> {
-    let all = matches!(q.all.as_deref(), Some("1" | "true"));
-    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), all, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    use crate::thread::Show;
+    let show = match (flag(q.hidden.as_deref()), flag(q.all.as_deref())) {
+        (true, _) => Show::Hidden,
+        (_, true) => Show::All,
+        _ => Show::Recent,
+    };
+    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), show, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
     Ok(Json(list))
+}
+
+/// Hides a thread from the board, the Inbox and the needs-you counts.
+async fn hide_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    crate::hide::hide(&s.db, id)?;
+    Ok(Json(serde_json::json!({ "id": id, "hidden": true })))
+}
+
+/// Brings a hidden thread back to the board.
+async fn unhide_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    crate::hide::unhide(&s.db, id)?;
+    Ok(Json(serde_json::json!({ "id": id, "hidden": false })))
+}
+
+/// Drops an unfinished thread with its team and hides it for good.
+async fn remove_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let dropped = crate::hide::remove(&s.db, &s.runs, id)?;
+    Ok(Json(serde_json::json!({ "id": id, "dropped": dropped })))
 }
 
 async fn get_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<crate::thread::Thread>> {
@@ -1753,6 +1786,71 @@ mod tests {
         assert_eq!(v[0]["needs_you_count"], 1);
         let (_, only) = call(&app, "GET", "/threads?state=planned", None).await;
         assert_eq!(only.as_array().unwrap().len(), 1);
+    }
+
+    fn thread_ids(v: &Value) -> Vec<i64> {
+        v.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn hiding_a_thread_takes_it_off_the_list_and_inbox() {
+        let (app, db, _rx) = setup();
+        let (_, top) = seed_task(&db);
+        db.create_ladder_question(top, Role::Lead, "owner", &[], "Pick one").unwrap();
+        assert_eq!(call(&app, "GET", "/inbox", None).await.1.as_array().unwrap().len(), 1);
+        assert_eq!(call(&app, "POST", &format!("/threads/{top}/hide"), None).await.0, StatusCode::OK);
+        assert!(thread_ids(&call(&app, "GET", "/threads", None).await.1).is_empty());
+        assert!(call(&app, "GET", "/inbox", None).await.1.as_array().unwrap().is_empty());
+        let (_, hidden) = call(&app, "GET", "/threads?hidden=1", None).await;
+        assert_eq!((thread_ids(&hidden), hidden[0]["hidden"].as_bool()), (vec![top], Some(true)));
+        assert_eq!(thread_ids(&call(&app, "GET", "/threads?all=1", None).await.1), vec![top]);
+        assert_eq!(call(&app, "POST", &format!("/threads/{top}/unhide"), None).await.0, StatusCode::OK);
+        let (_, back) = call(&app, "GET", "/threads", None).await;
+        assert_eq!((thread_ids(&back), back[0]["needs_you_count"].as_i64()), (vec![top], Some(1)));
+        assert!(thread_ids(&call(&app, "GET", "/threads?hidden=1", None).await.1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_running_thread_drops_and_hides_it() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        db.set_task_status(top, TaskStatus::InProgress).unwrap();
+        let q = db.create_ladder_question(sub, Role::Lead, "owner", &[], "Pick one").unwrap();
+        let (code, v) = call(&app, "POST", &format!("/threads/{top}/remove"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["dropped"], json!([top, sub]));
+        assert_eq!(db.get_task(top).unwrap().unwrap().status, TaskStatus::Stuck);
+        assert_eq!(db.get_question(q.id).unwrap().unwrap().status, QuestionStatus::Answered);
+        assert!(db.list_events(Some(top), 50).unwrap().iter().any(|e| e.kind == "dropped"));
+        assert!(thread_ids(&call(&app, "GET", "/threads", None).await.1).is_empty());
+        assert!(thread_ids(&call(&app, "GET", "/threads?hidden=1", None).await.1).is_empty());
+        let (code, v) = call(&app, "POST", &format!("/threads/{top}/unhide"), None).await;
+        assert_eq!((code, v["error"].as_str()), (StatusCode::CONFLICT, Some("removed threads stay hidden")));
+    }
+
+    #[tokio::test]
+    async fn removing_a_done_thread_only_hides_it() {
+        let (app, db, _rx) = setup();
+        let (_, top) = seed_task(&db);
+        db.set_task_status(top, TaskStatus::Done).unwrap();
+        let (code, v) = call(&app, "POST", &format!("/threads/{top}/remove"), None).await;
+        assert_eq!((code, v["dropped"].clone()), (StatusCode::OK, json!([])));
+        assert_eq!(db.get_task(top).unwrap().unwrap().status, TaskStatus::Done);
+        assert!(!db.list_events(Some(top), 50).unwrap().iter().any(|e| e.kind == "dropped"));
+        assert!(thread_ids(&call(&app, "GET", "/threads?all=1", None).await.1) == vec![top]);
+        assert!(thread_ids(&call(&app, "GET", "/threads", None).await.1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn hide_rejects_subtasks_and_unknown_ids() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        for action in ["hide", "unhide", "remove"] {
+            assert_eq!(call(&app, "POST", &format!("/threads/{sub}/{action}"), None).await.0, StatusCode::CONFLICT);
+            assert_eq!(call(&app, "POST", &format!("/threads/9999/{action}"), None).await.0, StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
