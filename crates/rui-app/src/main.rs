@@ -56,11 +56,11 @@ impl Nav {
         }
     }
 
-    /// Page to open at launch: `RUI_NAV=work` or `RUI_NAV=clients:1` (section, then sub-tab) for screenshots.
+    /// Page to open at launch: Work by default, or `RUI_NAV=rui` / `RUI_NAV=clients:1` (section, then sub-tab).
     fn from_env() -> Nav {
         let want = std::env::var("RUI_NAV").unwrap_or_default().to_lowercase();
         let name = want.split(':').next().unwrap_or("");
-        Nav::ALL.into_iter().find(|n| n.label().to_lowercase() == name).unwrap_or(Nav::Rui)
+        Nav::ALL.into_iter().find(|n| n.label().to_lowercase() == name).unwrap_or(Nav::Work)
     }
 
     /// Sub-tab from `RUI_NAV=<section>:<n>`, keyed like the store's `tabs`.
