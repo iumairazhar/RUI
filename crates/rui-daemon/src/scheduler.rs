@@ -668,6 +668,11 @@ fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
     if task.parent_id.is_some() || task.source_kind != SourceKind::Chat {
         return;
     }
+    // Start the apps once per task. Finishing again (e.g. after the owner's message woke the
+    // Lead) must not restart apps the owner may have stopped.
+    if latest_event(db, task_id, "apps_started").ok().flatten().is_some() {
+        return;
+    }
     let (db, apps, data_dir) = (db.clone(), apps.clone(), data_dir.to_path_buf());
     tokio::spawn(async move {
         if let Err(e) = launch_and_report(&db, &data_dir, &apps, &task).await {
