@@ -1,15 +1,15 @@
-//! "Edit" and "Delete client" in the client drawer. A blank field keeps the current value, which
+//! The Settings tab of the client drawer: edit fields and a "Danger zone" with Delete client. A blank field keeps the current value, which
 //! is shown as the field's placeholder (the text input has no way to be filled in).
 
+use crate::views::clients::{field, labeled};
 use crate::views::library::{self as lib, danger_button, run, toast};
 use crate::views::{chip, primary_button};
 use crate::api;
 use crate::store::Store;
 use crate::text_input::TextInput;
 use crate::theme::{Theme, theme};
-use gpui::{AnyElement, Context, Div, Entity, EventEmitter, FontWeight, Render, Window, div, prelude::*, px};
+use gpui::{Context, Div, Entity, EventEmitter, FontWeight, Render, Window, div, prelude::*, px};
 
-const TITLE: &str = "Edit";
 const SUBTITLE: &str = "Leave a field blank to keep it. Type - in hosts to remove them all.";
 const WARNING: &str = "Stops its running work and deletes its threads and history from RUI. The repo folder on disk is not touched. This can't be undone.";
 
@@ -145,21 +145,17 @@ impl EditPanel {
         cx.notify();
     }
 
-    fn field(input: &Entity<TextInput>, th: &Theme) -> AnyElement {
-        let f = div().px(px(10.)).py(px(4.)).rounded(px(8.)).bg(th.well).border_1().border_color(th.hairline);
-        f.font_family("Menlo").child(input.clone()).into_any_element()
-    }
-
     fn form(&self, th: &Theme, cx: &mut Context<Self>) -> Div {
         let label = if self.busy { "Saving\u{2026}" } else { "Save" };
         let save = primary_button("client-edit-save", label, cx).on_click(cx.listener(|this, _, _, cx| this.save(cx)));
         let rows = [("Name", &self.name), ("Repo folder", &self.repo), ("Allowed web hosts (comma separated)", &self.hosts)];
-        let fields: Vec<Div> = rows.map(|(l, i)| labeled(l, Self::field(i, th), th)).into();
-        div().flex().flex_col().gap(px(10.)).children(fields).child(div().flex().child(save))
+        let fields: Vec<Div> = rows.map(|(l, i)| labeled(l, field(i.clone(), true, th), th)).into();
+        div().flex().flex_col().gap(px(12.)).children(fields).child(div().flex().child(save))
     }
 
     fn danger_zone(&self, name: &str, th: &Theme, cx: &mut Context<Self>) -> Div {
-        let zone = div().flex().flex_col().gap(px(10.)).pt(px(12.)).border_t_1().border_color(th.hairline);
+        let zone = div().flex().flex_col().gap(px(10.)).mt(px(8.)).pt(px(16.)).border_t_1().border_color(th.hairline);
+        let zone = zone.child(div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.block.fg).child("Danger zone"));
         if !self.confirming {
             let ask = danger_button("client-delete", "Delete client", true, th).on_click(cx.listener(|this, _, _, cx| this.set_confirming(true, cx)));
             return zone.child(div().flex().child(ask));
@@ -171,22 +167,16 @@ impl EditPanel {
         }
         let cancel = chip("client-delete-cancel", "Cancel", cx).on_click(cx.listener(|this, _, _, cx| this.set_confirming(false, cx)));
         let warn = div().text_size(px(12.5)).text_color(th.fg_2).child(WARNING);
-        let ask = labeled(&format!("Type \u{201c}{name}\u{201d} to confirm"), Self::field(&self.confirm, th), th);
+        let ask = labeled(&format!("Type \u{201c}{name}\u{201d} to confirm"), field(self.confirm.clone(), true, th), th);
         zone.child(warn).child(ask).child(div().flex().items_center().gap(px(8.)).child(go).child(cancel))
     }
-}
-
-fn labeled(label: &str, el: AnyElement, th: &Theme) -> Div {
-    let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(label.to_string());
-    div().flex().flex_col().gap(px(4.)).child(head).child(el)
 }
 
 impl Render for EditPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
         let name = self.client.as_ref().map(|c| c.1.clone()).unwrap_or_default();
-        let title = div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(TITLE);
-        let head = div().flex().flex_col().gap(px(2.)).child(title).child(lib::note(SUBTITLE, &th));
+        let head = lib::note(SUBTITLE, &th);
         let form = self.form(&th, cx);
         let zone = self.danger_zone(&name, &th, cx);
         div().flex().flex_col().gap(px(12.)).child(head).child(form).child(zone)

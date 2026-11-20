@@ -5,16 +5,37 @@ use super::client_deploy::DeployPanel;
 use super::client_edit::{Done, EditPanel};
 use super::client_triggers::TriggerPanel;
 use super::library::{self as lib, after_slide, run, slide_overlay, toast};
-use super::{markdown, primary_button};
+use super::clients::{form_buttons, labeled, summary};
+use super::{chip, markdown, primary_button};
 use crate::api;
 use crate::store::Store;
 use crate::text_editor::{Save, TextEditor};
 use crate::theme::{Theme, theme};
 use gpui::{AnyElement, Context, Entity, FontWeight, Render, Window, div, prelude::*, px};
 
-const TITLE: &str = "What you know about this client";
-const SUBTITLE: &str = "Always wins over anything the agents inferred.";
-const EMPTY: &str = "Nothing yet. Add names, preferences, do's and don'ts.";
+const EMPTY: &str = "Nothing saved yet. Add names, preferences, do's and don'ts.";
+
+/// The drawer's tabs; one is shown at a time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Knowledge,
+    Automations,
+    Deploy,
+    Settings,
+}
+
+impl Tab {
+    const ALL: [Tab; 4] = [Tab::Knowledge, Tab::Automations, Tab::Deploy, Tab::Settings];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Knowledge => "Knowledge",
+            Tab::Automations => "Automations",
+            Tab::Deploy => "Deploy",
+            Tab::Settings => "Settings",
+        }
+    }
+}
 
 /// The `text` field of a `{text}` reply, or empty.
 fn reply_text(v: &serde_json::Value) -> String {
@@ -42,6 +63,8 @@ pub struct ClientDrawer {
     text: Option<String>,
     editor: Entity<TextEditor>,
     busy: bool,
+    tab: Tab,
+    adding: bool,
     triggers: Entity<TriggerPanel>,
     deploy: Entity<DeployPanel>,
     edit: Entity<EditPanel>,
@@ -55,13 +78,14 @@ impl ClientDrawer {
         let deploy = cx.new(|cx| DeployPanel::new(store.clone(), cx));
         let edit = cx.new(|cx| EditPanel::new(store.clone(), cx));
         cx.subscribe(&edit, |this, _, _: &Done, cx| this.close(cx)).detach();
-        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers, deploy, edit }
+        Self { store, open: None, closing: false, text: None, editor, busy: false, tab: Tab::Knowledge, adding: false, triggers, deploy, edit }
     }
 
     /// Open the drawer for a client and load its knowledge.
     pub fn open(&mut self, id: i64, name: String, cx: &mut Context<Self>) {
         let edit_name = name.clone();
         (self.open, self.closing, self.text, self.busy) = (Some((id, name)), false, None, false);
+        (self.tab, self.adding) = (Tab::Knowledge, false);
         self.editor.update(cx, |e, cx| e.set_text("", cx));
         self.triggers.update(cx, |t, cx| t.open(id, cx));
         self.deploy.update(cx, |d, cx| d.open(id, cx));
@@ -95,6 +119,7 @@ impl ClientDrawer {
         match res {
             Ok(val) if self.open.as_ref().map(|o| o.0) == Some(id) => {
                 self.text = Some(reply_text(&val));
+                self.adding = false;
                 self.editor.update(cx, |e, cx| e.set_text("", cx));
                 toast(&self.store, &added_title(name), "", cx);
             }
@@ -120,45 +145,87 @@ impl ClientDrawer {
         }
     }
 
+    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        cx.notify();
+    }
+
+    fn set_adding(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.adding = on;
+        if !on {
+            self.editor.update(cx, |e, cx| e.set_text("", cx));
+        }
+        cx.notify();
+    }
+
+    /// Name, one-line repo path and the small stats.
     fn head(&self, name: &str, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let eyebrow = div().text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.muted).child("CLIENT");
+        let id = self.open.as_ref().map(|o| o.0).unwrap_or_default();
+        let (repo, stats) = summary(id, self.store.read(cx));
         let title = div().text_size(px(23.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(name.to_string());
-        let left = div().flex().flex_col().gap(px(2.)).min_w_0().child(eyebrow).child(title);
+        let path = div().truncate().font_family("Menlo").text_size(px(11.5)).text_color(th.muted).child(repo);
+        let left = div().flex().flex_col().gap(px(2.)).min_w_0().child(title).child(path).child(lib::note(&stats, th));
         let close = lib::close_button("client-drawer-close", Self::close, th, cx);
-        let top = div().flex().items_start().justify_between().gap(px(12.)).child(left).child(close);
+        let top = div().flex().items_start().justify_between().gap(px(12.)).child(left.flex_1()).child(close);
         div().flex_none().px(px(20.)).pt(px(20.)).child(top).into_any_element()
+    }
+
+    /// Segmented control: one button per tab, the shown one filled.
+    fn tab_bar(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let seg = |t: Tab| {
+            let on = t == self.tab;
+            let b = div().id(("client-tab", t as usize)).flex_1().flex().justify_center().py(px(6.)).rounded(px(7.));
+            let b = b.text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).cursor_pointer().child(t.label());
+            let b = if on { b.bg(th.ctl).text_color(th.fg) } else { b.text_color(th.muted) };
+            b.on_click(cx.listener(move |this, _, _, cx| this.set_tab(t, cx))).into_any_element()
+        };
+        let bar = div().flex().gap(px(2.)).p(px(3.)).rounded(px(10.)).bg(th.well);
+        let bar = bar.children(Tab::ALL.map(seg));
+        div().flex_none().px(px(20.)).pt(px(14.)).child(bar).into_any_element()
     }
 
     /// The current knowledge as markdown, the empty line, or a loading note.
     fn current(&self, th: &Theme) -> AnyElement {
-        let body = match self.text.as_deref() {
+        match self.text.as_deref() {
             None => lib::note("Loading\u{2026}", th).into_any_element(),
             Some(t) => match shown(t) {
-                Some(md) => markdown::render(md, th.fg_2, 12.5, th),
+                Some(md) => div().p(px(16.)).rounded(px(10.)).bg(th.well).child(markdown::render(md, th.fg_2, 12.5, th)).into_any_element(),
                 None => lib::note(EMPTY, th).into_any_element(),
             },
-        };
-        div().p(px(16.)).rounded(px(10.)).bg(th.well).child(body).into_any_element()
+        }
     }
 
+    /// The note form: one bordered editor, Save and Cancel.
     fn input(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let boxed = div().id("knowledge-box").h(px(120.)).rounded(px(10.)).overflow_hidden().border_1().border_color(th.hairline);
-        let label = if self.busy { "Adding\u{2026}" } else { "Add" };
-        let btn = primary_button("knowledge-add", label, cx).on_click(cx.listener(|this, _, _, cx| this.add(cx)));
-        let row = div().flex().items_center().gap(px(10.)).child(btn).child(lib::note("Or press \u{2318}S", th));
-        div().flex().flex_col().gap(px(10.)).child(boxed.child(self.editor.clone())).child(row).into_any_element()
+        let label = if self.busy { "Saving\u{2026}" } else { "Save" };
+        let save = primary_button("knowledge-add", label, cx).on_click(cx.listener(|this, _, _, cx| this.add(cx)));
+        let cancel = chip("knowledge-cancel", "Cancel", cx).on_click(cx.listener(|this, _, _, cx| this.set_adding(false, cx)));
+        let row = form_buttons(save, cancel).child(lib::note("Or press \u{2318}S", th));
+        let note = labeled("Note", boxed.child(self.editor.clone()).into_any_element(), th);
+        div().flex().flex_col().gap(px(10.)).child(note).child(row).into_any_element()
+    }
+
+    fn knowledge(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let more = if self.adding {
+            self.input(th, cx)
+        } else {
+            chip("knowledge-open", "+ Add a note", cx).on_click(cx.listener(|this, _, _, cx| this.set_adding(true, cx))).into_any_element()
+        };
+        let col = div().flex().flex_col().items_start().gap(px(12.));
+        col.child(div().w_full().child(self.current(th))).child(div().w_full().child(more)).into_any_element()
     }
 
     fn drawer(&self, name: &str, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let title = div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(TITLE);
-        let head = div().flex().flex_col().gap(px(2.)).child(title).child(lib::note(SUBTITLE, th));
-        let known = div().flex().flex_col().gap(px(12.)).child(head).child(self.current(th)).child(self.input(th, cx));
-        let known = known.into_any_element();
-        let auto = self.triggers.clone().into_any_element();
-        let deploy = self.deploy.clone().into_any_element();
-        let edit = self.edit.clone().into_any_element();
-        let body = lib::scroll_body("client-drawer-body", vec![known, auto, deploy, edit]);
-        lib::drawer_shell("client-drawer", th).child(self.head(name, th, cx)).child(body).into_any_element()
+        let section = match self.tab {
+            Tab::Knowledge => self.knowledge(th, cx),
+            Tab::Automations => self.triggers.clone().into_any_element(),
+            Tab::Deploy => self.deploy.clone().into_any_element(),
+            Tab::Settings => self.edit.clone().into_any_element(),
+        };
+        let body = lib::scroll_body("client-drawer-body", vec![section]);
+        let shell = lib::drawer_shell("client-drawer", th);
+        shell.child(self.head(name, th, cx)).child(self.tab_bar(th, cx)).child(body).into_any_element()
     }
 }
 
