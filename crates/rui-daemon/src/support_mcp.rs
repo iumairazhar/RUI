@@ -1,6 +1,7 @@
-//! MCP servers for the two support agents: the Scout (`report`) and the Coach (`propose`, `done`).
-//! Each exposes only its own tools. The task comes from the run token's grant; a Scout run's grant
-//! also carries its request event id as the source ref.
+//! MCP servers for the support agents: the Scout (`report`), the Coach (`propose`, `done`) and
+//! planning-meeting turns (`plan_reply`). Each exposes only its own tools. The task comes from the
+//! run token's grant; a Scout run's grant also carries its request event id as the source ref, and
+//! a planning turn's carries "<request id>:<role>".
 
 use crate::coach::{self, Proposal};
 use crate::db::Db;
@@ -46,6 +47,24 @@ pub struct ProposeArgs {
     pub why: String,
 }
 
+/// Arguments for `plan_reply`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct PlanReplyArgs {
+    /// How you would do your part, in two to four plain sentences.
+    pub approach: String,
+    /// What could go wrong, one short line each.
+    #[serde(default)]
+    pub risks: Vec<String>,
+    /// What you need from other roles, one short line each, naming the role.
+    #[serde(default)]
+    pub needs: Vec<String>,
+    /// "S", "M" or "L".
+    pub size: String,
+    /// The test or check that proves your part is done.
+    pub proof: String,
+}
+
 /// Tool logic as plain functions, unit tested without MCP.
 pub mod logic {
     use super::*;
@@ -60,6 +79,14 @@ pub mod logic {
         let r = Report { summary: a.summary, findings: a.findings, sources: a.sources };
         let id = scout::report(db, request, Some(task_id(ctx)?), r)?;
         Ok(json!({"ok": true, "report_event_id": id}))
+    }
+
+    /// A planning turn's answer for the request and role named in the run's source ref.
+    pub fn plan_reply(db: &Db, ctx: &Ctx, a: PlanReplyArgs) -> anyhow::Result<Value> {
+        let (request, role) = ctx.source_ref.as_deref().and_then(crate::team::parse_source).context("missing planning meeting seat")?;
+        let r = crate::team::Reply { approach: a.approach, risks: a.risks, needs: a.needs, size: a.size, proof: a.proof };
+        let id = crate::team::reply(db, request, Some(task_id(ctx)?), &role, r)?;
+        Ok(json!({"ok": true, "reply_event_id": id}))
     }
 
     /// One Coach proposal; refused when it touches done commands, tests, evals or protected paths.
@@ -94,6 +121,35 @@ impl ScoutServer {
 
 #[tool_handler]
 impl ServerHandler for ScoutServer {
+    fn get_info(&self) -> ServerConfig {
+        info()
+    }
+}
+
+/// MCP server for planning-meeting turns.
+#[derive(Clone)]
+pub struct PlanServer {
+    db: Arc<Db>,
+    #[expect(dead_code, reason = "read by the tool_handler macro")]
+    tool_router: ToolRouter<Self>,
+}
+
+impl PlanServer {
+    pub fn new(db: Arc<Db>) -> Self {
+        Self { db, tool_router: Self::tool_router() }
+    }
+}
+
+#[tool_router]
+impl PlanServer {
+    #[tool(description = "Finish: say how you'd do your part (approach, risks, needs from other roles, size S/M/L, proof). Call it once.")]
+    async fn plan_reply(&self, Extension(parts): Extension<Parts>, Parameters(a): Parameters<PlanReplyArgs>) -> CallToolResult {
+        finish(logic::plan_reply(&self.db, &ctx_from(&parts), a))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for PlanServer {
     fn get_info(&self) -> ServerConfig {
         info()
     }
@@ -144,5 +200,13 @@ mod tests {
         let ctx = Ctx { task_id: Some(1), source_ref: None };
         let a = ReportArgs { summary: "x".into(), findings: vec![], sources: vec![] };
         assert!(logic::report(&db, &ctx, a).is_err());
+    }
+
+    #[test]
+    fn plan_reply_needs_the_seat_header() {
+        let db = Db::open_test();
+        let ctx = Ctx { task_id: Some(1), source_ref: None };
+        let a = PlanReplyArgs { approach: "x".into(), risks: vec![], needs: vec![], size: "S".into(), proof: "t".into() };
+        assert!(logic::plan_reply(&db, &ctx, a).is_err());
     }
 }

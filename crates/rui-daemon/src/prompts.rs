@@ -22,6 +22,9 @@ pub const SCOUT_VARS: [&str; 7] = ["question", "asked_by", "tools", "brief", "la
 /// Placeholders filled in `coach.md`.
 pub const COACH_VARS: [&str; 6] = ["title", "brief", "lessons", "client_playbook", "global_playbook", "library"];
 
+/// Placeholders filled in `plan.md`.
+pub const PLAN_VARS: [&str; 4] = ["role", "brief", "question", "pod_roles"];
+
 /// What a placeholder gets when there is nothing to say yet.
 pub const NONE_YET: &str = "(none yet)";
 
@@ -77,6 +80,7 @@ mod tests {
             (include_str!("../prompts/account_lead.md"), all(&ACCOUNT_LEAD_VARS)),
             (include_str!("../prompts/scout.md"), all(&SCOUT_VARS)),
             (include_str!("../prompts/coach.md"), all(&COACH_VARS)),
+            (include_str!("../prompts/plan.md"), all(&PLAN_VARS)),
         ];
         for (template, vars) in cases {
             assert_eq!(unfilled(&fill(template, &vars)), Vec::<String>::new());

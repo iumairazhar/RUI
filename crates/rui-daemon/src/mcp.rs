@@ -39,7 +39,7 @@ pub struct Ctx {
     pub source_ref: Option<String>,
 }
 
-/// Builds the router with `/mcp/rui`, `/mcp/lead`, `/mcp/builder`, `/mcp/scout` and `/mcp/coach`.
+/// Builds the router with `/mcp/rui`, `/mcp/lead`, `/mcp/builder`, `/mcp/scout`, `/mcp/coach` and `/mcp/plan`.
 /// Each route only accepts a run token granted for its own server.
 pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axum::Router {
     axum::Router::new()
@@ -47,6 +47,7 @@ pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axu
         .merge(guarded("/mcp/lead", Server::Lead, service(LeadServer::new(db.clone(), data_dir.clone()))))
         .merge(guarded("/mcp/builder", Server::Builder, service(BuilderServer::new(db.clone(), data_dir.clone()))))
         .merge(guarded("/mcp/scout", Server::Scout, service(crate::support_mcp::ScoutServer::new(db.clone()))))
+        .merge(guarded("/mcp/plan", Server::Plan, service(crate::support_mcp::PlanServer::new(db.clone()))))
         .merge(guarded("/mcp/coach", Server::Coach, service(crate::support_mcp::CoachServer::new(db, data_dir))))
 }
 
@@ -285,6 +286,16 @@ pub struct AskLeadArgs {
 pub struct AskScoutArgs {
     /// What the Scout should research or diagnose. Be specific.
     pub question: String,
+}
+
+/// Arguments for `ask_team`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AskTeamArgs {
+    /// 1 to 5 role names from this client's Pod: the members you intend to use.
+    pub roles: Vec<String>,
+    /// What you want each member to answer. Defaults to how they'd do their part.
+    pub question: Option<String>,
 }
 
 /// Arguments for `rule`.
@@ -1133,6 +1144,18 @@ pub mod logic {
         Ok(json!({"ok": true, "request_event_id": id, "note": note}))
     }
 
+    /// The Account Lead calls a planning meeting. It never blocks: the replies arrive as one instruction.
+    pub fn ask_team(db: &Db, data_dir: &Path, ctx: &Ctx, a: AskTeamArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if task.parent_id.is_some() {
+            anyhow::bail!("only the Account Lead can call a planning meeting");
+        }
+        let id = crate::team::ask(db, data_dir, &task, &a.roles, a.question.as_deref())?;
+        record(db, ctx, Role::Lead, "ask_team", &a)?;
+        let note = "Each role answers in the background. End your turn unless you have other work; you wake with all replies as an instruction.";
+        Ok(json!({"ok": true, "request_event_id": id, "note": note}))
+    }
+
     /// Member asks the Lead; the member waits until the question is ruled.
     pub fn ask_lead(db: &Db, data_dir: &Path, ctx: &Ctx, a: AskLeadArgs) -> anyhow::Result<Value> {
         let task = current_task(db, ctx)?;
@@ -1416,6 +1439,15 @@ impl LeadServer {
         Parameters(a): Parameters<AskScoutArgs>,
     ) -> CallToolResult {
         finish(logic::ask_scout(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Before splitting, ask 1 to 5 Pod roles how they'd do their part. Does not wait: end your turn; you wake with every reply as an instruction.")]
+    async fn ask_team(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AskTeamArgs>,
+    ) -> CallToolResult {
+        finish(logic::ask_team(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
@@ -2387,7 +2419,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["ask_scout", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
+        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
@@ -2395,6 +2427,7 @@ mod tests {
         assert_eq!(tool_names(&app, "/mcp/rui", Server::Rui).await, rui);
         assert_eq!(tool_names(&app, "/mcp/scout", Server::Scout).await, ["report"]);
         assert_eq!(tool_names(&app, "/mcp/coach", Server::Coach).await, ["done", "propose"]);
+        assert_eq!(tool_names(&app, "/mcp/plan", Server::Plan).await, ["plan_reply"]);
     }
 
     fn test_router(db: Arc<Db>) -> axum::Router {
@@ -2410,6 +2443,9 @@ mod tests {
         assert_eq!(status(&app, "/mcp/lead", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status(&app, "/mcp/rui", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status(&app, "/mcp/builder", Some(builder.value())).await, StatusCode::OK);
+        assert_eq!(status(&app, "/mcp/plan", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
+        let plan = token(Server::Plan, Some(1));
+        assert_eq!(status(&app, "/mcp/plan", Some(plan.value())).await, StatusCode::OK);
     }
 
     #[tokio::test]

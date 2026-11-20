@@ -67,6 +67,7 @@ fn beat_for(db: &Db, t: &Task, is_running: bool, last_at: i64, now: i64) -> Resu
     }
     match (t.parent_id, t.status) {
         (Some(_), TaskStatus::InProgress) => orphan_subtask(db, t.id),
+        (None, TaskStatus::Clarifying) if crate::team::lead_waits(db, t.id)? => Ok(None),
         (None, TaskStatus::Clarifying) => {
             let status = scheduler::recovered_status(db, t, TaskStatus::New)?;
             Ok(Some(Beat::RestartLead { task_id: t.id, status }))

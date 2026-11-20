@@ -35,6 +35,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod scheduler;
 pub mod scout;
+pub mod team;
 pub mod seat;
 pub mod seats;
 pub mod seats_api;
