@@ -201,6 +201,15 @@ fn fetch_all(after_id: Option<i64>, wanted: Option<i64>) -> Snapshot {
     (fetch_core(wanted), fetch_extras(after_id))
 }
 
+/// Replace `slot` with `new` only when they differ; true when it changed.
+fn put<T: PartialEq>(slot: &mut T, new: T) -> bool {
+    if *slot == new {
+        return false;
+    }
+    *slot = new;
+    true
+}
+
 /// Create the chat first when there is none, then post; returns the chat id.
 fn send_to(current: Option<i64>, text: &str, client: Option<&str>) -> anyhow::Result<i64> {
     let id = match current {
@@ -339,85 +348,98 @@ impl Store {
         Self::load_skills(cx);
     }
 
-    fn apply_extras(&mut self, extras: Extras) {
+    /// Store what the poll brought; true when anything shown on screen changed.
+    fn apply_extras(&mut self, extras: Extras) -> bool {
+        let mut changed = false;
         if let Some(apps) = extras.apps {
-            self.apps = apps;
+            changed |= put(&mut self.apps, apps);
         }
         if let Some(asks) = extras.asks {
-            self.asks = asks;
+            changed |= put(&mut self.asks, asks);
         }
         if let Some(done) = extras.answered {
             let skip = done.len().saturating_sub(MAX_ANSWERED_ASKS);
-            self.answered_asks = done.into_iter().skip(skip).collect();
+            changed |= put(&mut self.answered_asks, done.into_iter().skip(skip).collect());
         }
         if extras.seat.is_some() {
-            self.seat = extras.seat;
+            changed |= put(&mut self.seat, extras.seat);
         }
         if let Some(seats) = extras.seats {
-            self.seats = seats;
+            changed |= put(&mut self.seats, seats);
         }
         if let Some(runs) = extras.runs {
-            self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();
+            changed |= put(&mut self.runs, runs.into_iter().map(|r| (r.task_id, r)).collect());
         }
         if let Some(states) = extras.states {
-            self.states = states.into_iter().map(|s| (s.task_id, s)).collect();
+            changed |= put(&mut self.states, states.into_iter().map(|s| (s.task_id, s)).collect());
         }
         if let Some(threads) = extras.threads {
-            self.threads = threads;
+            changed |= put(&mut self.threads, threads);
         }
         if let Some(inbox) = extras.inbox {
-            self.apply_inbox(inbox);
+            changed |= self.apply_inbox(inbox);
         }
-        let Some(new) = extras.events else { return };
+        changed | self.apply_events(extras.events)
+    }
+
+    /// Append new events, keeping the newest MAX_EVENTS; true when there were any.
+    fn apply_events(&mut self, new: Option<Vec<Event>>) -> bool {
+        let Some(new) = new.filter(|n| !n.is_empty()) else { return false };
         self.events.extend(new);
         let excess = self.events.len().saturating_sub(MAX_EVENTS);
         self.events.drain(..excess);
         self.last_event_id = self.events.last().map(|e| e.id);
+        true
     }
 
     /// Store the inbox; notify for new stuck and review items, except on the first load.
-    fn apply_inbox(&mut self, inbox: Vec<InboxItem>) {
+    fn apply_inbox(&mut self, inbox: Vec<InboxItem>) -> bool {
         let fresh = notify::fresh(&mut self.seen_inbox, &inbox);
         if std::mem::replace(&mut self.inbox_loaded, true) {
             let items: Vec<(String, String)> = fresh.into_iter().map(|i| (i.title, i.reason)).collect();
             std::thread::spawn(move || items.iter().for_each(|(t, r)| notify::send(t, r)));
         }
-        self.inbox = inbox;
+        put(&mut self.inbox, inbox)
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
         let (core, extras) = snap;
-        self.apply_extras(extras);
+        let mut changed = self.apply_extras(extras);
         match core {
             Ok((clients, tasks, questions, chat_data)) => {
-                self.clients = clients;
-                self.tasks = tasks;
-                self.questions = questions;
-                self.apply_chat(chat_data);
-                self.error = None;
+                changed |= put(&mut self.clients, clients);
+                changed |= put(&mut self.tasks, tasks);
+                changed |= put(&mut self.questions, questions);
+                changed |= self.apply_chat(chat_data);
+                changed |= put(&mut self.error, None);
             }
             Err(_) => {
-                self.error = Some(format!("Daemon not reachable at {}", api::base_url()));
+                changed |= put(&mut self.error, Some(format!("Daemon not reachable at {}", api::base_url())));
             }
         }
         self.reload_changes(cx);
         self.load_needs_you(cx);
         let now = now_secs();
+        let before = self.sending.len();
         self.sending.retain(|_, s| s.undo.run_at > now);
+        // An undo countdown is on screen: it ticks every second.
+        changed |= before != self.sending.len() || !self.sending.is_empty();
         if let Some(id) = self.watched_thread {
             self.load_thread(id, cx);
         }
-        cx.notify();
+        // Redraw only when the poll brought something new; a steady screen stays still.
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Store the chat list; drop the messages if the selection changed while fetching.
-    fn apply_chat(&mut self, (chats, wanted, current, messages): ChatData) {
-        self.chats = chats;
+    fn apply_chat(&mut self, (chats, wanted, current, messages): ChatData) -> bool {
+        let changed = put(&mut self.chats, chats);
         if self.current_chat.is_some() && self.current_chat != wanted {
-            return;
+            return changed;
         }
-        self.current_chat = current;
-        self.chat = messages;
+        changed | put(&mut self.current_chat, current) | put(&mut self.chat, messages)
     }
 
     fn reload_changes(&mut self, cx: &mut Context<Self>) {
