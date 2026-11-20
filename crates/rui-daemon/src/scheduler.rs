@@ -678,11 +678,27 @@ fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
 
 async fn launch_and_report(db: &Db, data_dir: &Path, apps: &Apps, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
-    let repo = expand_home(&client.repo_path);
-    let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
-    let infos = apps::start_project(apps, &sb, &client.name, &repo).await;
+    let infos = start_client_apps(db, data_dir, apps, &client).await;
     db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
     post_done_notice(db, task, &client.repo_path, &infos)
+}
+
+/// Starts a client's apps from the repo, or from its newest task worktree when the code is
+/// only there (work not merged yet).
+pub async fn start_client_apps(db: &Db, data_dir: &Path, apps: &Apps, client: &Client) -> Vec<apps::AppInfo> {
+    let repo = expand_home(&client.repo_path);
+    let code = apps::code_dir(&repo, &task_worktrees(db, data_dir, client.id));
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &code);
+    apps::start_project_in(apps, &sb, &client.name, &repo, &code).await
+}
+
+/// The client's top-level task worktrees that exist, newest task first.
+fn task_worktrees(db: &Db, data_dir: &Path, client_id: i64) -> Vec<PathBuf> {
+    let mut tops: Vec<i64> = db.list_tasks().unwrap_or_default().into_iter()
+        .filter(|t| t.client_id == client_id && t.parent_id.is_none()).map(|t| t.id).collect();
+    tops.sort_unstable_by(|a, b| b.cmp(a));
+    let dir = |id: i64| data_dir.join("worktrees").join(format!("task-{id}"));
+    tops.into_iter().map(dir).filter(|p| p.is_dir()).collect()
 }
 
 /// Posts the done message into the chat of the message the task came from (`chat:<message id>`).

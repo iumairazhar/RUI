@@ -1294,9 +1294,7 @@ impl RuiServer {
             .db
             .get_client_by_name(project)?
             .ok_or_else(|| anyhow::anyhow!("project '{project}' not found"))?;
-        let repo = crate::scheduler::expand_home(&client.repo_path);
-        let sb = crate::sandbox::for_client(&self.data_dir, &client.name, &repo);
-        let infos = apps::start_project(&self.apps, &sb, &client.name, &repo).await;
+        let infos = crate::scheduler::start_client_apps(&self.db, &self.data_dir, &self.apps, &client).await;
         Ok(serde_json::to_value(infos)?)
     }
 }

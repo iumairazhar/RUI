@@ -124,11 +124,9 @@ async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
 /// Re-reads the project's apps.json and starts them in the background.
 async fn restart_apps(State(s): State<ApiState>, Path(project): Path<String>) -> ApiResult<StatusCode> {
     let client = s.db.get_client_by_name(&project)?.ok_or_else(|| not_found("project not found"))?;
-    let repo = crate::scheduler::expand_home(&client.repo_path);
-    let sb = crate::sandbox::for_client(&s.data_dir, &client.name, &repo);
-    let apps = s.apps.clone();
+    let (apps, db, data_dir) = (s.apps.clone(), s.db.clone(), s.data_dir.clone());
     tokio::spawn(async move {
-        apps::start_project(&apps, &sb, &client.name, &repo).await;
+        crate::scheduler::start_client_apps(&db, &data_dir, &apps, &client).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
