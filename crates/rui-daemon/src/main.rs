@@ -61,6 +61,7 @@ async fn main() {
         }
     };
     tokio::spawn(seat::refresh_loop(seat_cache));
+    tokio::spawn(rui_daemon::seats::probe_loop(db.clone()));
     tokio::spawn(scheduler::run(db.clone(), cfg.clone(), runs, client_locks, live.clone(), apps.clone()));
     tokio::spawn(chat::run(db, chat_rx, cfg, live));
     println!("rui-daemon listening on 127.0.0.1:{port}");

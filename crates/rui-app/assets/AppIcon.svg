@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2b24"/>
+      <stop offset="1" stop-color="#0e1410"/>
+    </linearGradient>
+    <linearGradient id="shell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3cc27c"/>
+      <stop offset="1" stop-color="#1f8a52"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="185" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <g transform="translate(176 150) scale(12)">
+    <ellipse cx="28" cy="50.5" rx="12" ry="2.3" fill="#000000" fill-opacity="0.35"/>
+    <path d="M28 16V9.6" fill="none" stroke="#3cc27c" stroke-width="2.2" stroke-linecap="round"/>
+    <circle cx="28" cy="7" r="3.1" fill="#f2a93b"/>
+    <rect x="10" y="15" width="36" height="31" rx="12" fill="url(#shell)"/>
+    <rect x="15.5" y="19.5" width="25" height="17" rx="8.5" fill="#0f1712"/>
+    <circle cx="23" cy="26.4" r="2.8" fill="#e9f7ef"/>
+    <circle cx="33" cy="26.4" r="2.8" fill="#e9f7ef"/>
+    <path d="M24.4 31.4q3.6 3.2 7.2 0" fill="none" stroke="#e9f7ef" stroke-width="1.7" stroke-linecap="round"/>
+    <rect x="14.5" y="40.8" width="27" height="2.6" rx="1.3" fill="#145c37"/>
+  </g>
+</svg>
