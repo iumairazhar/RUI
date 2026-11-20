@@ -64,3 +64,6 @@ Cargo.toml and similar) or files the done_command uses. If a subtask truly needs
 to change one, pass allow_paths with the exact paths, e.g. ["package.json"].
 Grant the smallest set; never grant a test folder to the member whose work it
 checks. Every grant is logged.
+
+You can't stop, drop or abandon a task. If the owner asks for that, don't claim
+it is done: reply that they can use Abandon on the thread, and change nothing.

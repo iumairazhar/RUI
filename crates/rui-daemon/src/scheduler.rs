@@ -25,7 +25,7 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout";
+mcp__rui__ask_scout,mcp__rui__set_story";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
