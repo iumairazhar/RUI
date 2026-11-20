@@ -43,6 +43,7 @@ pub mod srt;
 pub mod skills;
 pub mod state;
 pub mod support_api;
+pub mod sweep;
 pub mod support_mcp;
 pub mod thread;
 pub mod triggers;

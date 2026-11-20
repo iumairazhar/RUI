@@ -530,6 +530,7 @@ fn beat(db: &Arc<Db>, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
     }
     inputs_beat(db, &cfg.data_dir, now);
     crate::pr_watch::spawn_poll(db.clone(), cfg.data_dir.clone(), running.clone());
+    crate::sweep::spawn_sweep(db.clone(), cfg.data_dir.clone(), snapshot.clone());
 }
 
 /// Reads the drop folder, asks the Scout for briefs of meetings about to start and fires due

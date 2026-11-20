@@ -105,6 +105,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/checkpoint", post(checkpoint_task))
         .route("/tasks/{id}/take-over", post(take_over_task))
         .route("/tasks/{id}/hand-back", post(hand_back_task))
+        .route("/maintenance/clean-worktrees", post(clean_worktrees))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
@@ -768,7 +769,7 @@ async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResu
     let name = if top { format!("task-{id}") } else { id.to_string() };
     let dir = s.data_dir.join("worktrees").join(name);
     if !dir.exists() {
-        return Ok(Json(vec![]));
+        return Ok(Json(branch_changes(&s.db, &task).await?));
     }
     let done = task.status == TaskStatus::Done;
     let list = tokio::task::spawn_blocking(move || {
@@ -777,6 +778,47 @@ async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResu
         .await
         .map_err(anyhow::Error::from)??;
     Ok(Json(list))
+}
+
+/// The task's branch: the one it recorded, else the name RUI gives it.
+fn task_branch(task: &Task) -> String {
+    let fallback = || match task.parent_id {
+        None => worktree::task_branch_name(task.id),
+        Some(_) => worktree::branch_name(task.id),
+    };
+    task.branch.clone().unwrap_or_else(fallback)
+}
+
+/// Changes read from the task's branch when its worktree is gone (never made, or cleaned up).
+/// An unfinished subtask's work lived only in its worktree, so it has none to show.
+async fn branch_changes(db: &Db, task: &Task) -> ApiResult<Vec<Change>> {
+    let top = task.parent_id.is_none();
+    if !top && task.status != TaskStatus::Done {
+        return Ok(vec![]);
+    }
+    let Some(client) = db.get_client(task.client_id)? else { return Ok(vec![]) };
+    let repo = crate::scheduler::expand_home(&client.repo_path);
+    let branch = task_branch(task);
+    let list = tokio::task::spawn_blocking(move || worktree::branch_changes(&repo, &branch, top))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(list)
+}
+
+/// True once the sweep removed one of the task's worktrees.
+fn cleaned_up(db: &Db, id: i64) -> ApiResult<bool> {
+    Ok(!db.events_for_tasks(&[id], &["worktree_removed"], 0, 1)?.is_empty())
+}
+
+/// Removes the worktrees RUI no longer needs, now, and says which were removed or kept.
+async fn clean_worktrees(State(s): State<ApiState>) -> ApiResult<Json<crate::sweep::Sweep>> {
+    let running = s.runs.lock().map(|r| r.keys().copied().collect()).unwrap_or_default();
+    let (db, dir) = (s.db.clone(), s.data_dir.clone());
+    let now = crate::thread::now_secs();
+    let out = tokio::task::spawn_blocking(move || crate::sweep::sweep(&db, &dir, &running, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(out))
 }
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -826,8 +868,12 @@ async fn task_file(
     Path(id): Path<i64>,
     Query(q): Query<FileQuery>,
 ) -> ApiResult<Json<FileView>> {
-    s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
     let dir = s.data_dir.join("worktrees").join(id.to_string());
+    if !dir.exists() && cleaned_up(&s.db, id)? {
+        let msg = format!("This task's files were cleaned up; its branch {} still has them", task_branch(&task));
+        return Err(not_found(&msg));
+    }
     let view = tokio::task::spawn_blocking(move || read_worktree_file(&dir, &q.path))
         .await
         .map_err(anyhow::Error::from)??;
@@ -1587,6 +1633,41 @@ mod tests {
         assert_eq!(v["tasks"]["5"]["text"], "hi");
         assert_eq!(v["tasks"]["5"]["tool"], "Bash");
         assert_eq!(v["chats"]["2"], json!({"text":"","thinking":false,"tool":null,"tool_input":"","at":""}));
+    }
+
+    #[tokio::test]
+    async fn cleaned_task_reads_changes_from_its_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        git(&["init"]);
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Arc::new(Db::open_test());
+        let c = db.create_client("acme", &repo.path().to_string_lossy(), None, &[]).unwrap();
+        let new = |parent: Option<i64>| NewTask { client_id: c.id, parent_id: parent, title: "t".into(), body: String::new(), status: TaskStatus::Done, done_command: None, max_loops: 2, role: Role::Lead, source_kind: SourceKind::User, source_ref: None, agent: None, pod: vec![] };
+        let top = db.create_task(&new(None)).unwrap();
+        let sub = db.create_task(&new(Some(top.id))).unwrap();
+        let wts = data.path().join("worktrees");
+        let (task_wt, tb) = worktree::ensure_task_worktree(repo.path(), &wts, top.id, &worktree::base_branch(repo.path()).unwrap()).unwrap();
+        let (sub_wt, _) = worktree::create_worktree(repo.path(), &wts, sub.id, Some(&tb)).unwrap();
+        std::fs::write(task_wt.join("b.txt"), "b\n").unwrap();
+        worktree::commit_all(&task_wt, "add b").unwrap();
+        db.add_event(Some(top.id), "owner", "landed", &json!({})).unwrap();
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let (st, v) = call(&app, "POST", "/maintenance/clean-worktrees", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["removed"].as_array().unwrap().len(), 2, "{v}");
+        assert!(!task_wt.exists() && !sub_wt.exists());
+        let (st, v) = call(&app, "GET", &format!("/tasks/{}/changes", top.id), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v[0]["file"], "b.txt", "{v}");
+        let (st, v) = call(&app, "GET", &format!("/tasks/{}/file?path=a.txt", sub.id), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(v.to_string().contains(&format!("rui/{}", sub.id)), "{v}");
     }
 
     #[tokio::test]
