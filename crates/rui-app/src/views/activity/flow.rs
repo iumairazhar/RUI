@@ -142,9 +142,25 @@ fn anchor_of(nodes: &[Node], i: usize, spine: &[Placed]) -> Option<usize> {
     linked.or_else(|| steps().find(|&s| nodes[s].started_at >= n.started_at)).or_else(|| steps().next_back())
 }
 
-/// Attached nodes: above (came in) or below (went out) their spine step, a second one stacked further off.
+/// Horizontal room one attached card takes, gap included, so cards in a row never overlap.
+const CARD_W: f32 = DOT / 2. + CARD_RIGHT + 14.;
+
+/// The x where a card goes in its row: as close to `want` as the cards already there allow.
+fn free_x(rows: &mut Vec<(Zone, bool, f32)>, zone: Zone, far: bool, want: f32) -> f32 {
+    let row = rows.iter_mut().find(|(z, f, _)| *z == zone && *f == far);
+    let x = row.as_ref().map_or(want, |(_, _, next)| want.max(*next));
+    match row {
+        Some(r) => r.2 = x + CARD_W,
+        None => rows.push((zone, far, x + CARD_W)),
+    }
+    x
+}
+
+/// Attached nodes: above (came in) or below (went out) their spine step. Cards for one step take turns
+/// between the near and far row, and each row pushes a card right until it clears the one before.
 fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
     let mut rank: Vec<(Option<usize>, Zone, u32)> = Vec::new();
+    let mut rows: Vec<(Zone, bool, f32)> = Vec::new();
     let mut out = Vec::new();
     for (i, n) in nodes.iter().enumerate() {
         let zone = zone_of(n);
@@ -163,11 +179,13 @@ fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
             }
         };
         let ax = anchor.and_then(|a| spine.iter().find(|p| p.node == a)).map_or(FIRST_X, |p| p.x);
-        let slot = (r - 1) as f32 * 24.;
-        let (x, y) = match zone {
-            Zone::In => (ax - 40. + slot, SPINE_Y - if r == 1 { NEAR } else { FAR }),
-            _ => (ax + 40. + slot, SPINE_Y + if r == 1 { NEAR } else { FAR }),
+        let far = r % 2 == 0;
+        let off = if far { FAR } else { NEAR };
+        let (want, y) = match zone {
+            Zone::In => (ax - 40., SPINE_Y - off),
+            _ => (ax + 40., SPINE_Y + off),
         };
+        let x = free_x(&mut rows, zone, far, want);
         out.push(Placed { node: i, zone, planned: false, x, y, anchor });
     }
     out
@@ -814,7 +832,22 @@ mod tests {
         assert!(close(i.x, ax - 40.) && close(i.y, SPINE_Y - NEAR));
         let (o1, o2) = (at(&l, &nodes, "o1"), at(&l, &nodes, "o2"));
         assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + NEAR));
-        assert!(close(o2.x, ax + 40. + 24.) && close(o2.y, SPINE_Y + FAR));
+        assert!(close(o2.x, ax + 40.) && close(o2.y, SPINE_Y + FAR));
+    }
+
+    #[test]
+    fn cards_in_one_row_never_overlap() {
+        let mut a = node("a", "work", "done", "2026-11-18 10:00:00");
+        a.after = vec!["i1".into(), "i2".into(), "i3".into(), "i4".into()];
+        let ins: Vec<Node> = (1..=4).map(|k| node(&format!("i{k}"), "in", "done", "2026-11-18 09:59:00")).collect();
+        let nodes: Vec<Node> = std::iter::once(a).chain(ins).collect();
+        let l = layout(&nodes);
+        let cards: Vec<&Placed> = l.placed.iter().filter(|p| p.zone == Zone::In).collect();
+        for (i, p) in cards.iter().enumerate() {
+            for q in &cards[i + 1..] {
+                assert!(!close(p.y, q.y) || (p.x - q.x).abs() >= CARD_W - 0.5, "cards overlap");
+            }
+        }
     }
 
     #[test]
