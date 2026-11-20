@@ -20,7 +20,7 @@ const WORLD_H: f32 = 470.;
 const FIRST_X: f32 = 70.;
 const DOT: f32 = 34.;
 const DOT_SIDE: f32 = 28.;
-const LABEL_MAX_W: f32 = 212.;
+const LABEL_W: f32 = 200.;
 
 /// A point on the track, in pixels from its top-left corner.
 type Point = (f32, f32);
@@ -392,6 +392,16 @@ fn paint_strokes(b: Bounds<Pixels>, strokes: &[Stroke], window: &mut Window) {
     }
 }
 
+/// The left edge to scroll the track to: `focus` (the Now line) at 60% of the viewport, moved to
+/// the picked node when that would leave it out of view, and kept inside the world.
+fn scroll_target(focus: f32, picked: Option<f32>, viewport: f32, world: f32) -> f32 {
+    let mut left = focus - viewport * 0.6;
+    if let Some(x) = picked.filter(|x| *x < left + 40. || *x > left + viewport - 100.) {
+        left = x - viewport * 0.5;
+    }
+    left.clamp(0., (world - viewport).max(0.))
+}
+
 /// The highlighted node: the one the side panel shows for this thread, else its default node.
 fn selected_id(view: &ThreadsView, t: &Thread) -> Option<String> {
     let open = view.selected_node(t.id).filter(|id| t.nodes.iter().any(|n| n.id == *id));
@@ -400,12 +410,41 @@ fn selected_id(view: &ThreadsView, t: &Thread) -> Option<String> {
 
 impl ThreadsView {
     /// The Flow tab body: lane labels on the left, the scrolling track on the right.
-    pub(super) fn flow(&self, thread: Option<&Thread>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn flow(&mut self, thread: Option<&Thread>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(t) = thread else {
             return div().text_size(px(12.5)).text_color(th.muted).child("Loading the flow\u{2026}").into_any_element();
         };
-        let track = div().id("flow-track").flex_1().min_w_0().h_full().overflow_x_scroll().child(self.track(t, th, cx));
+        self.sync_flow_scroll(t, cx);
+        let track = div().id("flow-track").flex_1().min_w_0().h_full().overflow_x_scroll().track_scroll(&self.flow_scroll);
+        let track = track.child(self.track(t, th, cx));
         div().id("flow").flex().w_full().h(px(WORLD_H)).child(gutter(th)).child(track).into_any_element()
+    }
+
+    /// Scroll the map so the Now line (and the picked node) is in view: when a thread opens, and
+    /// when the picked node changes to one that is off screen.
+    fn sync_flow_scroll(&mut self, t: &Thread, cx: &mut Context<Self>) {
+        let picked = selected_id(self, t);
+        let key = (t.id, picked.clone());
+        if self.flow_key.as_ref() == Some(&key) {
+            return;
+        }
+        let viewport = f32::from(self.flow_scroll.bounds().size.width);
+        if viewport <= 0. {
+            cx.notify();
+            return;
+        }
+        let l = layout(&t.nodes);
+        let picked_x = picked.and_then(|id| l.placed.iter().find(|p| t.nodes[p.node].id == id).map(|p| p.x));
+        let left = -f32::from(self.flow_scroll.offset().x);
+        let in_view = picked_x.is_some_and(|x| x >= left && x <= left + viewport);
+        let same_thread = self.flow_key.as_ref().is_some_and(|k| k.0 == t.id);
+        self.flow_key = Some(key);
+        if same_thread && in_view {
+            return;
+        }
+        let focus = l.now_x.or(picked_x).unwrap_or(0.);
+        let x = scroll_target(focus, picked_x, viewport, l.width);
+        self.flow_scroll.set_offset(point(px(-x), px(0.)));
     }
 
     fn track(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -493,16 +532,16 @@ fn now_line(x: f32, th: &Theme) -> AnyElement {
 /// Icon file (in `icons/`) for a node: by lane, with kind, failed, needs_you and planned overriding.
 pub fn node_icon(n: &Node) -> &'static str {
     if is_planned(n) {
-        return "rui";
+        return "claude";
     }
     match (n.status.as_str(), n.kind.as_str(), lane_row(&n.lane)) {
         ("needs_you", ..) => "hand",
         ("failed", ..) => "close",
         (_, "pr", _) => "diff",
         (_, "doc", _) => "file",
-        (.., 0) => "send",
+        (.., 0) => "arrow",
         (.., 2) => "check",
-        _ => "rui",
+        _ => "claude",
     }
 }
 
@@ -606,9 +645,9 @@ fn label_view(n: &Node, p: &Placed, selected: bool, group: String, th: &Theme) -
         "stalled" if !p.planned => th.wait.fg,
         _ => th.muted,
     };
-    let title = div().text_size(px(12.5)).line_height(px(16.25)).font_weight(FontWeight::SEMIBOLD).text_color(ink).line_clamp(2);
-    let sub = div().max_w(px(190.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(sub_ink);
-    let card = div().flex().flex_col().gap(px(2.)).max_w(px(LABEL_MAX_W)).px(px(11.)).pt(px(6.)).pb(px(7.)).rounded(px(12.));
+    let title = div().w_full().text_size(px(12.5)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(ink).line_clamp(2);
+    let sub = div().w_full().h(px(14.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).line_height(px(14.)).text_color(sub_ink);
+    let card = div().flex().flex_col().flex_none().gap(px(3.)).w(px(LABEL_W)).px(px(11.)).pt(px(6.)).pb(px(7.)).rounded(px(12.));
     let card = card.child(title.child(n.title.clone())).child(sub.child(subtitle(n)));
     let hover = th.surface_2;
     let card = match (p.planned, n.status == "needs_you") {
@@ -629,6 +668,19 @@ fn label_view(n: &Node, p: &Placed, selected: bool, group: String, th: &Theme) -
 mod tests {
     use super::*;
     use crate::api::Decision;
+
+    #[test]
+    fn scroll_target_keeps_now_and_the_picked_node_in_view() {
+        // Now near the right edge of a wide world: scroll so it sits at 60% of the viewport.
+        assert!(close(scroll_target(1000., None, 800., 3000.), 520.));
+        // Never before the start, never past the end.
+        assert!(close(scroll_target(100., None, 800., 3000.), 0.));
+        assert!(close(scroll_target(2990., None, 800., 3000.), 2200.));
+        // A picked node left of the window pulls the view back to it.
+        assert!(close(scroll_target(1000., Some(200.), 800., 3000.), 0.));
+        assert!(close(scroll_target(1000., Some(700.), 800., 3000.), 520.));
+        assert!(close(scroll_target(1000., Some(1400.), 800., 3000.), 1000.));
+    }
 
     #[test]
     fn hhmm_wraps_the_day() {
@@ -748,12 +800,16 @@ mod tests {
     fn icons_by_lane_and_status() {
         let at = "2026-11-18 10:00:00";
         let icon = |l: &str, st: &str, t: &str| node_icon(&node("x", l, st, t));
-        assert_eq!(icon("in", "done", at), "send");
-        assert_eq!(icon("work", "running", at), "rui");
+        assert_eq!(icon("in", "done", at), "arrow");
+        assert_eq!(icon("work", "running", at), "claude");
         assert_eq!(icon("out", "done", at), "check");
         assert_eq!(icon("work", "needs_you", at), "hand");
         assert_eq!(icon("work", "failed", at), "close");
-        assert_eq!(icon("out", "planned", ""), "rui");
+        assert_eq!(icon("out", "planned", ""), "claude");
+        for name in ["arrow", "claude", "check", "hand", "close", "diff", "file"] {
+            let path = format!("icons/{name}.svg");
+            assert!(gpui::AssetSource::load(&crate::assets::Assets, &path).unwrap().is_some(), "{path}");
+        }
         let mut pr = node("x", "out", "done", at);
         pr.kind = "pr".into();
         assert_eq!(node_icon(&pr), "diff");

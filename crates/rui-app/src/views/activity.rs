@@ -331,6 +331,12 @@ pub struct ThreadsView {
     cards: Cards,
     /// The task page's Details section (model, team, effort) is open.
     details: bool,
+    /// The thread and picked node the map was last scrolled for.
+    flow_key: Option<(i64, Option<String>)>,
+    /// Horizontal scroll of the map track.
+    flow_scroll: ScrollHandle,
+    /// The board's "Every thread" chart is shown.
+    show_timeline: bool,
 }
 
 impl ThreadsView {
@@ -346,7 +352,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -360,6 +366,7 @@ impl ThreadsView {
         self.stop_open = false;
         self.abandon_armed = false;
         self.details = false;
+        self.flow_key = None;
         self.why.update(cx, |i, cx| i.clear(cx));
         let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
         self.set_tab(if top { Tab::Flow } else { Tab::Trace });
@@ -414,6 +421,19 @@ impl ThreadsView {
         let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child("Needs you");
         let row = div().flex().flex_wrap().gap(px(10.)).children(cards);
         Some(div().id("needs-strip").flex().flex_col().gap(px(8.)).pt(px(16.)).mr(px(40.)).child(head).child(row).into_any_element())
+    }
+
+    /// The "Show timeline" / "Hide timeline" text link beside the chart's heading.
+    fn timeline_toggle(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = if self.show_timeline { "Hide timeline" } else { "Show timeline" };
+        let hover = th.fg;
+        let link = div().id("timeline-toggle").flex_none().text_size(px(11.5)).text_color(th.muted).cursor_pointer();
+        let link = link.hover(move |s| s.text_color(hover)).child(label);
+        link.on_click(cx.listener(|this, _, _, cx| {
+            this.show_timeline = !this.show_timeline;
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     fn toggle_row(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -1204,7 +1224,8 @@ impl Render for ThreadsView {
         let strip = self.needs_strip(&th, cx);
         let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll().children(strip);
         // Tasks first; the four-hour chart sits below them.
-        let body = body.child(board).child(timeline::view(chart, &th));
+        let toggle = self.timeline_toggle(&th, cx);
+        let body = body.child(board).child(timeline::view(chart, self.show_timeline, toggle, &th));
         let confirm = self.confirm_view(&th, cx);
         let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
         let page = div().id("threads-page").relative().flex().flex_col().size_full();

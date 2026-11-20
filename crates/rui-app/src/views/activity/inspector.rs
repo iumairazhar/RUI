@@ -46,16 +46,39 @@ pub fn default_node(nodes: &[Node]) -> Option<&Node> {
     needs.or_else(running).or_else(done).or(nodes.first())
 }
 
+/// (year, month, day) of a day count since 1970-01-01.
+fn civil(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    (yoe + era * 400 + i64::from(mp >= 10), if mp < 10 { mp + 3 } else { mp - 9 }, d)
+}
+
+/// "today 10:24" when `at` falls on the same local day as `now`, else "11-18 10:24".
+/// Both are unix seconds in UTC; `offset` is the local offset east of UTC in seconds.
+pub fn when_text(at: i64, now: i64, offset: i64) -> String {
+    let (local, today) = (at + offset, now + offset);
+    let m = local.rem_euclid(86_400) / 60;
+    let clock = format!("{:02}:{:02}", m / 60, m % 60);
+    if local.div_euclid(86_400) == today.div_euclid(86_400) {
+        return format!("today {clock}");
+    }
+    let (_, month, day) = civil(local.div_euclid(86_400));
+    format!("{month:02}-{day:02} {clock}")
+}
+
 /// "Builder (agent) \u{b7} today 10:24"; an older day reads "11-18 10:24". Unknown parts are left out.
-pub fn who_when(n: &Node, now: i64) -> String {
+pub fn who_when(n: &Node, now: i64, offset: i64) -> String {
     let who = match &n.agent {
         _ if n.status == "owner" => Some("You".to_string()),
         Some(a) if !a.is_empty() => Some(format!("{a} (agent)")),
         _ => None,
     };
-    let clock = n.started_at.get(11..16);
-    let today = parse_secs(&n.started_at).is_some_and(|at| at / 86_400 == now / 86_400);
-    let when = clock.map(|c| if today { format!("today {c}") } else { format!("{} {c}", n.started_at.get(5..10).unwrap_or("")) });
+    let when = parse_secs(&n.started_at).map(|at| when_text(at, now, offset));
     [who, when].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
 }
 
@@ -65,10 +88,11 @@ pub fn risk_chip_text(risk: &str, reversible: Option<bool>) -> String {
     [Some(risk_label(risk).to_string()), rev].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
 }
 
-/// The "What happened" paragraph of a decision: why it came up, else the node's reason.
+/// The "What happened" paragraph of a decision: why it came up, else the full ask, else the node's reason.
 pub fn happened_text(n: &Node, d: &crate::api::Decision) -> Option<String> {
     let why = Some(d.why.trim().to_string()).filter(|w| !w.is_empty());
-    why.or_else(|| n.reason.clone().filter(|r| !r.trim().is_empty()))
+    let ask = Some(d.ask.trim().to_string()).filter(|a| !a.is_empty());
+    why.or(ask).or_else(|| n.reason.clone().filter(|r| !r.trim().is_empty()))
 }
 
 /// The last loaded event's id, once every page is loaded; new events come after it.
@@ -336,9 +360,9 @@ impl ThreadsView {
         let style = if ask { &th.wait } else { node_style(&n.status, th) };
         let risk = decision.map(|d| tag(&risk_style(&d.risk, th), &risk_chip_text(&d.risk, d.reversible)));
         let chips = div().flex().flex_wrap().items_center().gap(px(6.)).child(tag(style, label)).children(risk);
-        let title = decision.map(|d| first_line(&d.ask)).filter(|t| !t.is_empty()).unwrap_or_else(|| n.title.clone());
-        let title = div().mt(px(10.)).text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(title);
-        let who = Some(who_when(n, now)).filter(|w| !w.is_empty()).map(|w| self.who_row(n, w, th));
+        let title = div().mt(px(10.)).text_size(px(20.)).line_height(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg);
+        let title = title.line_clamp(3).child(n.title.clone());
+        let who = Some(who_when(n, now, super::timeline::local_offset())).filter(|w| !w.is_empty()).map(|w| self.who_row(n, w, th));
         let stalled = (n.status == "stalled").then(|| "No activity for 10 min".to_string());
         let reason = n.reason.clone().filter(|_| decision.is_none()).or(stalled);
         let reason = reason.map(|r| div().mt(px(8.)).text_size(px(11.5)).text_color(th.fg_2).child(r));
@@ -545,11 +569,23 @@ mod tests {
         n.agent = Some("Builder".into());
         n.started_at = "2026-11-18 10:24:00".into();
         let at = parse_secs(&n.started_at).unwrap();
-        assert_eq!(who_when(&n, at + 60), "Builder (agent) \u{b7} today 10:24");
-        assert_eq!(who_when(&n, at + 2 * 86_400), "Builder (agent) \u{b7} 11-18 10:24");
+        assert_eq!(who_when(&n, at + 60, 0), "Builder (agent) \u{b7} today 10:24");
+        assert_eq!(who_when(&n, at + 2 * 86_400, 0), "Builder (agent) \u{b7} 11-18 10:24");
         n.status = "owner".into();
-        assert_eq!(who_when(&n, at), "You \u{b7} today 10:24");
-        assert_eq!(who_when(&node("a", "", ""), at), "");
+        assert_eq!(who_when(&n, at, 0), "You \u{b7} today 10:24");
+        assert_eq!(who_when(&node("a", "", ""), at, 0), "");
+    }
+
+    #[test]
+    fn when_uses_the_local_day() {
+        // 23:14 UTC on 11-19 is 00:14 on 11-20 at +01:00, so with "now" on 11-20 it is today.
+        let at = parse_secs("2026-11-19 23:14:00").unwrap();
+        let now = parse_secs("2026-11-20 05:40:00").unwrap();
+        assert_eq!(when_text(at, now, 3600), "today 00:14");
+        assert_eq!(when_text(at, now, 0), "11-19 23:14");
+        // West of UTC the same moment is still the evening before.
+        assert_eq!(when_text(at, now, -5 * 3600), "11-19 18:14");
+        assert_eq!(when_text(at, now + 86_400, 3600), "11-20 00:14");
     }
 
     #[test]
@@ -566,6 +602,9 @@ mod tests {
         assert_eq!(happened_text(&n, &d).as_deref(), Some("Ready to ship"));
         d.why.clear();
         assert_eq!(happened_text(&n, &d), None);
+        d.ask = "Merge it?\nIt only adds a folder.".into();
+        assert_eq!(happened_text(&n, &d).as_deref(), Some("Merge it?\nIt only adds a folder."));
+        d.ask.clear();
         n.reason = Some("Waiting on you".into());
         assert_eq!(happened_text(&n, &d).as_deref(), Some("Waiting on you"));
     }

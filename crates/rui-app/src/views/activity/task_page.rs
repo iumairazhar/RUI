@@ -81,7 +81,7 @@ impl ThreadsView {
         }
         let flow = self.store.read(cx).thread_cache.get(&t.task.id).cloned().filter(|_| t.task.parent_id.is_none());
         let body = match self.tab {
-            Tab::Flow => section("Flow", vec![self.flow(flow.as_ref(), th, cx)]),
+            Tab::Flow => self.flow(flow.as_ref(), th, cx),
             Tab::Trace => {
                 let mut items = self.trace_rows(&rows, th, cx);
                 items.extend(live.as_ref().map(|l| live_row(l, th)));
@@ -96,7 +96,7 @@ impl ThreadsView {
         let details = self.details.then(|| self.details_section(t, all, now, th, cx));
         let has_flow = t.task.parent_id.is_none();
         let switch = self.tabs(has_flow, !results.is_empty(), has_flow, th, cx);
-        let page = div().id("task-page").relative().flex().size_full();
+        let page = div().id("task-page").relative().flex().size_full().overflow_hidden();
         if !has_flow {
             let scroll = scroll.flex().flex_col().gap(px(20.)).px(px(40.)).py(px(20.)).child(body);
             let face = character(char_state(&t.task.status, live.as_ref()), px(58.), ("task-rui", t.task.id as usize), th.client_color(t.task.client_id), th);
@@ -105,11 +105,11 @@ impl ThreadsView {
             return page.child(col.children(details).child(tabs).child(scroll).children(composer)).into_any_element();
         }
         let scroll = scroll.flex().flex_col().gap(px(20.)).p(px(24.)).child(body);
-        let card = div().id("task-body-card").flex().flex_col().flex_1().min_h_0().rounded(px(16.)).bg(th.surface).shadow(th.card_shadow());
+        let card = div().id("task-body-card").flex().flex_col().flex_1().min_h_0().overflow_hidden().rounded(px(16.)).bg(th.surface).shadow(th.card_shadow());
         let card = card.child(scroll).children(composer);
         let card = div().flex().flex_col().flex_1().min_h_0().px(px(30.)).pt(px(14.)).pb(px(14.)).child(card);
         let head = div().px(px(30.)).pt(px(4.)).child(self.head_card(t, flow.as_ref(), switch, th, cx));
-        let col = div().flex().flex_col().flex_1().min_w_0().child(self.crumbs(t, th, cx)).child(head);
+        let col = div().flex().flex_col().flex_1().min_w_0().min_h_0().h_full().child(self.crumbs(t, th, cx)).child(head);
         let col = col.children(details).child(card);
         page.child(col).children(self.inspector_view(flow.as_ref(), now, th, cx)).into_any_element()
     }
