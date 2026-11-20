@@ -102,10 +102,23 @@ pub fn seed_from(src_root: &Path, dst_root: &Path) {
     }
 }
 
-/// Seeds `<data_dir>/skills` from the source tree's `skills/` folder.
+/// Marks that the built-in skills were seeded once; skills the owner removes later stay removed.
+const SEEDED_MARK: &str = ".seeded";
+
+/// Seeds `<data_dir>/skills` from the source tree's `skills/` folder, on the first run only.
 pub fn seed(data_dir: &Path) {
     let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/skills"));
-    seed_from(src, &skills_dir(data_dir));
+    seed_once(src, &skills_dir(data_dir));
+}
+
+/// Seeds `dst_root` unless it was seeded before, then leaves the mark.
+pub fn seed_once(src_root: &Path, dst_root: &Path) {
+    let mark = dst_root.join(SEEDED_MARK);
+    if mark.exists() {
+        return;
+    }
+    seed_from(src_root, dst_root);
+    let _ = std::fs::create_dir_all(dst_root).and_then(|_| std::fs::write(&mark, ""));
 }
 
 fn git_common_dir(wt: &Path) -> Result<PathBuf> {
@@ -262,6 +275,17 @@ mod tests {
         write(&dst.path().join("a/SKILL.md"), "edited too");
         seed_from(src.path(), dst.path());
         assert_eq!(std::fs::read_to_string(dst.path().join("a/SKILL.md")).unwrap(), "edited too");
+    }
+
+    #[test]
+    fn seed_once_lets_removed_skills_stay_removed() {
+        let (src, dst) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write(&src.path().join("a/SKILL.md"), WITH_HINT);
+        seed_once(src.path(), dst.path());
+        assert!(dst.path().join("a/SKILL.md").exists());
+        std::fs::remove_dir_all(dst.path().join("a")).unwrap();
+        seed_once(src.path(), dst.path());
+        assert!(!dst.path().join("a").exists());
     }
 
     #[test]
