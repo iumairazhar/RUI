@@ -367,9 +367,74 @@ pub fn latest_gate_event(db: &Db) -> Result<Option<rui_core::Event>> {
     Ok(db.events_of_kinds(&["seats_exhausted", "seats_freed"])?.into_iter().last())
 }
 
+/// Claude usage-limit windows from a `rate_limit_event` stream line; empty for any other line.
+pub fn parse_limits(line: &serde_json::Value) -> Vec<rui_core::LimitWindow> {
+    if line["type"] != "rate_limit_event" {
+        return vec![];
+    }
+    let info = &line["rate_limit_info"];
+    let window = |name: &str, v: &serde_json::Value| rui_core::LimitWindow {
+        name: name.to_string(),
+        used_pct: v["utilization"].as_f64().map(|u| (u * 100.0).clamp(0.0, 100.0)),
+        resets_at: v["resetsAt"].as_i64(),
+        status: v["status"].as_str().map(String::from),
+    };
+    if let Some(all) = info["unifiedWindows"].as_object().filter(|m| !m.is_empty()) {
+        return all.iter().map(|(k, v)| window(k, v)).collect();
+    }
+    info["rateLimitType"].as_str().map(|n| window(n, info)).into_iter().collect()
+}
+
+static LATEST_LIMITS: std::sync::Mutex<Option<(Vec<rui_core::LimitWindow>, i64)>> = std::sync::Mutex::new(None);
+
+/// Remembers the limits of a stream line, if it carries any.
+pub fn record_limits(line: &serde_json::Value, now: i64) {
+    let w = parse_limits(line);
+    if !w.is_empty() {
+        *LATEST_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some((w, now));
+    }
+}
+
+/// The newest limits: from memory, else from the newest stored rate-limit event (after a restart).
+pub fn current_limits(db: &Db) -> Result<(Vec<rui_core::LimitWindow>, Option<i64>)> {
+    if let Some((w, at)) = LATEST_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok((w, Some(at)));
+    }
+    let found = db.list_events(None, 2000)?.into_iter().rev().find_map(|e| {
+        let w = if e.kind == "other" { parse_limits(&e.payload) } else { vec![] };
+        (!w.is_empty()).then(|| (w, secs_of(&e.created_at)))
+    });
+    let Some((w, at)) = found else { return Ok((vec![], None)) };
+    if let Some(at) = at {
+        *LATEST_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some((w.clone(), at));
+    }
+    Ok((w, at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REAL_LIMIT_LINE: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795170600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.42,"resetsAt":1795170600,"status":"allowed"},"seven_day":{"utilization":0.7,"resetsAt":1795402800,"status":"allowed"}}}}"#;
+
+    #[test]
+    fn parses_real_rate_limit_line() {
+        let w = parse_limits(&serde_json::from_str(REAL_LIMIT_LINE).unwrap());
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].name, "five_hour");
+        assert_eq!(w[0].used_pct, Some(42.0));
+        assert_eq!(w[0].resets_at, Some(1795170600));
+        assert_eq!(w[1].name, "seven_day");
+        assert_eq!(w[1].used_pct.map(|p| p.round()), Some(70.0));
+    }
+
+    #[test]
+    fn limit_line_without_windows_has_status_and_reset_only() {
+        let v = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":5,"rateLimitType":"five_hour"}});
+        let w = parse_limits(&v);
+        assert_eq!((w[0].used_pct, w[0].resets_at, w[0].status.as_deref()), (None, Some(5), Some("rejected")));
+        assert!(parse_limits(&json!({"type":"assistant"})).is_empty());
+    }
 
     fn seat(id: &str, order: i32, budget: Option<f64>) -> Seat {
         Seat { id: id.into(), label: id.into(), order, budget_usd: budget, ..default_seat() }

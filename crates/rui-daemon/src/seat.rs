@@ -28,6 +28,7 @@ pub fn parse_auth_status(json: &str) -> SeatInfo {
         org_name: s("orgName"),
         last_model: None,
         error: None,
+        ..Default::default()
     }
 }
 

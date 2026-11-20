@@ -50,6 +50,9 @@ After every event, append one line to the decisions log: what happened and why.
 When you escalate or forward_pr, say the risk (low, medium or high), whether it
 can be undone, and what happens after Approve as 2 to 5 short steps (risk,
 reversible, if_approved).
+When you escalate, also pass question (one short plain sentence the owner can
+answer at a glance) and options (2 to 4 short answers, recommendation first);
+keep the reasoning in why.
 After each turn that changes the state, call set_story with one sentence under
 160 characters: where things stand and what is next.
 A done_command is a check, not an action. It must only read and test; never
@@ -61,3 +64,6 @@ Cargo.toml and similar) or files the done_command uses. If a subtask truly needs
 to change one, pass allow_paths with the exact paths, e.g. ["package.json"].
 Grant the smallest set; never grant a test folder to the member whose work it
 checks. Every grant is logged.
+
+You can't stop, drop or abandon a task. If the owner asks for that, don't claim
+it is done: reply that they can use Abandon on the thread, and change nothing.

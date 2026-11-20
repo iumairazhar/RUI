@@ -4,9 +4,10 @@ use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
 use super::chat_tools::{ToolCall, results_by_id, tool_calls, tool_output, tool_row_head};
 use super::library::confirm_modal;
-use super::{chip, markdown, primary_button, question_card};
+use super::{chip, markdown, primary_button};
 use crate::api::LiveState;
-use crate::store::{self, Store};
+use super::inbox::is_snoozed;
+use crate::store::{self, ItemKey, Store, now_secs};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{
@@ -16,20 +17,20 @@ use super::activity::{icon, parse_secs, summarize};
 use super::roster::role_title;
 use crate::api::RoleInfo;
 use serde_json::Value;
-use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question};
+use rui_core::{Chat, ChatAsk, ChatMessage, ChatRole, Event, Question, Task};
 use std::collections::{HashMap, HashSet};
 
 /// Chat list, messages of the selected chat, open questions and a composer.
 pub struct ChatView {
     store: Entity<Store>,
     input: Entity<TextInput>,
-    answers: HashMap<i64, Entity<TextInput>>,
     ask_inputs: AskInputs,
     scroll: ScrollHandle,
     last_len: usize,
     last_chat: Option<i64>,
     confirm_delete: Option<(i64, String)>,
     open_tools: HashSet<String>,
+    client_menu: bool,
 }
 
 impl ChatView {
@@ -38,7 +39,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, answers: HashMap::new(), ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new() }
+        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -73,44 +74,21 @@ impl ChatView {
         self.store.update(cx, |s, cx| s.send_chat(text, cx));
     }
 
-    fn sync_inputs(&mut self, questions: &[Question], cx: &mut Context<Self>) {
-        self.answers.retain(|id, _| questions.iter().any(|q| q.id == *id));
-        for q in questions {
-            if self.answers.contains_key(&q.id) {
-                continue;
-            }
-            let id = q.id;
-            let input = cx.new(|cx| TextInput::new("Your answer...", cx));
-            cx.subscribe(&input, move |this, _, _: &Submit, cx| this.answer(id, cx)).detach();
-            self.answers.insert(id, input);
-        }
-    }
-
-    fn answer(&mut self, id: i64, cx: &mut Context<Self>) {
-        let Some(input) = self.answers.get(&id).cloned() else { return };
-        let text = input.read(cx).content();
-        if text.trim().is_empty() {
-            return;
-        }
-        input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.answer(id, text, None, cx));
-    }
-
     /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
     fn answer_ask(&mut self, id: i64, text: Option<String>, cx: &mut Context<Self>) {
         let Some(text) = text.or_else(|| self.ask_inputs.take(id, cx)) else { return };
         self.store.update(cx, |s, cx| s.answer_ask(id, text, cx));
     }
 
+    /// A calm one-line pointer to an open owner question; answering happens in the Inbox.
     fn question(&self, q: &Question, cx: &mut Context<Self>) -> AnyElement {
-        let id = q.id;
-        let input = match self.answers.get(&id) {
-            Some(i) => i.clone().into_any_element(),
-            None => div().into_any_element(),
-        };
-        let btn = chip(format!("answer-{id}"), "Answer", cx)
-            .on_click(cx.listener(move |this, _, _, cx| this.answer(id, cx)));
-        question_card(&q.text, None, input, btn.into_any_element(), cx).into_any_element()
+        let (id, th) = (q.id, theme(cx).clone());
+        let icon = svg().path("icons/hand.svg").flex_none().size(px(15.)).text_color(th.wait.fg);
+        let text = div().flex_1().min_w_0().truncate().text_size(px(13.)).text_color(th.wait.fg).child(pointer_text(&q.text));
+        let go = chip(format!("answer-{id}"), "Answer in Inbox", cx)
+            .on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_question(id, cx))));
+        let row = div().flex().items_center().gap(px(10.)).max_w(px(660.)).px(px(12.)).py(px(10.)).rounded(px(9.));
+        row.bg(th.wait.dim).border_1().border_color(th.wait.rim).child(icon).child(text).child(go).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -216,6 +194,30 @@ impl ChatView {
         card.border_1().border_color(th.hairline).flex().flex_col().gap(px(6.)).child(head).child(body).child(scope).child(foot).into_any_element()
     }
 
+    fn choose_client(&mut self, client: Option<i64>, cx: &mut Context<Self>) {
+        self.client_menu = false;
+        self.store.update(cx, |s, cx| s.pick_client(client, cx));
+    }
+
+    /// The "Client: …" chip; its menu lists Auto and every client.
+    fn client_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = self.store.read(cx);
+        let label = format!("Client: {}", s.picked_client().map_or("Auto", |c| c.name.as_str()));
+        let mut options: Vec<(Option<i64>, String)> = vec![(None, "Auto".into())];
+        options.extend(s.clients.iter().map(|c| (Some(c.id), c.name.clone())));
+        let chip = chip("chat-client", &label, cx).on_click(cx.listener(|this, _, _, cx| {
+            this.client_menu = !this.client_menu;
+            cx.notify();
+        }));
+        let menu = self.client_menu.then(|| {
+            let items = options.into_iter().enumerate().map(|(i, (id, name))| {
+                super::chip(format!("chat-client-{i}"), &name, cx).on_click(cx.listener(move |this, _, _, cx| this.choose_client(id, cx)))
+            });
+            div().flex().flex_col().gap(px(4.)).children(items)
+        });
+        div().flex().flex_col().gap(px(4.)).children(menu).child(chip).into_any_element()
+    }
+
     fn composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let send = primary_button("send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
@@ -235,6 +237,7 @@ impl ChatView {
                     .rounded(px(14.))
                     .bg(th.surface)
                     .shadow(th.card_shadow())
+                    .child(self.client_picker(cx))
                     .child(div().flex_1().child(self.input.clone()))
                     .child(send),
             )
@@ -447,6 +450,16 @@ fn place_asks(chat: &[ChatMessage], asks: &[ChatAsk]) -> HashMap<i64, Vec<ChatAs
 }
 
 /// "✓ question — You chose: answer".
+/// A question's first line, cut to 100 characters with an ellipsis.
+fn pointer_text(text: &str) -> String {
+    let line = super::decision::first_line(text);
+    if line.chars().count() <= 100 {
+        return line;
+    }
+    let cut: String = line.chars().take(100).collect();
+    format!("{}\u{2026}", cut.trim_end())
+}
+
 fn answered_text(a: &ChatAsk) -> String {
     match a.answer.as_deref().filter(|t| !t.is_empty()) {
         Some(answer) => format!("\u{2713} {} \u{2014} You chose: {answer}", a.text),
@@ -656,9 +669,9 @@ impl Render for ChatView {
             let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
             let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
-            (s.chat.clone(), s.chats.clone(), s.current_chat, s.questions.clone(), live, state, cards, asks, tools, live_calls)
+            let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat, &s.snoozed);
+            (s.chat.clone(), s.chats.clone(), s.current_chat, questions, live, state, cards, asks, tools, live_calls)
         };
-        self.sync_inputs(&questions, cx);
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
         self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
         if current != self.last_chat {
@@ -691,9 +704,52 @@ impl Render for ChatView {
     }
 }
 
+/// The chat message a task's thread started from: its top task's `chat:<message id>` source.
+fn source_message(task_id: i64, tasks: &[Task]) -> Option<i64> {
+    let mut t = tasks.iter().find(|t| t.id == task_id)?;
+    while let Some(parent) = t.parent_id {
+        t = tasks.iter().find(|p| p.id == parent)?;
+    }
+    t.source_ref.as_deref()?.strip_prefix("chat:")?.parse().ok()
+}
+
+/// Open questions from threads started in this chat; the rest live only in the Inbox.
+/// Snoozed questions stay hidden here too.
+fn questions_in_chat(questions: &[Question], tasks: &[Task], chat: &[ChatMessage], snoozed: &HashMap<ItemKey, i64>) -> Vec<Question> {
+    let here = |q: &&Question| source_message(q.task_id, tasks).is_some_and(|m| chat.iter().any(|c| c.id == m));
+    let awake = |q: &&Question| !is_snoozed(snoozed, &("question".to_string(), q.id), now_secs());
+    questions.iter().filter(here).filter(awake).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn task(id: i64, parent: Option<i64>, source: Option<&str>) -> Task {
+        serde_json::from_value(json!({"id": id, "client_id": 1, "parent_id": parent, "title": "t", "body": "", "status": "open",
+            "done_command": null, "max_loops": 3, "loops_used": 0, "role": "lead", "branch": null, "source_kind": "chat",
+            "source_ref": source, "depends_on": [], "created_at": "", "updated_at": ""}))
+        .unwrap()
+    }
+
+    fn question(id: i64, task_id: i64) -> Question {
+        serde_json::from_value(json!({"id": id, "task_id": task_id, "asked_by": "builder", "text": "q", "answer": null,
+            "status": "open", "created_at": ""}))
+        .unwrap()
+    }
+
+    #[test]
+    fn questions_show_only_in_the_chat_that_started_their_thread() {
+        let tasks = vec![task(22, None, Some("chat:7")), task(23, Some(22), Some("task:22")), task(30, None, None)];
+        let qs = vec![question(1, 23), question(2, 30), question(3, 99)];
+        let here: Vec<ChatMessage> = vec![serde_json::from_value(json!({"id": 7, "chat_id": 4, "role": "user", "content": "go", "created_at": ""})).unwrap()];
+        let ids: Vec<i64> = questions_in_chat(&qs, &tasks, &here, &HashMap::new()).iter().map(|q| q.id).collect();
+        assert_eq!(ids, [1]);
+        assert!(questions_in_chat(&qs, &tasks, &[], &HashMap::new()).is_empty());
+        let snoozed = HashMap::from([(("question".to_string(), 1), i64::MAX)]);
+        assert!(questions_in_chat(&qs, &tasks, &here, &snoozed).is_empty());
+    }
 
     #[test]
     fn live_steps_only_while_waiting_in_this_chat() {

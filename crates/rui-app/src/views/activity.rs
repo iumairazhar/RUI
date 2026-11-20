@@ -23,6 +23,7 @@ use super::{chip, markdown, primary_button, tag};
 use super::decision::{self, CardEvent, Cards};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
+use super::inbox::is_snoozed;
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
@@ -254,8 +255,24 @@ fn board_thread(s: &Store, sum: &ThreadSummary) -> Option<Thread> {
     t.client = sum.client.name.clone();
     t.word = board_word(word_of(&s.states, sum.id), &sum.state);
     t.reason = sum.story.clone().unwrap_or_default();
-    t.needs = sum.needs_you_count;
+    t.needs = awake_for_thread(s, sum.id);
     Some(t)
+}
+
+/// Inbox items of one thread that are not snoozed or dismissed, so the card tag matches the Inbox.
+fn awake_for_thread(s: &Store, thread_id: i64) -> usize {
+    let now = crate::store::now_secs();
+    let mine = |i: &crate::api::InboxItem| i.task_id.is_some_and(|id| top_id(&s.tasks, id) == thread_id);
+    let awake = |i: &crate::api::InboxItem| !super::inbox::is_snoozed(&s.snoozed, &super::inbox::item_key(i), now);
+    s.inbox.iter().filter(|i| mine(i) && awake(i)).count()
+}
+
+/// The top-level task a task belongs to.
+fn top_id(tasks: &[Task], mut id: i64) -> i64 {
+    while let Some(parent) = tasks.iter().find(|t| t.id == id).and_then(|t| t.parent_id) {
+        id = parent;
+    }
+    id
 }
 
 /// The thread's word, except a task the app already shows as Stopped stays Stopped
@@ -328,13 +345,22 @@ pub struct ThreadsView {
     note: Entity<TextInput>,
     /// Decision cards for the Home strip and the inspector.
     cards: Cards,
+    /// The task page's Details section (model, team, effort) is open.
+    details: bool,
+    /// The thread and picked node the map was last scrolled for.
+    /// Thread, picked node and viewport width the map was last scrolled for.
+    flow_key: Option<(i64, Option<String>, i32)>,
+    /// Horizontal scroll of the map track.
+    flow_scroll: ScrollHandle,
+    /// The board's "Every thread" chart is shown.
+    show_timeline: bool,
 }
 
 impl ThreadsView {
     /// Build the threads view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let input = cx.new(|cx| TextInput::new("Answer it, or pass down new instructions…", cx));
+        let input = cx.new(|cx| TextInput::new("Write to the thread", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         let why = cx.new(|cx| TextInput::new("Why? (optional)", cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.stop_now(cx)).detach();
@@ -343,7 +369,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default() }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -356,6 +382,8 @@ impl ThreadsView {
         self.open = Some(id);
         self.stop_open = false;
         self.abandon_armed = false;
+        self.details = false;
+        self.flow_key = None;
         self.why.update(cx, |i, cx| i.clear(cx));
         let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
         self.set_tab(if top { Tab::Flow } else { Tab::Trace });
@@ -392,7 +420,9 @@ impl ThreadsView {
     fn needs_cards(&self, cx: &Context<Self>) -> Vec<decision::CardData> {
         let s = self.store.read(cx);
         let ids: Vec<i64> = s.threads.iter().filter(|t| t.needs_you_count > 0).map(|t| t.id).collect();
-        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).collect();
+        let now = crate::store::now_secs();
+        let awake = |c: &decision::CardData| c.decision.question_id.is_none_or(|q| !is_snoozed(&s.snoozed, &("question".into(), q), now));
+        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).filter(awake).collect();
         let mut cards = decision::with_sending(cards, s, |_| true);
         decision::sort_cards(&mut cards);
         cards
@@ -410,6 +440,19 @@ impl ThreadsView {
         Some(div().id("needs-strip").flex().flex_col().gap(px(8.)).pt(px(16.)).mr(px(40.)).child(head).child(row).into_any_element())
     }
 
+    /// The "Show timeline" / "Hide timeline" text link beside the chart's heading.
+    fn timeline_toggle(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = if self.show_timeline { "Hide timeline" } else { "Show timeline" };
+        let hover = th.fg;
+        let link = div().id("timeline-toggle").flex_none().text_size(px(11.5)).text_color(th.muted).cursor_pointer();
+        let link = link.hover(move |s| s.text_color(hover)).child(label);
+        link.on_click(cx.listener(|this, _, _, cx| {
+            this.show_timeline = !this.show_timeline;
+            cx.notify();
+        }))
+        .into_any_element()
+    }
+
     fn toggle_row(&mut self, i: usize, cx: &mut Context<Self>) {
         if !self.expanded.remove(&i) {
             self.expanded.insert(i);
@@ -421,12 +464,24 @@ impl ThreadsView {
         if rows.is_empty() {
             return vec![div().text_size(px(12.5)).text_color(th.muted).child("No steps yet.").into_any_element()];
         }
-        rows.iter().enumerate().map(|(i, r)| self.trace_row(i, r, th, cx)).collect()
+        let names = self.member_names(rows, cx);
+        rows.iter().enumerate().map(|(i, r)| self.trace_row(i, r, r.task_id.and_then(|t| names.get(&t).cloned()), th, cx)).collect()
     }
 
-    fn trace_row(&self, i: usize, r: &TraceRow, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// "Frontend Engineer 01" for each task in the rows, only when more than one task appears.
+    fn member_names(&self, rows: &[TraceRow], cx: &Context<Self>) -> HashMap<i64, String> {
+        let ids: HashSet<i64> = rows.iter().filter_map(|r| r.task_id).collect();
+        if ids.len() < 2 {
+            return HashMap::new();
+        }
+        let s = self.store.read(cx);
+        let name = |t: &Task| super::roster::member_name(t, &s.tasks, &s.roles).map(|n| (t.id, n));
+        s.tasks.iter().filter(|t| ids.contains(&t.id)).filter_map(name).collect()
+    }
+
+    fn trace_row(&self, i: usize, r: &TraceRow, who: Option<String>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.expanded.contains(&i);
-        let head = trace_head(i, r, open, th);
+        let head = trace_head(i, r, who, open, th);
         let head = match r.detail {
             Some(_) => head.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.toggle_row(i, cx))).into_any_element(),
             None => head.into_any_element(),
@@ -488,27 +543,22 @@ impl ThreadsView {
         if text.trim().is_empty() {
             return;
         }
-        let open_q = self.store.read(cx).questions.iter().find(|q| {
-            q.task_id == id && q.status == QuestionStatus::Open
-        });
-        let qid = open_q.map(|q| q.id);
         self.input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| match qid {
-            Some(q) => s.answer(q, text, None, cx),
-            None => s.instruct_task(id, text, cx),
-        });
+        self.store.update(cx, |s, cx| s.instruct_task(id, text, cx));
     }
 
-    fn fill(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.input.update(cx, |i, cx| i.set_content(text, cx));
-    }
-
+    /// The task's events, plus its steps' events for a split thread, oldest first.
     fn task_data(&self, id: i64, cx: &Context<Self>) -> (Vec<Event>, Vec<Change>) {
         let s = self.store.read(cx);
-        let events = match s.task_events.get(&id) {
-            Some(list) => list.clone(),
-            None => s.events.iter().filter(|e| e.task_id == Some(id)).cloned().collect(),
-        };
+        let steps = s.tasks.iter().filter(|t| t.parent_id == Some(id)).map(|t| t.id);
+        let mut events = Vec::new();
+        for tid in std::iter::once(id).chain(steps) {
+            match s.task_events.get(&tid) {
+                Some(list) => events.extend(list.iter().cloned()),
+                None => events.extend(s.events.iter().filter(|e| e.task_id == Some(tid)).cloned()),
+            }
+        }
+        events.sort_by_key(|e| e.id);
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
@@ -579,9 +629,10 @@ impl ThreadsView {
         ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
-    fn tabs(&self, has_flow: bool, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = if has_flow { vec![(Tab::Flow, "Flow")] } else { vec![] };
-        tabs.extend([(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
+    fn tabs(&self, has_flow: bool, has_results: bool, compact: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let list = if has_flow { "List" } else { "Trace" };
+        let mut tabs = if has_flow { vec![(Tab::Flow, "Map")] } else { vec![] };
+        tabs.extend([(Tab::Trace, list), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
         if has_results {
             tabs.push((Tab::Results, "Results"));
         }
@@ -593,7 +644,8 @@ impl ThreadsView {
                 div()
                     .id(("task-tab", i))
                     .flex()
-                    .flex_1()
+                    .when(!compact, |d| d.flex_1())
+                    .px(px(if compact { 12. } else { 0. }))
                     .items_center()
                     .justify_center()
                     .h(px(28.))
@@ -717,45 +769,47 @@ impl ThreadsView {
             .into_any_element()
     }
 
-    fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut chips: Vec<AnyElement> = Vec::new();
-        if t.question.is_none() {
-            for (i, text) in ["Narrow the scope", "Show me the diff before you continue"].into_iter().enumerate() {
-                let c = small_chip(format!("suggest-{i}"), text, cx);
-                chips.push(c.on_click(cx.listener(move |this, _, _, cx| this.fill(text, cx))).into_any_element());
-            }
-        }
-        let send = primary_button("thread-send", "Send down", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
-        let row = div().flex().items_center().gap(px(8.)).child(div().flex_1().child(self.input.clone())).child(send);
-        div()
-            .id("threads-composer")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(px(10.))
-            .pt(px(16.))
-            .px(px(20.))
-            .pb(px(20.))
-            .border_t_1()
-            .border_color(th.hairline)
-            .children((!chips.is_empty()).then(|| div().flex().flex_wrap().gap(px(8.)).children(chips)))
-            .child(row)
-            .child(composer_hint(t, th))
-            .into_any_element()
+    /// A calm bar pointing at the Inbox while the thread waits on an answer.
+    fn answer_bar(&self, qid: i64, text: &str, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = format!("Waiting on you: {}", first_line(text, 100));
+        let msg = div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(th.fg).child(label);
+        let go = primary_button("thread-answer-inbox", "Answer in Inbox", cx);
+        let go = go.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_question(qid, cx))));
+        let bar = div().flex().items_center().gap(px(10.)).px(px(14.)).py(px(10.)).rounded(px(10.));
+        let bar = bar.bg(th.wait.dim).border_1().border_color(th.wait.rim);
+        let bar = bar.child(icon("hand", 14., th.wait.fg)).child(msg).child(go);
+        let wrap = div().id("threads-answer-bar").flex().flex_none().pt(px(16.)).px(px(20.)).pb(px(20.));
+        wrap.border_t_1().border_color(th.hairline).child(bar).into_any_element()
     }
-}
 
-fn small_chip(id: String, text: &str, cx: &mut Context<ThreadsView>) -> Stateful<Div> {
-    chip(id, text, cx).h(px(26.)).px(px(10.)).text_size(px(11.5))
+    /// Suite's composer: one rounded bar with a Message segment, the field and Send.
+    fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some((qid, text)) = &t.question {
+            return self.answer_bar(*qid, text, th, cx);
+        }
+        let seg = div().flex().items_center().flex_none().p(px(3.)).rounded(px(9.)).bg(th.well);
+        let on = div().flex().items_center().h(px(26.)).px(px(12.)).rounded(px(7.)).bg(th.surface);
+        let on = on.text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Message");
+        let field = div().flex_1().min_w_0().child(self.input.clone());
+        let send = chip("thread-send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
+        let bar = div().flex().items_center().gap(px(10.)).p(px(6.)).rounded(px(14.)).bg(th.surface_2);
+        let bar = bar.border_1().border_color(th.hairline).child(seg.child(on)).child(field).child(send);
+        div().id("threads-composer").flex_none().px(px(14.)).pb(px(14.)).pt(px(4.)).child(bar).into_any_element()
+    }
 }
 
 pub(super) fn muted_status(th: &Theme) -> Status {
     Status { base: th.muted, fg: th.muted, dim: th.hairline, rim: th.hairline }
 }
 
-fn composer_hint(t: &Thread, th: &Theme) -> Div {
-    let text = format!("Goes to {}. If it can't run yet, RUI resumes what it waits on and tells you.", t.name);
-    div().mt(px(-2.)).text_size(px(11.)).text_color(th.muted).child(text)
+/// First line of `s`, cut to `max` chars with an ellipsis.
+pub(super) fn first_line(s: &str, max: usize) -> String {
+    let line = s.trim().lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{}\u{2026}", cut.trim_end())
 }
 
 fn column_head(name: &str, count: usize, th: &Theme) -> AnyElement {
@@ -827,14 +881,16 @@ pub(super) fn chevron(open: bool, th: &Theme) -> impl IntoElement {
     svg().path("icons/chevron.svg").size(px(12.)).flex_none().text_color(th.muted).with_transformation(turn)
 }
 
-fn trace_head(i: usize, r: &TraceRow, open: bool, th: &Theme) -> Stateful<Div> {
+fn trace_head(i: usize, r: &TraceRow, who: Option<String>, open: bool, th: &Theme) -> Stateful<Div> {
     let kind_color = if r.error { th.block.fg } else { th.fg_2 };
     let kind = div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(kind_color).child(r.kind.label());
+    let who = who.map(|w| div().text_size(px(11.)).text_color(th.accent_text).child(w));
     let arrow = r.detail.as_ref().map(|_| chevron(open, th));
     let meta = div()
         .flex()
         .items_center()
         .gap(px(8.))
+        .children(who)
         .child(kind)
         .child(mono(10.5, th.muted, r.time.clone()))
         .child(div().flex_1())
@@ -1149,8 +1205,7 @@ fn seat_mark(status: &TaskStatus) -> Option<Div> {
 /// Counts for the lead line: agents holding a seat and threads that need the owner.
 fn lead_counts(s: &Store, threads: &[Thread]) -> (usize, usize) {
     let doing: Vec<i64> = threads.iter().filter(|t| t.word == Word::Working).map(|t| t.task.id).collect();
-    let needs = threads.iter().filter(|t| t.word == Word::NeedsYou).count();
-    (busy_count(&doing, &s.live), needs)
+    (busy_count(&doing, &s.live), s.awake_inbox())
 }
 
 /// "**4** working \u{b7} **1** need you"
@@ -1185,7 +1240,8 @@ impl Render for ThreadsView {
         let strip = self.needs_strip(&th, cx);
         let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll().children(strip);
         // Tasks first; the four-hour chart sits below them.
-        let body = body.child(board).child(timeline::view(chart, &th));
+        let toggle = self.timeline_toggle(&th, cx);
+        let body = body.child(board).child(timeline::view(chart, self.show_timeline, toggle, &th));
         let confirm = self.confirm_view(&th, cx);
         let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
         let page = div().id("threads-page").relative().flex().flex_col().size_full();
@@ -1205,6 +1261,14 @@ pub(super) fn shown(closing: bool, d: f32) -> f32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn first_line_takes_first_line_and_cuts_safely() {
+        assert_eq!(first_line("  first\nsecond", 20), "first");
+        assert_eq!(first_line("", 5), "");
+        assert_eq!(first_line("h\u{e9}llo world", 5), "h\u{e9}ll\u{2026}");
+        assert_eq!(first_line("12345", 5), "12345");
+    }
 
     fn ev(kind: &str, payload: Value) -> Event {
         serde_json::from_value(json!({"id":1,"task_id":2,"agent":"builder","kind":kind,
@@ -1303,6 +1367,19 @@ mod tests {
         let s = LiveState { tool: Some("Bash".into()), tool_input: r#"{"command":"cargo te"#.into(), ..Default::default() };
         assert_eq!(live_sub(&s), "Running cargo te\u{2026}");
         assert_eq!(live_sub(&LiveState { thinking: true, ..Default::default() }), "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn top_id_walks_up_to_the_top_task() {
+        let task = |id: i64, parent: Option<i64>| -> Task {
+            serde_json::from_value(serde_json::json!({"id":id,"client_id":1,"parent_id":parent,"title":"t","body":"",
+                "status":"open","done_command":null,"max_loops":5,"loops_used":0,"role":"lead",
+                "branch":null,"source_kind":"user","source_ref":null,"depends_on":[],"agent":null,
+                "pod":[],"created_at":"a","updated_at":"b"}))
+            .unwrap()
+        };
+        let tasks = [task(1, None), task(2, Some(1)), task(3, Some(2))];
+        assert_eq!((top_id(&tasks, 3), top_id(&tasks, 1), top_id(&tasks, 9)), (1, 1, 9));
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub fn base_url() -> String {
 const OWNER_HEADER: &str = "x-rui-owner";
 
 /// The daemon's data folder (`RUI_DATA_DIR` or the default), where it writes `owner.token`.
-fn data_dir() -> std::path::PathBuf {
+pub fn data_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("RUI_DATA_DIR") {
         return dir.into();
     }
@@ -78,10 +78,12 @@ pub fn get_chats() -> Result<Vec<Chat>> {
     Ok(serde_json::from_value(get("/chats")?)?)
 }
 
-/// Create a chat; the daemon seeds it with Rui's first message.
-pub fn create_chat() -> Result<Chat> {
+/// Create a chat; the daemon seeds it with Rui's first message. `needs_you` is the Inbox count
+/// the app shows (snoozed items left out), so the greeting matches the Inbox.
+pub fn create_chat(needs_you: usize) -> Result<Chat> {
     let url = format!("{}/chats", base_url());
-    let body = agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(serde_json::json!({}))?.body_mut().read_json()?;
+    let req = serde_json::json!({ "needs_you": needs_you });
+    let body = agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(req)?.body_mut().read_json()?;
     Ok(serde_json::from_value(body)?)
 }
 
@@ -408,6 +410,7 @@ pub fn library(method: &str, path: &str, body: Option<serde_json::Value>) -> Res
         "GET" => agent.get(&url).header(OWNER_HEADER, owner_token()).call()?,
         "DELETE" => agent.delete(&url).header(OWNER_HEADER, owner_token()).call()?,
         "PUT" => agent.put(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
+        "PATCH" => agent.patch(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
         _ => agent.post(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
     };
     let json: serde_json::Value = res.body_mut().read_json().unwrap_or(serde_json::Value::Null);
@@ -434,6 +437,21 @@ pub fn skill_files(name: &str) -> Result<serde_json::Value> {
 /// Create a client from a repo folder. Errors carry the daemon's `{error}` text.
 pub fn create_client(name: &str, repo_path: &str) -> Result<serde_json::Value> {
     library("POST", "/clients", Some(serde_json::json!({ "name": name, "repo_path": repo_path })))
+}
+
+/// One client with its extra allowed web hosts, as `{..client, hosts}`.
+pub fn get_client(id: i64) -> Result<serde_json::Value> {
+    library("GET", &format!("/clients/{id}"), None)
+}
+
+/// Change a client's name, repo folder or hosts; `body` holds only the fields to change.
+pub fn update_client(id: i64, body: serde_json::Value) -> Result<serde_json::Value> {
+    library("PATCH", &format!("/clients/{id}"), Some(body))
+}
+
+/// Delete a client and its threads and history. The repo folder is not touched.
+pub fn delete_client(id: i64) -> Result<serde_json::Value> {
+    library("DELETE", &format!("/clients/{id}"), None)
 }
 
 /// What the owner wrote down about a client, as `{text}`.
@@ -530,9 +548,9 @@ pub fn delete_chat(id: i64) -> Result<()> {
     library("DELETE", &format!("/chats/{id}"), None).map(|_| ())
 }
 
-/// Post a user message to a chat.
-pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
-    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))
+/// Post a user message to a chat, with the client the owner picked for it (if any).
+pub fn post_chat(chat_id: i64, content: &str, client: Option<&str>) -> Result<()> {
+    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content, "client": client }))
 }
 
 /// How to undo a held owner answer before `run_at` (unix seconds).
@@ -609,6 +627,9 @@ pub struct Decision {
     pub question_id: Option<i64>,
     #[serde(default)]
     pub ask: String,
+    /// The long original text, folded away on the card.
+    #[serde(default)]
+    pub details: String,
     #[serde(default)]
     pub why: String,
     #[serde(default)]

@@ -357,12 +357,37 @@ pub fn changes(wt: &Path, done: bool) -> anyhow::Result<Vec<Change>> {
 
 /// Read-only list of what the branch in `wt` changed relative to the base branch.
 pub fn changes_vs_base(wt: &Path) -> anyhow::Result<Vec<Change>> {
-    let range = format!("{}...HEAD", task_base(wt)?);
-    let mut list = parse_numstat(&git_stdout(wt, &["diff", "--no-renames", "--numstat", &range])?);
+    diff_changes(wt, &[&format!("{}...HEAD", task_base(wt)?)])
+}
+
+/// Changed files with their diffs over `range` (one `a...b` or two revisions), run in `dir`.
+fn diff_changes(dir: &Path, range: &[&str]) -> anyhow::Result<Vec<Change>> {
+    let mut args = vec!["diff", "--no-renames", "--numstat"];
+    args.extend(range);
+    let mut list = parse_numstat(&git_stdout(dir, &args)?);
     for c in &mut list {
-        c.diff = git_stdout(wt, &["diff", "--no-renames", &range, "--", &c.file])?;
+        let mut args = vec!["diff", "--no-renames"];
+        args.extend(range);
+        args.extend(["--", c.file.as_str()]);
+        c.diff = git_stdout(dir, &args)?;
     }
     Ok(list)
+}
+
+/// Changes read from a branch in the repo, for a task whose worktree was removed: a task
+/// branch against its base, a subtask branch's last commit. Empty when the branch is gone.
+pub fn branch_changes(repo: &Path, branch: &str, top: bool) -> anyhow::Result<Vec<Change>> {
+    if !branch_exists(repo, branch) {
+        return Ok(vec![]);
+    }
+    if !top {
+        return diff_changes(repo, &[&format!("{branch}~1"), branch]);
+    }
+    let base = match git_stdout(repo, &["config", "--get", &format!("branch.{branch}.ruiBase")]) {
+        Ok(b) if !b.trim().is_empty() => b.trim().to_string(),
+        _ => base_branch(repo)?,
+    };
+    diff_changes(repo, &[&format!("{base}...{branch}")])
 }
 
 pub(crate) fn gh_command() -> String {

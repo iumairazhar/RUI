@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 mod support;
+pub mod chat_clients_file;
+pub mod snooze_file;
 
 const MAX_EVENTS: usize = 300;
 const FIRST_EVENT_LIMIT: usize = 200;
@@ -42,6 +44,11 @@ pub type ItemKey = (String, i64);
 pub fn now_secs() -> i64 {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     since.map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Apps of `project` that are up, as (name, url).
+pub fn running_links(apps: &[AppInfo], project: &str) -> Vec<(String, String)> {
+    apps.iter().filter(|a| a.project == project && a.status == "running").map(|a| (a.name.clone(), a.url.clone())).collect()
 }
 
 /// The app's store as a global, so click handlers without a view can reach it.
@@ -109,14 +116,20 @@ pub struct Store {
     pub open_threads: bool,
     /// Thread to open once the root has switched to Threads; the root clears it.
     pub open_task: Option<i64>,
+    /// Question to open in the Inbox slide-over; the root opens it and clears this.
+    pub open_question: Option<i64>,
     /// Selected sub-tab of each rail section, by section key.
     pub tabs: HashMap<&'static str, usize>,
     /// Toast confirming the last owner action; hides after a few seconds.
     pub toast: Option<Toast>,
     /// Answers still inside their undo window, by question id.
     pub sending: HashMap<i64, Sending>,
-    /// Inbox items hidden until a unix time. Kept in memory only: the app has no saved prefs yet.
+    /// The minute last drawn: time-based text ("resets in 12m") needs a redraw each minute.
+    drawn_minute: i64,
+    /// Inbox items hidden until a unix time, saved in `snoozes.json`.
     pub snoozed: HashMap<ItemKey, i64>,
+    /// Client picked per chat id (0 while there is no chat yet), saved in `chat_clients.json`.
+    pub chat_clients: HashMap<i64, i64>,
     /// Set with `open_task` to show the task page's Changes tab; the root clears it.
     pub open_changes: bool,
     /// (updated_at, needs-you count) of each needs-you thread when it was last loaded.
@@ -190,13 +203,22 @@ fn fetch_all(after_id: Option<i64>, wanted: Option<i64>) -> Snapshot {
     (fetch_core(wanted), fetch_extras(after_id))
 }
 
+/// Replace `slot` with `new` only when they differ; true when it changed.
+fn put<T: PartialEq>(slot: &mut T, new: T) -> bool {
+    if *slot == new {
+        return false;
+    }
+    *slot = new;
+    true
+}
+
 /// Create the chat first when there is none, then post; returns the chat id.
-fn send_to(current: Option<i64>, text: &str) -> anyhow::Result<i64> {
+fn send_to(current: Option<i64>, text: &str, client: Option<&str>, needs_you: usize) -> anyhow::Result<i64> {
     let id = match current {
         Some(id) => id,
-        None => api::create_chat()?.id,
+        None => api::create_chat(needs_you)?.id,
     };
-    api::post_chat(id, text)?;
+    api::post_chat(id, text, client)?;
     Ok(id)
 }
 
@@ -248,10 +270,13 @@ impl Store {
             roles: vec![],
             open_threads: false,
             open_task: None,
+            open_question: None,
             tabs: HashMap::new(),
             toast: None,
             sending: HashMap::new(),
-            snoozed: HashMap::new(),
+            drawn_minute: 0,
+            snoozed: snooze_file::load(&snooze_file::path()),
+            chat_clients: chat_clients_file::load(&chat_clients_file::path()),
             open_changes: false,
             needs_marks: HashMap::new(),
             watched: None,
@@ -303,6 +328,12 @@ impl Store {
         cx.notify();
     }
 
+    /// Ask the root to open the Inbox slide-over with one question expanded.
+    pub fn open_question(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_question = Some(id);
+        cx.notify();
+    }
+
     /// Ask the root to switch to Threads and open one task's thread.
     pub fn open_thread(&mut self, id: i64, cx: &mut Context<Self>) {
         self.open_task = Some(id);
@@ -320,94 +351,118 @@ impl Store {
         Self::load_skills(cx);
     }
 
-    fn apply_extras(&mut self, extras: Extras) {
+    /// Store what the poll brought; true when anything shown on screen changed.
+    fn apply_extras(&mut self, extras: Extras) -> bool {
+        let mut changed = false;
         if let Some(apps) = extras.apps {
-            self.apps = apps;
+            changed |= put(&mut self.apps, apps);
         }
         if let Some(asks) = extras.asks {
-            self.asks = asks;
+            changed |= put(&mut self.asks, asks);
         }
         if let Some(done) = extras.answered {
             let skip = done.len().saturating_sub(MAX_ANSWERED_ASKS);
-            self.answered_asks = done.into_iter().skip(skip).collect();
+            changed |= put(&mut self.answered_asks, done.into_iter().skip(skip).collect());
         }
         if extras.seat.is_some() {
-            self.seat = extras.seat;
+            changed |= put(&mut self.seat, extras.seat);
         }
         if let Some(seats) = extras.seats {
-            self.seats = seats;
+            changed |= put(&mut self.seats, seats);
         }
         if let Some(runs) = extras.runs {
-            self.runs = runs.into_iter().map(|r| (r.task_id, r)).collect();
+            changed |= put(&mut self.runs, runs.into_iter().map(|r| (r.task_id, r)).collect());
         }
         if let Some(states) = extras.states {
-            self.states = states.into_iter().map(|s| (s.task_id, s)).collect();
+            changed |= put(&mut self.states, states.into_iter().map(|s| (s.task_id, s)).collect());
         }
         if let Some(threads) = extras.threads {
-            self.threads = threads;
+            changed |= put(&mut self.threads, threads);
         }
         if let Some(inbox) = extras.inbox {
-            self.apply_inbox(inbox);
+            changed |= self.apply_inbox(inbox);
         }
-        let Some(new) = extras.events else { return };
+        changed | self.apply_events(extras.events)
+    }
+
+    /// Append new events, keeping the newest MAX_EVENTS; true when there were any.
+    fn apply_events(&mut self, new: Option<Vec<Event>>) -> bool {
+        let Some(new) = new.filter(|n| !n.is_empty()) else { return false };
         self.events.extend(new);
         let excess = self.events.len().saturating_sub(MAX_EVENTS);
         self.events.drain(..excess);
         self.last_event_id = self.events.last().map(|e| e.id);
+        true
     }
 
     /// Store the inbox; notify for new stuck and review items, except on the first load.
-    fn apply_inbox(&mut self, inbox: Vec<InboxItem>) {
+    fn apply_inbox(&mut self, inbox: Vec<InboxItem>) -> bool {
         let fresh = notify::fresh(&mut self.seen_inbox, &inbox);
         if std::mem::replace(&mut self.inbox_loaded, true) {
             let items: Vec<(String, String)> = fresh.into_iter().map(|i| (i.title, i.reason)).collect();
             std::thread::spawn(move || items.iter().for_each(|(t, r)| notify::send(t, r)));
         }
-        self.inbox = inbox;
+        put(&mut self.inbox, inbox)
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
         let (core, extras) = snap;
-        self.apply_extras(extras);
+        let mut changed = self.apply_extras(extras);
         match core {
             Ok((clients, tasks, questions, chat_data)) => {
-                self.clients = clients;
-                self.tasks = tasks;
-                self.questions = questions;
-                self.apply_chat(chat_data);
-                self.error = None;
+                changed |= put(&mut self.clients, clients);
+                changed |= put(&mut self.tasks, tasks);
+                changed |= put(&mut self.questions, questions);
+                changed |= self.apply_chat(chat_data);
+                changed |= put(&mut self.error, None);
             }
             Err(_) => {
-                self.error = Some(format!("Daemon not reachable at {}", api::base_url()));
+                changed |= put(&mut self.error, Some(format!("Daemon not reachable at {}", api::base_url())));
             }
         }
         self.reload_changes(cx);
         self.load_needs_you(cx);
         let now = now_secs();
+        let before = self.sending.len();
         self.sending.retain(|_, s| s.undo.run_at > now);
+        // An undo countdown is on screen: it ticks every second.
+        changed |= before != self.sending.len() || !self.sending.is_empty();
+        changed |= put(&mut self.drawn_minute, now / 60);
         if let Some(id) = self.watched_thread {
             self.load_thread(id, cx);
         }
-        cx.notify();
+        // Redraw only when the poll brought something new; a steady screen stays still.
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Store the chat list; drop the messages if the selection changed while fetching.
-    fn apply_chat(&mut self, (chats, wanted, current, messages): ChatData) {
-        self.chats = chats;
+    fn apply_chat(&mut self, (chats, wanted, current, messages): ChatData) -> bool {
+        let changed = put(&mut self.chats, chats);
         if self.current_chat.is_some() && self.current_chat != wanted {
-            return;
+            return changed;
         }
-        self.current_chat = current;
-        self.chat = messages;
+        changed | put(&mut self.current_chat, current) | put(&mut self.chat, messages)
     }
 
     fn reload_changes(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.watched else { return };
+        let steps: Vec<i64> = self.tasks.iter().filter(|t| t.parent_id == Some(id)).map(|t| t.id).collect();
         cx.spawn(async move |this, cx| {
-            let fetch = async move { (api::changes(id).ok(), api::task_events(id).ok(), api::get_results(id).ok()) };
-            let (changes, events, results) = cx.background_executor().spawn(fetch).await;
+            let fetch = async move {
+                let steps: Vec<(i64, Vec<Event>)> = steps.into_iter().filter_map(|s| Some((s, api::task_events(s).ok()?))).collect();
+                (api::changes(id).ok(), api::task_events(id).ok(), api::get_results(id).ok(), steps)
+            };
+            let (changes, events, results, steps) = cx.background_executor().spawn(fetch).await;
             this.update(cx, |s, cx| {
                 let mut changed = false;
+                for (sid, list) in steps {
+                    if s.task_events.get(&sid) != Some(&list) {
+                        s.task_events.insert(sid, list);
+                        changed = true;
+                    }
+                }
                 if let Some(list) = changes.filter(|l| s.changes.get(&id) != Some(l)) {
                     s.changes.insert(id, list);
                     changed = true;
@@ -587,15 +642,29 @@ impl Store {
         self.open_thread(id, cx);
     }
 
+    /// A client's running apps as (name, url), for "Open" links on its threads.
+    pub fn app_links(&self, client_id: i64) -> Vec<(String, String)> {
+        let Some(c) = self.clients.iter().find(|c| c.id == client_id) else { return vec![] };
+        running_links(&self.apps, &c.name)
+    }
+
+    /// The client of a task, by task id.
+    pub fn task_client(&self, task_id: i64) -> Option<i64> {
+        self.tasks.iter().find(|t| t.id == task_id).map(|t| t.client_id)
+    }
+
     /// Hide an inbox item until `until` (unix seconds).
     pub fn snooze(&mut self, key: ItemKey, until: i64, cx: &mut Context<Self>) {
         self.snoozed.insert(key, until);
-        self.show_toast("Snoozed", vec![], cx);
+        snooze_file::save(&snooze_file::path(), &self.snoozed, now_secs());
+        let word = if until == crate::views::inbox::DISMISSED { "Dismissed" } else { "Snoozed" };
+        self.show_toast(word, vec![], cx);
     }
 
     /// Show a snoozed inbox item again.
     pub fn unsnooze(&mut self, key: &ItemKey, cx: &mut Context<Self>) {
         self.snoozed.remove(key);
+        snooze_file::save(&snooze_file::path(), &self.snoozed, now_secs());
         cx.notify();
     }
 
@@ -629,17 +698,51 @@ impl Store {
     /// Post a message to the current chat (creating one if none), then refresh.
     pub fn send_chat(&mut self, text: String, cx: &mut Context<Self>) {
         let current = self.current_chat;
+        let client = self.picked_client().map(|c| c.name.clone());
+        let needs = self.awake_inbox();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { send_to(current, &text) }).await;
+            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref(), needs) }).await;
             this.update(cx, |s, cx| {
-                if let Ok(id) = res {
-                    s.current_chat.get_or_insert(id);
+                match res {
+                    Ok(id) => {
+                        s.adopt_new_chat_pick(id);
+                        s.current_chat.get_or_insert(id);
+                    }
+                    Err(e) => s.show_toast(&format!("Couldn't send your message: {e:#}"), vec![], cx),
                 }
                 s.refresh(cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The client picked for the current chat; `None` means Auto (or a client that is gone).
+    pub fn picked_client(&self) -> Option<&Client> {
+        let id = self.chat_clients.get(&self.current_chat.unwrap_or(0))?;
+        self.clients.iter().find(|c| c.id == *id)
+    }
+
+    /// Pick a client for the current chat, or `None` for Auto, and save it.
+    pub fn pick_client(&mut self, client: Option<i64>, cx: &mut Context<Self>) {
+        let key = self.current_chat.unwrap_or(0);
+        match client {
+            Some(id) => self.chat_clients.insert(key, id),
+            None => self.chat_clients.remove(&key),
+        };
+        chat_clients_file::save(&chat_clients_file::path(), &self.chat_clients);
+        cx.notify();
+    }
+
+    /// A chat created by the first message keeps the pick made before it existed.
+    fn adopt_new_chat_pick(&mut self, id: i64) {
+        if self.current_chat.is_some() {
+            return;
+        }
+        if let Some(c) = self.chat_clients.remove(&0) {
+            self.chat_clients.insert(id, c);
+            chat_clients_file::save(&chat_clients_file::path(), &self.chat_clients);
+        }
     }
 
     /// Show another chat, then refresh.
@@ -653,11 +756,17 @@ impl Store {
         self.refresh(cx);
     }
 
+    /// Inbox items that are not snoozed or dismissed: the one "needs you" count every screen shows.
+    pub fn awake_inbox(&self) -> usize {
+        crate::views::inbox::awake_count(&self.inbox, &self.snoozed, now_secs())
+    }
+
     /// Create a chat in the background, select it, then refresh.
     pub fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.show_toast("New chat started", vec![], cx);
+        let needs = self.awake_inbox();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { api::create_chat() }).await;
+            let res = cx.background_executor().spawn(async move { api::create_chat(needs) }).await;
             this.update(cx, |s, cx| {
                 if let Ok(chat) = res {
                     s.select_chat(chat.id, cx);
@@ -802,6 +911,21 @@ pub fn observe<V: 'static>(store: &Entity<Store>, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn running_links_only_lists_live_apps_of_the_client() {
+        let app = |project: &str, name: &str, status: &str| AppInfo {
+            project: project.into(),
+            name: name.into(),
+            port: 8100,
+            url: format!("http://localhost:8100/{name}"),
+            status: status.into(),
+            log: vec![],
+        };
+        let apps = vec![app("acme", "web", "running"), app("acme", "api", "failed"), app("other", "web", "running")];
+        assert_eq!(running_links(&apps, "acme"), vec![("web".to_string(), "http://localhost:8100/web".to_string())]);
+        assert!(running_links(&apps, "nobody").is_empty());
+    }
+
     use super::*;
 
     fn question(ladder: serde_json::Value) -> Question {

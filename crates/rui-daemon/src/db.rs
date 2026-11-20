@@ -332,6 +332,29 @@ impl Db {
         Ok(self.conn()?.query_row(&sql, [name], client_from_row).optional()?)
     }
 
+    /// Change a client's name and repo folder; returns the updated client.
+    pub fn update_client(&self, id: i64, name: &str, repo_path: &str) -> Result<Client> {
+        let conn = self.conn()?;
+        conn.execute("UPDATE clients SET name = ?1, repo_path = ?2 WHERE id = ?3", params![name, repo_path, id])?;
+        fetch_client(&conn, id)?.ok_or_else(|| anyhow!("client not found"))
+    }
+
+    /// Delete a client with its tasks, subtasks and everything that points at those tasks, in one
+    /// transaction. Returns false when the client does not exist.
+    pub fn delete_client_cascade(&self, id: i64) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mine = "SELECT id FROM tasks WHERE client_id = ?1";
+        for table in ["questions", "events", "agent_sessions"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE task_id IN ({mine})"), [id])?;
+        }
+        tx.execute(&format!("DELETE FROM task_deps WHERE task_id IN ({mine}) OR depends_on IN ({mine})"), [id])?;
+        tx.execute("DELETE FROM tasks WHERE client_id = ?1", [id])?;
+        let deleted = tx.execute("DELETE FROM clients WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
     // ---- tasks ----
 
     /// Insert a task and return it.
@@ -737,13 +760,13 @@ impl Db {
     }
 
     /// Epoch seconds of the newest activity per task: its newest event (heartbeat
-    /// bookkeeping like `stalled` and `heartbeat` does not count), or its own update.
+    /// and sweep bookkeeping like `stalled` or `worktree_kept` does not count), or its own update.
     pub fn last_activity(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
         let conn = self.conn()?;
         let sql = format!(
             "SELECT t.id, CAST(strftime('%s', MAX(t.updated_at, \
                COALESCE((SELECT MAX(created_at) FROM events WHERE task_id = t.id \
-               AND kind NOT IN ('stalled', 'heartbeat')), t.updated_at))) AS INTEGER) \
+               AND kind NOT IN ('stalled', 'heartbeat', 'worktree_kept', 'worktree_removed')), t.updated_at))) AS INTEGER) \
              FROM tasks t WHERE t.id IN ({})",
             id_list(ids)
         );
@@ -931,6 +954,28 @@ mod tests {
         let db = Db::open_test();
         let c = db.create_client("acme", "/repo", Some("cargo test"), &["ls".into()]).unwrap();
         (db, c)
+    }
+
+    #[test]
+    fn delete_client_cascade_removes_only_that_client() {
+        let (db, a) = db_with_client();
+        let b = db.create_client("other", "/repo2", None, &[]).unwrap();
+        let ta = db.create_task(&new_task(a.id, "a1")).unwrap();
+        let sub = db.create_task(&NewTask { parent_id: Some(ta.id), ..new_task(a.id, "a2") }).unwrap();
+        let tb = db.create_task(&new_task(b.id, "b1")).unwrap();
+        db.create_question(ta.id, Role::Lead, "why?").unwrap();
+        db.create_question(tb.id, Role::Lead, "keep?").unwrap();
+        db.add_event(Some(sub.id), "lead", "note", &serde_json::json!({})).unwrap();
+        db.add_event(Some(tb.id), "lead", "note", &serde_json::json!({})).unwrap();
+        db.set_session(Role::Lead, Some(ta.id), "s1").unwrap();
+        assert!(db.delete_client_cascade(a.id).unwrap());
+        assert!(db.get_client(a.id).unwrap().is_none());
+        let ids: Vec<i64> = db.list_tasks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![tb.id]);
+        assert_eq!(db.list_questions(None).unwrap().len(), 1);
+        assert_eq!(db.list_events(None, 100).unwrap().len(), 1);
+        assert!(db.get_client(b.id).unwrap().is_some());
+        assert!(!db.delete_client_cascade(a.id).unwrap());
     }
 
     #[test]

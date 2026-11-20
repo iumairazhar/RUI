@@ -78,6 +78,29 @@ pub fn tag_of(k: Kind, th: &Theme) -> (&'static str, &Status) {
     }
 }
 
+/// Chip text and colour family in the slide-over: a question reads as a "Decision", a stuck task as "Agent failed".
+pub fn sheet_tag(k: Kind, th: &Theme) -> (&'static str, &Status) {
+    match k {
+        Kind::Question => ("Decision", &th.wait),
+        Kind::Stuck => ("Agent failed", &th.block),
+        _ => tag_of(k, th),
+    }
+}
+
+/// "Low risk \u{b7} reversible" for a decision with a known risk; `None` when the risk is unknown.
+pub fn risk_line(risk: &str, reversible: Option<bool>) -> Option<String> {
+    if !matches!(risk, "low" | "medium" | "high") {
+        return None;
+    }
+    let mut line = super::decision::risk_label(risk).to_string();
+    match reversible {
+        Some(true) => line.push_str(" \u{b7} reversible"),
+        Some(false) => line.push_str(" \u{b7} can't be undone"),
+        None => {}
+    }
+    Some(line)
+}
+
 /// A button an item offers right in its row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ItemAct {
@@ -128,10 +151,11 @@ pub fn acts_of(k: Kind) -> Vec<ItemAct> {
     }
 }
 
-/// The reason line under the title; deploy kinds show theirs inside the warning box instead.
+/// The reason line under the title, cut to one short line; deploy kinds show theirs inside the
+/// warning box instead. The full text is one tap away in the item's drawer.
 pub fn reason(it: &InboxItem) -> Option<String> {
     let own_box = matches!(kind_of(&it.kind), Kind::Deploy | Kind::DeployFailed);
-    (!own_box && !it.reason.is_empty()).then(|| it.reason.clone())
+    (!own_box && !it.reason.is_empty()).then(|| super::decision::short_why(&it.reason))
 }
 
 /// The item's longer text: markdown for reports, briefs, emails and unknown kinds; a quote for a proposal;
@@ -235,6 +259,23 @@ mod tests {
         assert_eq!(acts_of(Kind::Deploy), [ItemAct::Deploy, ItemAct::Skip]);
         assert_eq!(acts_of(Kind::DeployFailed), [ItemAct::TryAgain, ItemAct::Skip]);
         assert_eq!((ItemAct::Deploy.label(), ItemAct::TryAgain.label(), ItemAct::Skip.label()), ("Deploy", "Try again", "Skip"));
+    }
+
+    #[test]
+    fn sheet_chip_words_follow_the_kind() {
+        let th = Theme::dark();
+        assert_eq!(sheet_tag(Kind::Question, &th).0, "Decision");
+        assert_eq!(sheet_tag(Kind::Stuck, &th).0, "Agent failed");
+        assert_eq!(sheet_tag(Kind::Ask, &th).0, "Asked in chat");
+        assert_eq!(sheet_tag(Kind::Review, &th).0, "Review");
+    }
+
+    #[test]
+    fn risk_line_needs_a_known_risk() {
+        assert_eq!(risk_line("low", Some(true)).as_deref(), Some("Low risk \u{b7} reversible"));
+        assert_eq!(risk_line("high", Some(false)).as_deref(), Some("High risk \u{b7} can't be undone"));
+        assert_eq!(risk_line("medium", None).as_deref(), Some("Medium risk"));
+        assert_eq!(risk_line("unknown", Some(true)), None);
     }
 
     #[test]

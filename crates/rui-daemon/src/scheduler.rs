@@ -25,7 +25,7 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout";
+mcp__rui__ask_scout,mcp__rui__set_story";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -530,6 +530,7 @@ fn beat(db: &Arc<Db>, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
     }
     inputs_beat(db, &cfg.data_dir, now);
     crate::pr_watch::spawn_poll(db.clone(), cfg.data_dir.clone(), running.clone());
+    crate::sweep::spawn_sweep(db.clone(), cfg.data_dir.clone(), snapshot.clone());
 }
 
 /// Reads the drop folder, asks the Scout for briefs of meetings about to start and fires due
@@ -668,6 +669,11 @@ fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
     if task.parent_id.is_some() || task.source_kind != SourceKind::Chat {
         return;
     }
+    // Start the apps once per task. Finishing again (e.g. after the owner's message woke the
+    // Lead) must not restart apps the owner may have stopped.
+    if latest_event(db, task_id, "apps_started").ok().flatten().is_some() {
+        return;
+    }
     let (db, apps, data_dir) = (db.clone(), apps.clone(), data_dir.to_path_buf());
     tokio::spawn(async move {
         if let Err(e) = launch_and_report(&db, &data_dir, &apps, &task).await {
@@ -678,11 +684,27 @@ fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
 
 async fn launch_and_report(db: &Db, data_dir: &Path, apps: &Apps, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
-    let repo = expand_home(&client.repo_path);
-    let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
-    let infos = apps::start_project(apps, &sb, &client.name, &repo).await;
+    let infos = start_client_apps(db, data_dir, apps, &client).await;
     db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
     post_done_notice(db, task, &client.repo_path, &infos)
+}
+
+/// Starts a client's apps from the repo, or from its newest task worktree when the code is
+/// only there (work not merged yet).
+pub async fn start_client_apps(db: &Db, data_dir: &Path, apps: &Apps, client: &Client) -> Vec<apps::AppInfo> {
+    let repo = expand_home(&client.repo_path);
+    let code = apps::code_dir(&repo, &task_worktrees(db, data_dir, client.id));
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &code);
+    apps::start_project_in(apps, &sb, &client.name, &repo, &code).await
+}
+
+/// The client's top-level task worktrees that exist, newest task first.
+fn task_worktrees(db: &Db, data_dir: &Path, client_id: i64) -> Vec<PathBuf> {
+    let mut tops: Vec<i64> = db.list_tasks().unwrap_or_default().into_iter()
+        .filter(|t| t.client_id == client_id && t.parent_id.is_none()).map(|t| t.id).collect();
+    tops.sort_unstable_by(|a, b| b.cmp(a));
+    let dir = |id: i64| data_dir.join("worktrees").join(format!("task-{id}"));
+    tops.into_iter().map(dir).filter(|p| p.is_dir()).collect()
 }
 
 /// Posts the done message into the chat of the message the task came from (`chat:<message id>`).
@@ -835,8 +857,14 @@ pub fn line_event(p: &ParsedLine) -> Option<(&'static str, Value)> {
         ParsedLine::Assistant(v) => ("assistant", v.clone()),
         ParsedLine::ToolResult(v) => ("toolresult", v.clone()),
         ParsedLine::Result { raw, .. } => ("result", raw.clone()),
+        ParsedLine::Other(v) if is_thinking_ping(v) => return None,
         ParsedLine::Other(v) => ("other", v.clone()),
     })
+}
+
+/// A "still thinking" tick with a token count, sent about once a second; not worth keeping.
+fn is_thinking_ping(v: &Value) -> bool {
+    v["subtype"] == "thinking_tokens"
 }
 
 /// Expands a leading `~/` to the home directory.
@@ -864,6 +892,7 @@ async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str
     let res = run_agent_with(cli, &run, |p| {
         on_line(live, LiveKey::Task(task_id), p);
         let Some((kind, payload)) = line_event(p) else { return };
+        seats::record_limits(&payload, crate::thread::now_secs());
         let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
     })
     .await;
@@ -1173,7 +1202,8 @@ pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: O
          Output of the member's last check:\n{check}\n\n\
          Task brief: {brief}\nPod: {pod}\n\n\
          Owner answers on this task:\n{owner}\n\n\
-         Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why). \
+         Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why, question, options), \
+         where question is one short plain sentence for the owner and options are 2 to 4 short answers, recommendation first. \
          You must call one of them.",
         id = q.id,
         mid = member.id,
@@ -1683,6 +1713,12 @@ mod tests {
     #[test]
     fn stream_lines_are_not_stored() {
         let line = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
+        let p = crate::runner::parse_line(line).unwrap();
+        assert!(line_event(&p).is_none());
+    }
+    #[test]
+    fn thinking_pings_are_not_stored() {
+        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":100}"#;
         let p = crate::runner::parse_line(line).unwrap();
         assert!(line_event(&p).is_none());
     }

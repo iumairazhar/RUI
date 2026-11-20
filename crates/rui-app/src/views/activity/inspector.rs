@@ -1,17 +1,16 @@
-//! The Inspector: a glass panel that slides in from the right with one Flow node's story and controls.
+//! The Inspector: a docked side panel on the thread page with one Flow node's story and controls.
 
 use super::flow::node_style;
-use super::{ThreadsView, is_empty_turn, mono, section, summarize};
+use super::{ThreadsView, icon, is_empty_turn, mono, parse_secs, section, summarize};
 use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
-use crate::views::decision::{CardData, first_line};
-use crate::views::library::{after_slide, close_button, scrim, slide_overlay};
+use crate::views::decision::{CardData, DecisionCard, first_line, reversible_text, risk_label, risk_style};
 use crate::views::status::thread_word;
 use crate::views::{chip, primary_button, tag};
-use gpui::{AnyElement, ClipboardItem, Context, Div, FontWeight, Stateful, div, prelude::*, px};
+use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
 use rui_core::Event;
 
-const PANEL_W: f32 = 420.;
+const PANEL_W: f32 = 380.;
 
 /// The open inspector: which node, its loaded events, and any take-over reply.
 pub(super) struct Inspect {
@@ -20,7 +19,10 @@ pub(super) struct Inspect {
     page: Option<Inspector>,
     error: Option<String>,
     take: Option<TakeOver>,
-    closing: bool,
+    /// The owner clicked this node; otherwise it is the thread's default node.
+    picked: bool,
+    /// The "What happened" text is expanded; it starts as a one-line preview.
+    story_open: bool,
 }
 
 /// Add a newer page to what is loaded; without `append` the new page replaces it.
@@ -36,6 +38,69 @@ pub fn merge(old: Option<Inspector>, new: Inspector, append: bool) -> Inspector 
 /// (what happened, tool calls); turns with nothing to show are left out.
 pub fn split_events(evs: &[Event]) -> (Vec<&Event>, Vec<&Event>) {
     evs.iter().filter(|e| !is_empty_turn(e)).partition(|e| e.kind != "tool_call")
+}
+
+/// The node the panel shows when nothing is clicked: one that needs the owner, else a running one, else the last done.
+pub fn default_node(nodes: &[Node]) -> Option<&Node> {
+    let needs = nodes.iter().find(|n| n.status == "needs_you" || n.kind == "decision");
+    let running = || nodes.iter().find(|n| matches!(n.status.as_str(), "running" | "working"));
+    let done = || nodes.iter().rev().find(|n| n.status == "done");
+    needs.or_else(running).or_else(done).or(nodes.first())
+}
+
+/// (year, month, day) of a day count since 1970-01-01.
+fn civil(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    (yoe + era * 400 + i64::from(mp >= 10), if mp < 10 { mp + 3 } else { mp - 9 }, d)
+}
+
+/// "today 10:24" when `at` falls on the same local day as `now`, else "11-18 10:24".
+/// Both are unix seconds in UTC; `offset` is the local offset east of UTC in seconds.
+pub fn when_text(at: i64, now: i64, offset: i64) -> String {
+    let (local, today) = (at + offset, now + offset);
+    let m = local.rem_euclid(86_400) / 60;
+    let clock = format!("{:02}:{:02}", m / 60, m % 60);
+    if local.div_euclid(86_400) == today.div_euclid(86_400) {
+        return format!("today {clock}");
+    }
+    let (_, month, day) = civil(local.div_euclid(86_400));
+    format!("{month:02}-{day:02} {clock}")
+}
+
+/// "Builder (agent) \u{b7} today 10:24"; an older day reads "11-18 10:24". Unknown parts are left out.
+pub fn who_when(n: &Node, now: i64, offset: i64) -> String {
+    let who = match &n.agent {
+        _ if n.status == "owner" => Some("You".to_string()),
+        Some(a) if !a.is_empty() => Some(format!("{a} (agent)")),
+        _ => None,
+    };
+    let when = parse_secs(&n.started_at).map(|at| when_text(at, now, offset));
+    [who, when].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
+}
+
+/// "Low risk \u{b7} reversible": how risky the decision is and whether it can be undone.
+pub fn risk_chip_text(risk: &str, reversible: Option<bool>) -> String {
+    let rev = reversible_text(reversible).map(str::to_lowercase);
+    [Some(risk_label(risk).to_string()), rev].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
+}
+
+/// The "What happened" paragraph of a decision: why it came up, else the full ask, else the node's reason.
+pub fn happened_text(n: &Node, d: &crate::api::Decision) -> Option<String> {
+    let why = Some(d.why.trim().to_string()).filter(|w| !w.is_empty());
+    let ask = Some(d.ask.trim().to_string()).filter(|a| !a.is_empty());
+    why.or(ask).or_else(|| n.reason.clone().filter(|r| !r.trim().is_empty()))
+}
+
+/// The last loaded event's id, once every page is loaded; new events come after it.
+fn tail_after(i: &Inspect) -> Option<i64> {
+    let p = i.page.as_ref().filter(|p| p.next_after_id.is_none())?;
+    Some(p.events.last().map_or(0, |e| e.id))
 }
 
 /// "$0.25"
@@ -75,12 +140,54 @@ fn call<T: Send + 'static>(
 }
 
 impl ThreadsView {
-    /// Open the inspector on one node and load its first page.
+    /// The node the side panel shows for thread `tid`, if it is open on that thread.
+    pub(super) fn selected_node(&self, tid: i64) -> Option<&str> {
+        self.inspect.as_ref().filter(|i| i.thread_id == tid).map(|i| i.node_id.as_str())
+    }
+
+    /// Show the clicked node in the panel and load its first page.
     pub(super) fn inspect(&mut self, thread_id: i64, node_id: String, cx: &mut Context<Self>) {
-        self.inspect = Some(Inspect { thread_id, node_id, page: None, error: None, take: None, closing: false });
+        self.show_node(thread_id, node_id, true, cx);
+        cx.notify();
+    }
+
+    fn show_node(&mut self, thread_id: i64, node_id: String, picked: bool, cx: &mut Context<Self>) {
+        self.inspect = Some(Inspect { thread_id, node_id, page: None, error: None, take: None, picked, story_open: false });
         self.note.update(cx, |i, cx| i.clear(cx));
         self.fetch_page(None, cx);
-        cx.notify();
+        self.follow(cx);
+    }
+
+    /// Unless the owner clicked a node, follow the thread's default node as it changes.
+    fn sync_default(&mut self, t: &Thread, cx: &mut Context<Self>) {
+        let cur = self.inspect.as_ref().filter(|i| i.thread_id == t.id);
+        if cur.is_some_and(|i| i.picked) {
+            return;
+        }
+        let Some(id) = default_node(&t.nodes).map(|n| n.id.clone()) else { return };
+        if cur.is_some_and(|i| i.node_id == id) {
+            return;
+        }
+        self.show_node(t.id, id, false, cx);
+    }
+
+    /// While this node stays open, load its new events every few seconds.
+    fn follow(&mut self, cx: &mut Context<Self>) {
+        let Some(want) = self.inspect.as_ref().map(|i| i.node_id.clone()) else { return };
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
+            let open = this.update(cx, |v, cx| {
+                let Some(i) = v.inspect.as_ref().filter(|i| i.node_id == want) else { return false };
+                if let Some(after) = tail_after(i) {
+                    v.fetch_page(Some(after), cx);
+                }
+                true
+            });
+            if !open.unwrap_or(false) {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// Load events after `after` (appending), or reload from the start with `None`.
@@ -95,18 +202,6 @@ impl ThreadsView {
                 Err(e) => i.error = Some(e),
             }
             cx.notify();
-        });
-    }
-
-    pub(super) fn close_inspector(&mut self, cx: &mut Context<Self>) {
-        let Some(i) = self.inspect.as_mut() else { return };
-        i.closing = true;
-        cx.notify();
-        after_slide(cx, |v, cx| {
-            if v.inspect.as_ref().is_some_and(|i| i.closing) {
-                v.inspect = None;
-                cx.notify();
-            }
         });
     }
 
@@ -176,18 +271,106 @@ impl ThreadsView {
         t.nodes.iter().find(|n| n.id == i.node_id)?.subtask_id
     }
 
-    /// The sliding panel over the task page, when a node is open.
-    pub(super) fn inspector_view(&mut self, thread: Option<&Thread>, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The docked panel beside the task page, showing the clicked or default node.
+    pub(super) fn inspector_view(&mut self, thread: Option<&Thread>, now: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = thread?;
+        self.sync_default(t, cx);
         let node = self.inspected_node(t, cx)?;
-        let card = CardData::from_node(t, &node).map(|d| self.cards.get(&d, false, &self.store, Self::on_card, cx).into_any_element());
+        let data = CardData::from_node(t, &node);
+        let card = data.as_ref().map(|d| self.cards.bare(d, &self.store, Self::on_card, cx));
         let i = self.inspect.as_ref()?;
-        let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).pb(px(20.));
-        let body = body.flex().flex_col().gap(px(18.)).children(card).children(self.controls(&node, i, th, cx));
-        let body = body.children(self.sections(&node, i, th, cx));
-        let panel = panel_shell(th).child(self.inspector_head(&node, th, cx)).child(body);
-        let back = scrim("inspector-scrim", Self::close_inspector, cx);
-        Some(slide_overlay("inspector", back, panel.into_any_element(), i.closing))
+        // Hidden until the owner clicks a step on the map.
+        if !i.picked {
+            return None;
+        }
+        let rows = match (&data, card) {
+            (Some(d), Some(card)) => self.decision_rows(&node, d, card, i, th, cx),
+            _ => self.node_rows(&node, i, th, cx),
+        };
+        let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).py(px(18.));
+        let body = body.flex().flex_col().gap(px(18.)).children(rows);
+        let panel = panel_shell(th).relative().child(self.inspector_head(&node, now, th)).child(body);
+        Some(panel.child(self.close_button(th, cx)).into_any_element())
+    }
+
+    /// The "×" in the panel's top-right corner: hides the panel until a step is clicked again.
+    fn close_button(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let hide = cx.listener(|this, _, _, cx| {
+            if let Some(i) = this.inspect.as_mut() {
+                i.picked = false;
+            }
+            cx.notify();
+        });
+        let hover = th.surface_2;
+        let x = div().id("inspector-close").absolute().top(px(12.)).right(px(12.)).size(px(28.)).rounded(px(8.));
+        let x = x.flex().items_center().justify_center().cursor_pointer().text_size(px(16.)).text_color(th.fg_2);
+        x.hover(move |st| st.bg(hover)).on_click(hide).child("\u{d7}").into_any_element()
+    }
+
+    /// A step that isn't a decision: its controls, then the log, output, tool calls, check and cost.
+    fn node_rows(&self, n: &Node, i: &Inspect, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = self.controls(n, i, th, cx).into_iter().collect();
+        rows.extend(self.sections(n, i, th, cx));
+        rows
+    }
+
+    /// A decision: what happened, then the amber "If approved" box with its buttons.
+    fn decision_rows(&self, n: &Node, d: &CardData, card: Entity<DecisionCard>, i: &Inspect, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let open = self.inspect.as_ref().is_some_and(|i| i.story_open);
+        let story = happened_text(n, &d.decision).map(|text| self.story_row(text, open, th, cx));
+        let mut rows: Vec<AnyElement> = story.into_iter().collect();
+        rows.push(self.approve_box(n, d, card, th, cx));
+        rows.extend(self.controls(n, i, th, cx));
+        rows
+    }
+
+    /// "What happened": one line until clicked, the full text with a "Hide" link once open.
+    fn story_row(&self, text: String, open: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let toggle = cx.listener(|this, _, _, cx| {
+            if let Some(i) = this.inspect.as_mut() {
+                i.story_open = !i.story_open;
+            }
+            cx.notify();
+        });
+        let link = div().text_size(px(11.5)).text_color(th.accent_text).child(if open { "Hide" } else { "Show" });
+        let head = div().flex().items_center().justify_between().child(div().text_size(px(11.5)).text_color(th.muted).child("What happened")).child(link);
+        let body = div().mt(px(6.)).text_size(px(13.5)).text_color(th.fg);
+        let body = if open { body.child(text) } else { body.overflow_hidden().whitespace_nowrap().text_ellipsis().child(first_line(&text)) };
+        let row = div().id("inspector-story").cursor_pointer().child(head).child(body);
+        row.on_click(toggle).into_any_element()
+    }
+
+    /// "If approved, <agent> will", the numbered steps, the review link and the buttons.
+    fn approve_box(&self, n: &Node, d: &CardData, card: Entity<DecisionCard>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let steps = &d.decision.if_approved;
+        let agent = n.agent.clone().filter(|a| !a.is_empty()).unwrap_or_else(|| "the team".into());
+        let heading = div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(th.wait.fg).child(format!("If approved, {agent} will"));
+        let line = |(k, s): (usize, &String)| div().mt(px(4.)).text_size(px(13.)).text_color(th.fg).child(format!("{}. {s}", k + 1));
+        let list = (!steps.is_empty()).then(|| div().child(heading).children(steps.iter().enumerate().map(line)));
+        let box_ = div().id("inspector-decision").flex().flex_col().gap(px(12.)).p(px(14.)).rounded(px(12.));
+        let box_ = box_.bg(th.wait.dim).border_1().border_color(th.wait.rim);
+        box_.children(list).children(self.review_row(d, th, cx)).child(card).into_any_element()
+    }
+
+    /// "Review the change first": opens the pull request, or the Changes tab when there is no link.
+    fn review_row(&self, d: &CardData, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let r = d.decision.review.as_ref()?;
+        let (url, tid) = (r.url.clone(), d.thread_id);
+        let sub = url.clone().unwrap_or_else(|| "See what it changed".into());
+        let mark = div().flex().flex_none().items_center().justify_center().size(px(28.)).rounded(px(8.)).bg(th.done.dim);
+        let mark = mark.child(icon("diff", 14., th.done.fg));
+        let title = div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Review the change first");
+        let sub = div().truncate().text_size(px(11.5)).text_color(th.muted).child(sub);
+        let text = div().flex().flex_col().flex_1().min_w_0().child(title).child(sub);
+        let hover = th.surface_2;
+        let row = div().id("inspector-review").flex().items_center().gap(px(10.)).p(px(10.)).rounded(px(10.));
+        let row = row.bg(th.surface).cursor_pointer().hover(move |s| s.bg(hover));
+        let row = row.child(mark).child(text).child(icon("chevron", 12., th.fg_2));
+        let open = move |this: &mut Self, cx: &mut Context<Self>| match &url {
+            Some(u) => cx.open_url(u),
+            None => this.show_changes(tid, cx),
+        };
+        Some(row.on_click(cx.listener(move |this, _, _, cx| open(this, cx))).into_any_element())
     }
 
     /// The open node; a question just answered is gone from the thread, so it comes from the held answer.
@@ -202,16 +385,31 @@ impl ThreadsView {
         Some(Node { id: id.clone(), kind: "decision".into(), status: "needs_you".into(), title, decision: Some(d), ..Default::default() })
     }
 
-    fn inspector_head(&self, n: &Node, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let title = div().text_size(px(16.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(n.title.clone());
+    /// Chips (state and risk), the title, and "who \u{b7} when" for the open node.
+    fn inspector_head(&self, n: &Node, now: i64, th: &Theme) -> AnyElement {
+        let decision = n.decision.as_ref();
+        let ask = n.status == "needs_you" && decision.is_some();
+        let label = if n.status == "needs_you" { "Needs a decision" } else { node_word(&n.status) };
+        let style = if ask { &th.wait } else { node_style(&n.status, th) };
+        let risk = decision.map(|d| tag(&risk_style(&d.risk, th), &risk_chip_text(&d.risk, d.reversible)));
+        let chips = div().flex().flex_wrap().items_center().gap(px(6.)).child(tag(style, label)).children(risk);
+        let title = div().mt(px(10.)).text_size(px(20.)).line_height(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg);
+        let title = title.line_clamp(3).child(n.title.clone());
+        let who = Some(who_when(n, now, super::timeline::local_offset())).filter(|w| !w.is_empty()).map(|w| self.who_row(n, w, th));
         let stalled = (n.status == "stalled").then(|| "No activity for 10 min".to_string());
-        let reason = n.reason.clone().or(stalled).map(|r| div().text_size(px(11.5)).text_color(th.fg_2).child(r));
-        let word = tag(node_style(&n.status, th), node_word(&n.status));
-        let agent = n.agent.clone().map(|a| mono(10.5, th.muted, a));
-        let meta = div().flex().items_center().gap(px(8.)).child(word).children(agent);
-        let info = div().flex().flex_col().flex_1().min_w_0().gap(px(6.)).child(title).child(meta).children(reason);
-        let close = close_button("inspector-close", Self::close_inspector, th, cx);
-        div().flex().items_start().gap(px(12.)).p(px(20.)).child(info).child(close).into_any_element()
+        let reason = n.reason.clone().filter(|_| decision.is_none()).or(stalled);
+        let reason = reason.map(|r| div().mt(px(8.)).text_size(px(11.5)).text_color(th.fg_2).child(r));
+        let head = div().px(px(20.)).pt(px(18.)).pb(px(14.)).border_b_1().border_color(th.hairline);
+        head.child(chips).child(title).children(who).children(reason).into_any_element()
+    }
+
+    /// The agent's initial in a small square, then "Builder (agent) \u{b7} today 10:24".
+    fn who_row(&self, n: &Node, text: String, th: &Theme) -> Div {
+        let initial = n.agent.as_deref().and_then(|a| a.chars().next()).map(|c| c.to_uppercase().to_string());
+        let badge = div().flex().flex_none().items_center().justify_center().size(px(22.)).rounded(px(6.)).bg(th.run.dim);
+        let badge = initial.map(|c| badge.text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(th.run.fg).child(c));
+        let text = div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(th.muted).child(text);
+        div().mt(px(8.)).flex().items_center().gap(px(8.)).children(badge).child(text)
     }
 
     fn sections(&self, n: &Node, i: &Inspect, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -282,12 +480,10 @@ impl ThreadsView {
     }
 }
 
-/// The panel floats over the thread. gpui has no backdrop blur, so it uses the mock's
-/// no-blur fallback (a 97% solid surface) instead of see-through glass.
+/// The docked right column: a rounded card beside the main column.
 fn panel_shell(th: &Theme) -> Stateful<Div> {
-    let side = div().id("inspector-panel").occlude().absolute().right(px(10.)).top(px(10.)).bottom(px(10.)).w(px(PANEL_W));
-    let side = side.flex().flex_col().overflow_hidden().rounded(px(16.)).bg(th.surface.opacity(0.97));
-    side.shadow(th.card_shadow()).border_1().border_color(th.glass_rim)
+    let side = div().id("inspector-panel").flex_none().w(px(PANEL_W)).my(px(10.)).mr(px(10.));
+    side.flex().flex_col().overflow_hidden().rounded(px(16.)).bg(th.surface).shadow(th.card_shadow())
 }
 
 fn or_none(rows: Vec<AnyElement>, th: &Theme) -> Vec<AnyElement> {
@@ -385,6 +581,65 @@ mod tests {
         assert_eq!((cost_text(0.0), cost_text(1.256)), ("$0.00".to_string(), "$1.26".to_string()));
         assert_eq!(node_word("owner"), "You're doing this step");
         assert_eq!(node_word("failed"), "Needs you");
+    }
+
+    fn node(id: &str, kind: &str, status: &str) -> Node {
+        Node { id: id.into(), kind: kind.into(), status: status.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn default_node_prefers_decision_then_running_then_last_done() {
+        let ns = [node("a", "subtask", "done"), node("b", "subtask", "running"), node("c", "decision", "needs_you"), node("d", "subtask", "done")];
+        assert_eq!(default_node(&ns).unwrap().id, "c");
+        assert_eq!(default_node(&ns[..2]).unwrap().id, "b");
+        assert_eq!(default_node(&[ns[0].clone(), ns[3].clone()]).unwrap().id, "d");
+        assert!(default_node(&[]).is_none());
+    }
+
+    #[test]
+    fn who_when_says_today_for_this_day() {
+        let mut n = node("a", "subtask", "done");
+        n.agent = Some("Builder".into());
+        n.started_at = "2026-11-18 10:24:00".into();
+        let at = parse_secs(&n.started_at).unwrap();
+        assert_eq!(who_when(&n, at + 60, 0), "Builder (agent) \u{b7} today 10:24");
+        assert_eq!(who_when(&n, at + 2 * 86_400, 0), "Builder (agent) \u{b7} 11-18 10:24");
+        n.status = "owner".into();
+        assert_eq!(who_when(&n, at, 0), "You \u{b7} today 10:24");
+        assert_eq!(who_when(&node("a", "", ""), at, 0), "");
+    }
+
+    #[test]
+    fn when_uses_the_local_day() {
+        // 23:14 UTC on 11-19 is 00:14 on 11-20 at +01:00, so with "now" on 11-20 it is today.
+        let at = parse_secs("2026-11-19 23:14:00").unwrap();
+        let now = parse_secs("2026-11-20 05:40:00").unwrap();
+        assert_eq!(when_text(at, now, 3600), "today 00:14");
+        assert_eq!(when_text(at, now, 0), "11-19 23:14");
+        // West of UTC the same moment is still the evening before.
+        assert_eq!(when_text(at, now, -5 * 3600), "11-19 18:14");
+        assert_eq!(when_text(at, now + 86_400, 3600), "11-20 00:14");
+    }
+
+    #[test]
+    fn risk_chip_joins_risk_and_reversible() {
+        assert_eq!(risk_chip_text("low", Some(true)), "Low risk \u{b7} reversible");
+        assert_eq!(risk_chip_text("high", Some(false)), "High risk \u{b7} can't be undone");
+        assert_eq!(risk_chip_text("unknown", None), "Risk unknown");
+    }
+
+    #[test]
+    fn happened_prefers_why_then_reason() {
+        let mut n = node("a", "decision", "needs_you");
+        let mut d = crate::api::Decision { why: " Ready to ship ".into(), ..Default::default() };
+        assert_eq!(happened_text(&n, &d).as_deref(), Some("Ready to ship"));
+        d.why.clear();
+        assert_eq!(happened_text(&n, &d), None);
+        d.ask = "Merge it?\nIt only adds a folder.".into();
+        assert_eq!(happened_text(&n, &d).as_deref(), Some("Merge it?\nIt only adds a folder."));
+        d.ask.clear();
+        n.reason = Some("Waiting on you".into());
+        assert_eq!(happened_text(&n, &d).as_deref(), Some("Waiting on you"));
     }
 
     #[test]

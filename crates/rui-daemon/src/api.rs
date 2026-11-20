@@ -72,6 +72,7 @@ fn require_text(s: &str, field: &str) -> ApiResult<()> {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/clients", get(list_clients).post(create_client_http))
+        .route("/clients/{id}", get(get_client_http).patch(update_client_http).delete(delete_client_http))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
@@ -104,6 +105,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/checkpoint", post(checkpoint_task))
         .route("/tasks/{id}/take-over", post(take_over_task))
         .route("/tasks/{id}/hand-back", post(hand_back_task))
+        .route("/maintenance/clean-worktrees", post(clean_worktrees))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
@@ -124,11 +126,9 @@ async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
 /// Re-reads the project's apps.json and starts them in the background.
 async fn restart_apps(State(s): State<ApiState>, Path(project): Path<String>) -> ApiResult<StatusCode> {
     let client = s.db.get_client_by_name(&project)?.ok_or_else(|| not_found("project not found"))?;
-    let repo = crate::scheduler::expand_home(&client.repo_path);
-    let sb = crate::sandbox::for_client(&s.data_dir, &client.name, &repo);
-    let apps = s.apps.clone();
+    let (apps, db, data_dir) = (s.apps.clone(), s.db.clone(), s.data_dir.clone());
     tokio::spawn(async move {
-        apps::start_project(&apps, &sb, &client.name, &repo).await;
+        crate::scheduler::start_client_apps(&db, &data_dir, &apps, &client).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -164,6 +164,106 @@ async fn create_client_http(State(s): State<ApiState>, Json(b): Json<NewClient>)
     }
     let client = crate::mcp::logic::register_client(&s.db, &s.data_dir, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
     Ok((StatusCode::CREATED, Json(client)))
+}
+
+#[derive(serde::Serialize)]
+struct ClientDetail {
+    #[serde(flatten)]
+    client: Client,
+    hosts: Vec<String>,
+}
+
+fn client_hosts(s: &ApiState, name: &str) -> Vec<String> {
+    crate::client_state::read_client(&s.data_dir, name).ok().flatten().map(|c| c.network_hosts).unwrap_or_default()
+}
+
+/// One client with its extra allowed web hosts (from its client.json).
+async fn get_client_http(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<ClientDetail>> {
+    let client = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let hosts = client_hosts(&s, &client.name);
+    Ok(Json(ClientDetail { client, hosts }))
+}
+
+#[derive(Deserialize)]
+struct ClientPatch {
+    name: Option<String>,
+    repo_path: Option<String>,
+    hosts: Option<Vec<String>>,
+}
+
+/// Trims hosts, drops empty and repeated ones.
+fn clean_hosts(hosts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        if !out.iter().any(|o| o == h) {
+            out.push(h.to_string());
+        }
+    }
+    out
+}
+
+/// Checks a new name: not empty, usable as a folder name, and not taken by another client.
+fn check_new_name(s: &ApiState, old: &Client, name: &str) -> ApiResult<()> {
+    require_text(name, "name")?;
+    if crate::projects::slug(name).is_empty() {
+        return Err(bad_request("name needs at least one letter or digit"));
+    }
+    if s.db.get_client_by_name(name)?.is_some_and(|c| c.id != old.id) {
+        return Err(conflict(&format!("client '{name}' already exists")));
+    }
+    let (from, to) = (crate::client_state::dir(&s.data_dir, &old.name), crate::client_state::dir(&s.data_dir, name));
+    if from != to && to.exists() {
+        return Err(conflict("a folder for that name already exists"));
+    }
+    Ok(())
+}
+
+/// Moves the client's state folder to the new name.
+fn rename_state_dir(s: &ApiState, old: &str, new: &str) -> ApiResult<()> {
+    let (from, to) = (crate::client_state::dir(&s.data_dir, old), crate::client_state::dir(&s.data_dir, new));
+    if from != to && from.exists() {
+        std::fs::rename(from, to).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Changes a client's name, repo folder and allowed web hosts.
+async fn update_client_http(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<ClientPatch>) -> ApiResult<Json<ClientDetail>> {
+    let old = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let name = b.name.as_deref().map(str::trim).unwrap_or(&old.name).to_string();
+    check_new_name(&s, &old, &name)?;
+    let repo = b.repo_path.as_deref().map(str::trim).unwrap_or(&old.repo_path);
+    let path = crate::scheduler::expand_home(repo);
+    if !path.is_dir() {
+        return Err(bad_request(&format!("repo_path {} does not exist", path.display())));
+    }
+    let hosts = b.hosts.as_deref().map(clean_hosts).unwrap_or_else(|| client_hosts(&s, &old.name));
+    rename_state_dir(&s, &old.name, &name)?;
+    let client = s.db.update_client(id, &name, &path.to_string_lossy())?;
+    let mut file = crate::client_state::ensure(&s.data_dir, &client.name, &client.repo_path, None)?;
+    file.network_hosts = hosts.clone();
+    let json = serde_json::to_string_pretty(&file).map_err(anyhow::Error::from)?;
+    std::fs::write(crate::client_state::dir(&s.data_dir, &client.name).join("client.json"), json).map_err(anyhow::Error::from)?;
+    if old.name != client.name {
+        apps::stop_project(&s.apps, &old.name);
+    }
+    Ok(Json(ClientDetail { client, hosts }))
+}
+
+/// Stops the client's running work and deletes it with its tasks and history. The repo folder and
+/// task worktrees stay on disk.
+async fn delete_client_http(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let client = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let open: Vec<i64> = (s.db.list_tasks()?.iter())
+        .filter(|t| t.client_id == id && t.parent_id.is_none() && !matches!(t.status, TaskStatus::Done | TaskStatus::Stuck))
+        .map(|t| t.id)
+        .collect();
+    for task in open {
+        crate::control::stop_tree(&s.db, &s.runs, task, "owner", Some("Clients"), Some("client deleted"))?;
+    }
+    apps::stop_project(&s.apps, &client.name);
+    s.db.delete_client_cascade(id)?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
 }
 
 async fn list_tasks(State(s): State<ApiState>) -> ApiResult<Json<Vec<Task>>> {
@@ -231,9 +331,17 @@ async fn list_chats(State(s): State<ApiState>) -> ApiResult<Json<Vec<Chat>>> {
 }
 
 /// Creates a chat that opens with a Rui greeting.
-async fn create_chat(State(s): State<ApiState>) -> ApiResult<(StatusCode, Json<Chat>)> {
+/// Optional body of `POST /chats`. The app sends the Inbox count it shows, because only the
+/// app knows which items the owner snoozed or dismissed.
+#[derive(Deserialize, Default)]
+struct NewChat {
+    needs_you: Option<usize>,
+}
+
+async fn create_chat(State(s): State<ApiState>, body: Option<Json<NewChat>>) -> ApiResult<(StatusCode, Json<Chat>)> {
     let chat = s.db.create_chat()?;
-    let (in_loop, needs_you, open) = greeting_counts(&s.db)?;
+    let (in_loop, counted, open) = greeting_counts(&s.db)?;
+    let needs_you = body.and_then(|b| b.0.needs_you).unwrap_or(counted);
     let hour = chrono::Timelike::hour(&chrono::Local::now());
     s.db.add_chat_message(chat.id, ChatRole::Rui, &greeting(hour, in_loop, needs_you, open))?;
     let chat = s.db.get_chat(chat.id)?.ok_or_else(|| not_found("chat not found"))?;
@@ -291,6 +399,7 @@ async fn list_events(
 async fn get_seat(State(s): State<ApiState>) -> ApiResult<Json<SeatInfo>> {
     let mut info = s.seat.read().await.clone();
     info.last_model = s.db.latest_model()?;
+    (info.limits, info.limits_seen_at) = crate::seats::current_limits(&s.db)?;
     Ok(Json(info))
 }
 
@@ -376,6 +485,8 @@ async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun
 struct ChatBody {
     chat_id: i64,
     content: String,
+    #[serde(default)]
+    client: Option<String>,
 }
 
 async fn post_chat(
@@ -388,6 +499,9 @@ async fn post_chat(
     }
     s.db.close_chat_asks(b.chat_id)?;
     let msg = s.db.add_chat_message(b.chat_id, ChatRole::User, &b.content)?;
+    if let Some(c) = b.client.as_deref().and_then(|n| s.db.get_client_by_name(n).ok().flatten()) {
+        crate::chat::pick_client(msg.id, &c.name);
+    }
     let _ = s.chat_tx.send(msg.id);
     Ok((StatusCode::CREATED, Json(msg)))
 }
@@ -663,7 +777,7 @@ async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResu
     let name = if top { format!("task-{id}") } else { id.to_string() };
     let dir = s.data_dir.join("worktrees").join(name);
     if !dir.exists() {
-        return Ok(Json(vec![]));
+        return Ok(Json(branch_changes(&s.db, &task).await?));
     }
     let done = task.status == TaskStatus::Done;
     let list = tokio::task::spawn_blocking(move || {
@@ -672,6 +786,47 @@ async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResu
         .await
         .map_err(anyhow::Error::from)??;
     Ok(Json(list))
+}
+
+/// The task's branch: the one it recorded, else the name RUI gives it.
+fn task_branch(task: &Task) -> String {
+    let fallback = || match task.parent_id {
+        None => worktree::task_branch_name(task.id),
+        Some(_) => worktree::branch_name(task.id),
+    };
+    task.branch.clone().unwrap_or_else(fallback)
+}
+
+/// Changes read from the task's branch when its worktree is gone (never made, or cleaned up).
+/// An unfinished subtask's work lived only in its worktree, so it has none to show.
+async fn branch_changes(db: &Db, task: &Task) -> ApiResult<Vec<Change>> {
+    let top = task.parent_id.is_none();
+    if !top && task.status != TaskStatus::Done {
+        return Ok(vec![]);
+    }
+    let Some(client) = db.get_client(task.client_id)? else { return Ok(vec![]) };
+    let repo = crate::scheduler::expand_home(&client.repo_path);
+    let branch = task_branch(task);
+    let list = tokio::task::spawn_blocking(move || worktree::branch_changes(&repo, &branch, top))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(list)
+}
+
+/// True once the sweep removed one of the task's worktrees.
+fn cleaned_up(db: &Db, id: i64) -> ApiResult<bool> {
+    Ok(!db.events_for_tasks(&[id], &["worktree_removed"], 0, 1)?.is_empty())
+}
+
+/// Removes the worktrees RUI no longer needs, now, and says which were removed or kept.
+async fn clean_worktrees(State(s): State<ApiState>) -> ApiResult<Json<crate::sweep::Sweep>> {
+    let running = s.runs.lock().map(|r| r.keys().copied().collect()).unwrap_or_default();
+    let (db, dir) = (s.db.clone(), s.data_dir.clone());
+    let now = crate::thread::now_secs();
+    let out = tokio::task::spawn_blocking(move || crate::sweep::sweep(&db, &dir, &running, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(out))
 }
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -721,8 +876,12 @@ async fn task_file(
     Path(id): Path<i64>,
     Query(q): Query<FileQuery>,
 ) -> ApiResult<Json<FileView>> {
-    s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
     let dir = s.data_dir.join("worktrees").join(id.to_string());
+    if !dir.exists() && cleaned_up(&s.db, id)? {
+        let msg = format!("This task's files were cleaned up; its branch {} still has them", task_branch(&task));
+        return Err(not_found(&msg));
+    }
     let view = tokio::task::spawn_blocking(move || read_worktree_file(&dir, &q.path))
         .await
         .map_err(anyhow::Error::from)??;
@@ -927,6 +1086,60 @@ mod tests {
         assert_eq!(call(&app, "POST", "/clients", Some(empty)).await.0, StatusCode::BAD_REQUEST);
     }
 
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git").arg("-C").arg(repo.path()).arg("init").output().unwrap();
+        assert!(ok.status.success());
+        repo
+    }
+
+    #[tokio::test]
+    async fn patch_client_renames_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let repo = git_repo();
+        let other = db.create_client("taken", "/repo", None, &[]).unwrap();
+        let body = json!({"name": "newco", "repo_path": repo.path().to_string_lossy()});
+        let (_, c) = call(&app, "POST", "/clients", Some(body)).await;
+        let id = c["id"].as_i64().unwrap();
+        let url = format!("/clients/{id}");
+        let patch = json!({"name": "renamed", "hosts": ["a.example.com", " a.example.com ", "b.example.com"]});
+        let (st, v) = call(&app, "PATCH", &url, Some(patch)).await;
+        assert_eq!((st, v["name"].as_str()), (StatusCode::OK, Some("renamed")));
+        assert_eq!(v["hosts"], json!(["a.example.com", "b.example.com"]));
+        let (_, got) = call(&app, "GET", &url, None).await;
+        assert_eq!(got["hosts"], json!(["a.example.com", "b.example.com"]));
+        let dup = json!({"name": "taken"});
+        assert_eq!(call(&app, "PATCH", &url, Some(dup)).await.0, StatusCode::CONFLICT);
+        let bad = json!({"repo_path": "/no/such/folder/here"});
+        assert_eq!(call(&app, "PATCH", &url, Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let empty = json!({"name": " "});
+        assert_eq!(call(&app, "PATCH", &url, Some(empty)).await.0, StatusCode::BAD_REQUEST);
+        let missing = json!({"name": "x"});
+        assert_eq!(call(&app, "PATCH", "/clients/9999", Some(missing)).await.0, StatusCode::NOT_FOUND);
+        assert!(db.get_client(other.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_client_cascades_and_404s() {
+        let (app, db, _rx) = setup();
+        let (client, task) = seed_task(&db);
+        let (other, keep) = {
+            let o = db.create_client("keeper", "/repo", None, &[]).unwrap();
+            (o.id, seed_task_for(&db, o.id))
+        };
+        let (st, _) = call(&app, "DELETE", &format!("/clients/{client}"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(db.get_client(client).unwrap().is_none());
+        assert!(db.get_task(task).unwrap().is_none());
+        assert!(db.get_client(other).unwrap().is_some());
+        assert!(db.get_task(keep).unwrap().is_some());
+        assert_eq!(call(&app, "DELETE", &format!("/clients/{client}"), None).await.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn owner_list_hides_lower_levels_and_answer_flows_to_member() {
         let (app, db, _rx) = setup();
@@ -1077,6 +1290,17 @@ mod tests {
         let (_, msgs) = call(&app, "GET", &format!("/chat?chat_id={cid}"), None).await;
         assert_eq!(msgs.as_array().unwrap().len(), 2);
         assert_eq!(msgs[0]["role"].as_str(), Some("rui"));
+    }
+
+    #[tokio::test]
+    async fn chat_greeting_uses_the_inbox_count_the_app_sends() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.create_ladder_question(tid, Role::Lead, "owner", &[], "Which provider?").unwrap();
+        let (_, c) = call(&app, "POST", "/chats", Some(json!({"needs_you": 0}))).await;
+        assert!(!c["last"].as_str().unwrap().contains("Inbox"), "{}", c["last"]);
+        let (_, c) = call(&app, "POST", "/chats", None).await;
+        assert!(c["last"].as_str().unwrap().contains("1 thing waits for you in the Inbox"), "{}", c["last"]);
     }
 
     #[tokio::test]
@@ -1428,6 +1652,41 @@ mod tests {
         assert_eq!(v["tasks"]["5"]["text"], "hi");
         assert_eq!(v["tasks"]["5"]["tool"], "Bash");
         assert_eq!(v["chats"]["2"], json!({"text":"","thinking":false,"tool":null,"tool_input":"","at":""}));
+    }
+
+    #[tokio::test]
+    async fn cleaned_task_reads_changes_from_its_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        git(&["init"]);
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Arc::new(Db::open_test());
+        let c = db.create_client("acme", &repo.path().to_string_lossy(), None, &[]).unwrap();
+        let new = |parent: Option<i64>| NewTask { client_id: c.id, parent_id: parent, title: "t".into(), body: String::new(), status: TaskStatus::Done, done_command: None, max_loops: 2, role: Role::Lead, source_kind: SourceKind::User, source_ref: None, agent: None, pod: vec![] };
+        let top = db.create_task(&new(None)).unwrap();
+        let sub = db.create_task(&new(Some(top.id))).unwrap();
+        let wts = data.path().join("worktrees");
+        let (task_wt, tb) = worktree::ensure_task_worktree(repo.path(), &wts, top.id, &worktree::base_branch(repo.path()).unwrap()).unwrap();
+        let (sub_wt, _) = worktree::create_worktree(repo.path(), &wts, sub.id, Some(&tb)).unwrap();
+        std::fs::write(task_wt.join("b.txt"), "b\n").unwrap();
+        worktree::commit_all(&task_wt, "add b").unwrap();
+        db.add_event(Some(top.id), "owner", "landed", &json!({})).unwrap();
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: data.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let (st, v) = call(&app, "POST", "/maintenance/clean-worktrees", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["removed"].as_array().unwrap().len(), 2, "{v}");
+        assert!(!task_wt.exists() && !sub_wt.exists());
+        let (st, v) = call(&app, "GET", &format!("/tasks/{}/changes", top.id), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v[0]["file"], "b.txt", "{v}");
+        let (st, v) = call(&app, "GET", &format!("/tasks/{}/file?path=a.txt", sub.id), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(v.to_string().contains(&format!("rui/{}", sub.id)), "{v}");
     }
 
     #[tokio::test]

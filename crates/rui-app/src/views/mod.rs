@@ -8,6 +8,7 @@ pub mod character;
 pub mod chat;
 pub mod client_knowledge;
 mod client_deploy;
+mod client_edit;
 mod client_triggers;
 mod chat_tools;
 pub mod clients;
@@ -19,7 +20,6 @@ pub mod live;
 pub mod markdown;
 pub mod motion;
 pub mod playbook;
-pub mod questions;
 pub mod results;
 pub mod roster;
 pub mod seat;
@@ -32,8 +32,7 @@ pub mod trace;
 
 use crate::theme::{Status, theme};
 use gpui::{
-    AnyElement, App, Div, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
-    svg,
+    App, Div, FontWeight, Hsla, SharedString, Stateful, div, prelude::*, px,
 };
 
 /// Page header: small eyebrow line above a big title. Pass the eyebrow already uppercase.
@@ -130,28 +129,4 @@ pub fn chip(id: impl Into<SharedString>, label: &str, cx: &App) -> Stateful<Div>
         .cursor_pointer()
         .hover(|s| s.bg(th.surface_2))
         .child(label.to_string())
-}
-
-/// Amber card holding a question, an optional "why" input, an answer input and its button.
-pub fn question_card(text: &str, why: Option<AnyElement>, input: AnyElement, answer_btn: AnyElement, cx: &App) -> Div {
-    let th = theme(cx);
-    // Text as a plain block with the icon in its left margin, like a chat bubble.
-    let icon = svg().path("icons/hand.svg").absolute().left_0().top(px(2.)).size(px(15.)).text_color(th.wait.fg);
-    let head = div().relative().pl(px(23.)).child(icon).child(markdown::render(text, th.wait.fg, 13., th));
-    let row = match why {
-        Some(why) => div().flex().flex_col().gap(px(8.)).child(input).child(why).child(div().flex().child(answer_btn)),
-        None => div().flex().items_center().gap(px(8.)).child(div().flex_1().child(input)).child(answer_btn),
-    };
-    // A plain block with a max width, like a chat bubble: gpui measures wrapped text height
-    // correctly there, but not inside a flex column, where the card stayed one line per
-    // paragraph tall and its text spilled over the next card.
-    div()
-        .max_w(px(660.))
-        .p(px(16.))
-        .rounded(px(9.))
-        .bg(th.wait.dim)
-        .border_1()
-        .border_color(th.wait.rim)
-        .child(head)
-        .child(row.mt(px(12.)))
 }

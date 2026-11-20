@@ -285,11 +285,15 @@ fn now_label(th: &Theme) -> AnyElement {
     div().absolute().left(relative(BEFORE_NOW)).top(px(4.)).ml(px(6.)).child(text).into_any_element()
 }
 
-/// The whole section: title and client legend, then the plot.
-pub fn view(chart: Chart, th: &Theme) -> AnyElement {
+/// The whole section: title, toggle and client legend, then the plot when `open`.
+pub fn view(chart: Chart, open: bool, toggle: AnyElement, th: &Theme) -> AnyElement {
     let title = div().flex_1().min_w_0().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg);
     let head = div().flex().items_end().gap(px(16.)).mb(px(8.));
-    let head = head.child(title.child("Every thread, last four hours")).child(legend(&chart.clients, th));
+    let legend = open.then(|| legend(&chart.clients, th));
+    let head = head.child(title.child("Every thread, last four hours")).child(toggle).children(legend);
+    if !open {
+        return div().id("threads-timeline").flex_none().pt(px(16.)).mr(px(28.)).child(head).into_any_element();
+    }
     let from = window_start(chart.now);
     let ticks = hour_ticks(from, from + WINDOW_SECS, local_offset());
     let ticks = ticks.into_iter().map(|(t, text)| tick((t - from) as f32 / WINDOW_SECS as f32, text, th));

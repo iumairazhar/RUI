@@ -5,6 +5,9 @@ use crate::api::OwnerState;
 use std::collections::HashMap;
 use super::card;
 use super::client_knowledge::ClientDrawer;
+use crate::store::Store;
+use crate::text_input::TextInput;
+use gpui::Stateful;
 use super::character::{CharState, character};
 use super::section::{Sec, section_top};
 use crate::store::StoreHandle;
@@ -58,6 +61,47 @@ fn stats(c: [usize; 4], th: &Theme) -> Div {
     let rows = [("Working", c[0]), ("Waiting", c[1]), ("Needs you", c[2]), ("Stopped", c[3])];
     let kvs = rows.map(|(label, n)| kv(label, dash_zero(n), th));
     div().flex().flex_col().gap(px(4.)).children(kvs)
+}
+
+/// "2 working \u{b7} 1 waiting \u{b7} 0 need you" from the card counts.
+pub fn stats_text(c: [usize; 4]) -> String {
+    format!("{} working \u{b7} {} waiting \u{b7} {} need you", c[0], c[1], c[2])
+}
+
+/// (repo folder, stats line) for the drawer header of a client.
+pub fn summary(client: i64, store: &Store) -> (String, String) {
+    let repo = store.clients.iter().find(|c| c.id == client).map(|c| c.repo_path.clone()).unwrap_or_default();
+    (repo, stats_text(counts(client, &store.tasks, &store.states)))
+}
+
+/// One text input drawn with a single rounded border (the input already has its own fill).
+pub fn field(input: Entity<TextInput>, mono: bool, th: &Theme) -> AnyElement {
+    let f = div().rounded(px(8.)).overflow_hidden().border_1().border_color(th.hairline);
+    let f = if mono { f.font_family("Menlo") } else { f };
+    f.child(input).into_any_element()
+}
+
+/// A small label above a form control.
+pub fn labeled(label: &str, el: AnyElement, th: &Theme) -> Div {
+    let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(label.to_string());
+    div().flex().flex_col().gap(px(6.)).child(head).child(el)
+}
+
+/// One option of a single-select group: a ring with a check when selected. The caller adds the click.
+pub fn radio_row(id: impl Into<gpui::ElementId>, label: &str, on: bool, th: &Theme) -> Stateful<Div> {
+    let (bg, ring) = if on { (th.accent_fill, th.accent_fill) } else { (gpui::transparent_black(), th.muted) };
+    let tick = on.then(|| super::activity::icon("check", 11., th.on_accent));
+    let dot = div().flex().flex_none().items_center().justify_center().size(px(16.)).rounded_full();
+    let dot = dot.bg(bg).border_1().border_color(ring).children(tick);
+    let name = div().text_size(px(12.5)).text_color(th.fg).child(label.to_string());
+    let edge = if on { th.accent_fill } else { th.hairline };
+    let row = div().id(id).flex().items_center().gap(px(10.)).px(px(12.)).py(px(9.)).rounded(px(8.));
+    row.border_1().border_color(edge).cursor_pointer().child(dot).child(name)
+}
+
+/// Save and Cancel for an inline form; the caller adds both click handlers.
+pub fn form_buttons(save: Stateful<Div>, cancel: Stateful<Div>) -> Div {
+    div().flex().items_center().gap(px(8.)).child(save).child(cancel)
 }
 
 /// Clicking a card opens the client's drawer.
@@ -130,6 +174,11 @@ mod tests {
         assert_eq!(since("garbage"), "Client");
         assert_eq!(since("2026-13-01"), "Client");
         assert_eq!(since(""), "Client");
+    }
+
+    #[test]
+    fn stats_line_reads_in_words() {
+        assert_eq!(stats_text([2, 1, 0, 5]), "2 working \u{b7} 1 waiting \u{b7} 0 need you");
     }
 
     #[test]

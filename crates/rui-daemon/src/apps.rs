@@ -9,7 +9,7 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -199,9 +199,14 @@ fn spawn_app(apps: &Apps, key: &Key, sb: &Sandbox, repo: &Path, spec: &AppSpec, 
     Ok(())
 }
 
+/// True when the app answers HTTP on IPv4 or IPv6 loopback (dev servers like Vite bind `::1`).
 async fn http_ok(port: u16) -> bool {
+    http_ok_at("127.0.0.1", port).await || http_ok_at("::1", port).await
+}
+
+async fn http_ok_at(host: &str, port: u16) -> bool {
     let probe = async {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let mut s = tokio::net::TcpStream::connect((host, port)).await.ok()?;
         s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.ok()?;
         let mut buf = [0u8; 5];
         s.read_exact(&mut buf).await.ok()?;
@@ -274,6 +279,22 @@ async fn start_one(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path, spec: 
 
 /// Starts every app of a project in order, waiting for each to answer HTTP.
 pub async fn start_project(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path) -> Vec<AppInfo> {
+    start_project_in(apps, sb, project, repo, repo).await
+}
+
+/// Where the apps' code is: the repo when every app folder is there, else the first candidate
+/// (a task worktree, newest first) that has them all, else the repo.
+pub fn code_dir(repo: &Path, candidates: &[PathBuf]) -> PathBuf {
+    let Ok(specs) = read_specs(repo) else { return repo.to_path_buf() };
+    let has_all = |d: &Path| specs.iter().all(|s| d.join(&s.dir).is_dir());
+    if has_all(repo) {
+        return repo.to_path_buf();
+    }
+    candidates.iter().find(|c| has_all(c)).cloned().unwrap_or_else(|| repo.to_path_buf())
+}
+
+/// `start_project`, reading the app list from `repo` but running each app's code in `code`.
+pub async fn start_project_in(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path, code: &Path) -> Vec<AppInfo> {
     stop_project(apps, project);
     let specs = match read_specs(repo) {
         Ok(s) => s,
@@ -284,7 +305,7 @@ pub async fn start_project(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path
     };
     let mut earlier: Vec<(String, String)> = Vec::new();
     for spec in &specs {
-        start_one(apps, sb, project, repo, spec, &earlier).await;
+        start_one(apps, sb, project, code, spec, &earlier).await;
         let key = (project.to_string(), spec.name.clone());
         if let Some(url) = with_entry(apps, &key, |e| e.info.url.clone()) {
             earlier.push((spec.name.clone(), url));
@@ -299,6 +320,31 @@ mod tests {
 
     fn spec(name: &str) -> AppSpec {
         AppSpec { name: name.into(), dir: ".".into(), command: "x".into() }
+    }
+
+    #[tokio::test]
+    async fn an_app_listening_only_on_ipv6_loopback_counts_as_up() {
+        let Ok(l) = tokio::net::TcpListener::bind(("::1", 0)).await else { return };
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await;
+            }
+        });
+        assert!(http_ok(port).await);
+    }
+
+    #[test]
+    fn code_dir_uses_a_worktree_only_when_the_repo_lacks_the_app_folder() {
+        let repo = tempfile::tempdir().unwrap();
+        let (old, new) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir_all(repo.path().join(".rui")).unwrap();
+        std::fs::write(repo.path().join(".rui/apps.json"), r#"[{"name":"web","dir":"proto","command":"run $PORT"}]"#).unwrap();
+        std::fs::create_dir_all(new.path().join("proto")).unwrap();
+        let wts = vec![old.path().to_path_buf(), new.path().to_path_buf()];
+        assert_eq!(code_dir(repo.path(), &wts), new.path());
+        std::fs::create_dir_all(repo.path().join("proto")).unwrap();
+        assert_eq!(code_dir(repo.path(), &wts), repo.path(), "merged code runs from the repo");
     }
 
     #[test]

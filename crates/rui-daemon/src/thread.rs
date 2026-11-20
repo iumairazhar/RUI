@@ -46,6 +46,8 @@ pub struct Decision {
     pub source: &'static str,
     pub question_id: Option<i64>,
     pub ask: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub details: String,
     pub why: String,
     pub ladder: Vec<Rung>,
     pub risk: &'static str,
@@ -205,13 +207,14 @@ fn pending_loop<'a>(ctx: &'a Ctx, t: &Task) -> Option<&'a Event> {
     (t.status == TaskStatus::Stuck && hit.id > max_id(&evs, "resumed")).then_some(hit)
 }
 
-/// The top task's newest `forwarded` event while it is neither approved nor landed.
+/// The top task's newest `forwarded` event while the owner hasn't answered it (approved or sent
+/// back for changes) and it hasn't landed.
 fn pending_review<'a>(ctx: &'a Ctx) -> Option<&'a Event> {
     let evs = ctx.evs(ctx.top.id);
     let fwd = latest(&evs, "forwarded")?;
-    let approved = evs.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
+    let answered = max_id(&evs, "reviewed");
     let settled = max_id(&evs, "landed").max(max_id(&evs, "pr_merged")).max(max_id(&evs, "pr_closed"));
-    (fwd.id > approved && fwd.id > settled).then_some(fwd)
+    (fwd.id > answered && fwd.id > settled).then_some(fwd)
 }
 
 fn last_is_failure(evs: &[&Event]) -> bool {
@@ -391,7 +394,7 @@ fn review_nodes(ctx: &Ctx) -> Vec<Node> {
 
 fn decision(source: &'static str, ask: String, actions: &[&str]) -> Decision {
     Decision {
-        source, question_id: None, ask, why: String::new(), ladder: vec![], risk: "unknown", reversible: None,
+        source, question_id: None, ask, details: String::new(), why: String::new(), ladder: vec![], risk: "unknown", reversible: None,
         if_approved: vec![], options: vec![], review: None, actions: actions.iter().map(|a| a.to_string()).collect(), undo_secs: 0,
     }
 }
@@ -410,6 +413,30 @@ fn meta_from(payload: &serde_json::Value) -> (&'static str, Option<bool>, Vec<St
 
 fn apply_meta(d: &mut Decision, payload: &serde_json::Value) {
     (d.risk, d.reversible, d.if_approved) = meta_from(payload);
+    if let Some(short) = short_question(payload) {
+        d.details = std::mem::replace(&mut d.ask, short);
+    }
+    if let Some(opts) = payload["options"].as_array() {
+        d.options = opts.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    }
+}
+
+/// The newest `escalated` event that sent question `q` to the owner, among `events`.
+pub fn owner_escalation<'a>(events: impl IntoIterator<Item = &'a Event>, q: &Question) -> Option<&'a Event> {
+    let to_owner = |e: &&Event| e.kind == "escalated" && e.payload["question_id"] == q.id && e.payload["to"] == "owner";
+    events.into_iter().filter(to_owner).max_by_key(|e| e.id)
+}
+
+/// The short question the escalating agent wrote for the owner, if any.
+pub fn short_question(payload: &serde_json::Value) -> Option<String> {
+    let s = payload["question"].as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The short owner question for `q`, read from its escalation event.
+pub fn owner_short(db: &Db, q: &Question) -> Option<String> {
+    let events = db.list_events(Some(q.task_id), 500).ok()?;
+    short_question(&owner_escalation(&events, q)?.payload)
 }
 
 fn decision_node(id: String, title: String, at: &str, d: Decision) -> Node {
@@ -426,12 +453,12 @@ fn question_decisions(ctx: &Ctx) -> Vec<Node> {
         d.undo_secs = crate::scheduler::UNDO_SECS;
         d.why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
         d.ladder = q.ladder.clone();
-        let to_owner = |e: &&Event| e.payload["question_id"] == q.id && e.payload["to"] == "owner";
-        let esc = ctx.evs(q.task_id).into_iter().filter(|e| e.kind == "escalated").filter(to_owner).max_by_key(|e| e.id);
+        let esc = owner_escalation(ctx.evs(q.task_id), q);
         if let Some(e) = esc {
             apply_meta(&mut d, &e.payload);
         }
-        let mut n = decision_node(format!("q:{}", q.id), first_line(&q.text), &q.created_at, d);
+        let title = esc.and_then(|e| short_question(&e.payload)).unwrap_or_else(|| first_line(&q.text));
+        let mut n = decision_node(format!("q:{}", q.id), title, &q.created_at, d);
         n.subtask_id = (q.task_id != ctx.top.id).then_some(q.task_id);
         n
     };
@@ -685,7 +712,9 @@ pub fn inspect(db: &Db, th: &Thread, node_id: &str, after_id: i64) -> Result<Opt
     let done_checks = done_checks(&own);
     let mut events: Vec<Event> = own.into_iter().filter(|e| e.id > after_id).collect();
     if let Some(sid) = node.subtask_id.filter(|_| node.kind == "subtask") {
-        events.extend(db.events_for_tasks(&[sid], &["tool_call"], after_id, PAGE as i64 + 1)?);
+        // The member's own turns and notes, so a running step shows what it is doing.
+        let kinds = ["assistant", "tool_call", "progress", "result"];
+        events.extend(db.events_for_tasks(&[sid], &kinds, after_id, PAGE as i64 + 1)?);
     }
     let cost_usd = node.cost_usd.unwrap_or(0.0);
     Ok(Some(page(node, events, cost_usd, done_checks)))
@@ -838,12 +867,40 @@ mod tests {
     }
 
     #[test]
+    fn short_question_and_options_split_off_the_details() {
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "Long original text\nmore", json!({"question": "Use sqlite?", "options": ["Yes", "No"]}));
+        let th = get(&db, top, real_now());
+        let n = th.nodes.iter().find(|n| n.decision.is_some()).unwrap();
+        let d = n.decision.as_ref().unwrap();
+        assert_eq!((d.ask.as_str(), d.details.as_str()), ("Use sqlite?", "Long original text\nmore"));
+        assert_eq!((d.options.clone(), n.title.as_str()), (vec!["Yes".to_string(), "No".to_string()], "Use sqlite?"));
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        owner_question(&db, sub, "Plain\nmore", json!({}));
+        let n = get(&db, top, real_now()).nodes.into_iter().find(|n| n.decision.is_some()).unwrap();
+        let d = n.decision.unwrap();
+        assert_eq!((d.ask.as_str(), d.details.as_str(), d.options.len(), n.title.as_str()), ("Plain\nmore", "", 0, "Plain"));
+    }
+
+    #[test]
     fn review_decision_reads_forwarded_meta() {
         let (db, top, _) = setup(TaskStatus::Done);
         db.set_task_status(top, TaskStatus::Done).unwrap();
         db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": null, "risk": "low", "reversible": true, "if_approved": ["merge"]})).unwrap();
         let d = get(&db, top, real_now()).nodes.iter().find_map(|n| n.decision.clone()).unwrap();
         assert_eq!((d.source, d.risk, d.reversible, d.if_approved), ("review", "low", Some(true), vec!["merge".to_string()]));
+    }
+
+    #[test]
+    fn sending_work_back_answers_the_review_until_new_work_comes() {
+        let (db, top, _) = setup(TaskStatus::Done);
+        db.set_task_status(top, TaskStatus::Done).unwrap();
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "first"})).unwrap();
+        db.add_event(Some(top), "owner", "reviewed", &json!({"verdict": "changes"})).unwrap();
+        let reviews = |db: &Db| get(db, top, real_now()).nodes.iter().filter(|n| n.decision.as_ref().is_some_and(|d| d.source == "review")).count();
+        assert_eq!(reviews(&db), 0, "sent back: nothing waits on the owner");
+        db.add_event(Some(top), "lead", "forwarded", &json!({"remarks": "second"})).unwrap();
+        assert_eq!(reviews(&db), 1, "new work asks again");
     }
 
     #[test]
@@ -1035,6 +1092,23 @@ mod tests {
         let ids: Vec<i64> = seen.events.iter().map(|e| e.id).collect();
         assert_eq!(ids, [think, call, done], "only the planning turn");
         assert!((seen.cost_usd - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn running_step_shows_its_turns_and_notes_but_not_thinking_pings() {
+        let (db, top, sub) = setup(TaskStatus::InProgress);
+        let said = db.add_event(Some(sub), "builder", "assistant", &json!({"text": "scaffolding"})).unwrap();
+        let note = db.add_event(Some(sub), "builder", "progress", &json!({"note": "next: mock data"})).unwrap();
+        db.add_event(Some(sub), "builder", "other", &json!({"subtype": "thinking_tokens"})).unwrap();
+        db.add_event(Some(sub), "builder", "toolresult", &json!({})).unwrap();
+        let th = get(&db, top, real_now());
+        let step = th.nodes.iter().find(|n| n.subtask_id == Some(sub) && n.kind == "subtask").unwrap();
+        let seen = inspect(&db, &th, &step.id, 0).unwrap().unwrap();
+        let ids: Vec<i64> = seen.events.iter().map(|e| e.id).filter(|id| [said, note].contains(id)).collect();
+        assert_eq!(ids, [said, note]);
+        assert!(seen.events.iter().all(|e| e.kind != "other" && e.kind != "toolresult"));
+        let later = inspect(&db, &th, &step.id, note).unwrap().unwrap();
+        assert!(later.events.iter().all(|e| e.id > note), "follow-up pages only bring newer events");
     }
 
     #[test]

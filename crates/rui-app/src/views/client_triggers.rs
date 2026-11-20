@@ -1,17 +1,16 @@
-//! "Automatic tasks" in the client drawer: the client's triggers, a delete per row, and an add form.
+//! The Automations tab of the client drawer: the client's triggers, a delete per row, and an add form.
 //! Every change posts the whole list; the daemon checks it and answers 400 with a message when wrong.
 
+use super::clients::{field, form_buttons, labeled, radio_row};
 use super::library::{self as lib, run, toast};
 use super::{chip, primary_button};
 use crate::api::{self, Trigger};
 use crate::store::Store;
 use crate::text_input::TextInput;
 use crate::theme::{Theme, theme};
-use gpui::{AnyElement, Context, Div, Entity, FontWeight, Render, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, Render, SharedString, Window, div, prelude::*, px};
 
-const TITLE: &str = "Automatic tasks";
-const SUBTITLE: &str = "Start a task when something happens.";
-const EMPTY: &str = "None yet. Add one below.";
+const EMPTY: &str = "No automations yet. Start a task when a PR merges, a client emails, or every day.";
 
 /// What starts the task, as picked in the add form.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +50,11 @@ pub fn when_label(t: &Trigger) -> String {
         "schedule" => cron_label(t.cron.as_deref().unwrap_or("")),
         other => format!("When {other}"),
     }
+}
+
+/// One list line: "When a PR merges \u{2192} Check the release notes".
+pub fn summary(t: &Trigger) -> String {
+    format!("{} \u{2192} {}", when_label(t), t.title)
 }
 
 /// Plain words for the daemon's tiny cron: "HH:MM daily", "weekdays HH:MM" or "<day> HH:MM".
@@ -108,6 +112,7 @@ pub struct TriggerPanel {
     title: Entity<TextInput>,
     body: Entity<TextInput>,
     busy: bool,
+    adding: bool,
 }
 
 impl TriggerPanel {
@@ -115,12 +120,13 @@ impl TriggerPanel {
         let time = cx.new(|cx| TextInput::new("09:00", cx));
         let title = cx.new(|cx| TextInput::new("Title, like \u{201c}Check the release notes\u{201d}", cx));
         let body = cx.new(|cx| TextInput::new("What should the task do? (optional)", cx));
-        Self { store, client: None, list: None, when: When::PrMerged, time, title, body, busy: false }
+        Self { store, client: None, list: None, when: When::PrMerged, time, title, body, busy: false, adding: false }
     }
 
     /// Show a client's triggers and clear the form.
     pub fn open(&mut self, id: i64, cx: &mut Context<Self>) {
         (self.client, self.list, self.when, self.busy) = (Some(id), None, When::PrMerged, false);
+        self.adding = false;
         self.clear_form(cx);
         run(cx, move || api::get_triggers(id), move |v, res, cx| v.loaded(id, res, cx));
         cx.notify();
@@ -140,6 +146,14 @@ impl TriggerPanel {
             toast(&self.store, "Could not load automatic tasks", e, cx);
         }
         self.list = Some(res.unwrap_or_default());
+        cx.notify();
+    }
+
+    fn set_adding(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.adding = on;
+        if !on {
+            self.clear_form(cx);
+        }
         cx.notify();
     }
 
@@ -181,6 +195,7 @@ impl TriggerPanel {
             Ok(list) if self.client == Some(id) => {
                 self.list = Some(list);
                 if added {
+                    self.adding = false;
                     self.clear_form(cx);
                 }
                 toast(&self.store, "Automatic tasks saved", "", cx);
@@ -192,9 +207,7 @@ impl TriggerPanel {
     }
 
     fn row(&self, i: usize, t: &Trigger, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let when = div().text_size(px(11.5)).text_color(th.muted).child(when_label(t));
-        let title = div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(t.title.clone());
-        let text = div().flex().flex_col().gap(px(2.)).flex_1().min_w_0().child(when).child(title);
+        let text = div().flex_1().min_w_0().text_size(px(12.5)).text_color(th.fg).child(summary(t));
         let del_id = SharedString::from(format!("trigger-del-{i}"));
         let id = t.id.clone();
         let del = lib::danger_button(del_id, "Delete", !self.busy, th);
@@ -211,43 +224,39 @@ impl TriggerPanel {
         }
     }
 
-    fn choices(&self, cx: &mut Context<Self>) -> AnyElement {
-        let button = |(i, w): (usize, &When)| {
+    /// The three "when" options as a single-select list.
+    fn choices(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let option = |(i, w): (usize, &When)| {
             let (w, id) = (*w, SharedString::from(format!("trigger-when-{i}")));
-            let el = if w == self.when { primary_button(id, w.choice(), cx) } else { chip(id, w.choice(), cx) };
+            let el = radio_row(id, w.choice(), w == self.when, th);
             el.on_click(cx.listener(move |this, _, _, cx| this.pick(w, cx))).into_any_element()
         };
-        let items: Vec<AnyElement> = When::ALL.iter().enumerate().map(button).collect();
-        div().flex().flex_wrap().items_center().gap(px(6.)).children(items).into_any_element()
+        let items: Vec<AnyElement> = When::ALL.iter().enumerate().map(option).collect();
+        div().flex().flex_col().gap(px(6.)).children(items).into_any_element()
     }
 
     fn form(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let time = (self.when == When::Schedule).then(|| labeled("At", field(self.time.clone(), th), th));
-        let label = if self.busy { "Saving\u{2026}" } else { "Add" };
-        let add = primary_button("trigger-add", label, cx).on_click(cx.listener(|this, _, _, cx| this.add(cx)));
-        let col = div().flex().flex_col().gap(px(10.)).child(labeled("When", self.choices(cx), th)).children(time);
-        let col = col.child(labeled("Title", field(self.title.clone(), th), th));
-        col.child(labeled("Task", field(self.body.clone(), th), th)).child(div().flex().child(add)).into_any_element()
+        let time = (self.when == When::Schedule).then(|| labeled("At", field(self.time.clone(), false, th), th));
+        let label = if self.busy { "Saving\u{2026}" } else { "Save" };
+        let save = primary_button("trigger-add", label, cx).on_click(cx.listener(|this, _, _, cx| this.add(cx)));
+        let cancel = chip("trigger-cancel", "Cancel", cx).on_click(cx.listener(|this, _, _, cx| this.set_adding(false, cx)));
+        let col = div().flex().flex_col().gap(px(12.)).child(labeled("When should it run?", self.choices(th, cx), th)).children(time);
+        let col = col.child(labeled("Title", field(self.title.clone(), false, th), th));
+        let col = col.child(labeled("What should the task do? (optional)", field(self.body.clone(), false, th), th));
+        col.child(form_buttons(save, cancel)).into_any_element()
     }
-}
-
-fn field(input: Entity<TextInput>, th: &Theme) -> AnyElement {
-    let f = div().px(px(10.)).py(px(4.)).rounded(px(8.)).bg(th.well).border_1().border_color(th.hairline);
-    f.child(input).into_any_element()
-}
-
-fn labeled(label: &str, el: AnyElement, th: &Theme) -> Div {
-    let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(label.to_string());
-    div().flex().flex_col().gap(px(4.)).child(head).child(el)
 }
 
 impl Render for TriggerPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
-        let title = div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(TITLE);
-        let head = div().flex().flex_col().gap(px(2.)).child(title).child(lib::note(SUBTITLE, &th));
         let rows = div().flex().flex_col().gap(px(6.)).children(self.rows(&th, cx));
-        div().flex().flex_col().gap(px(12.)).child(head).child(rows).child(self.form(&th, cx))
+        let more = if self.adding {
+            self.form(&th, cx)
+        } else {
+            chip("trigger-open", "+ Add an automation", cx).on_click(cx.listener(|this, _, _, cx| this.set_adding(true, cx))).into_any_element()
+        };
+        div().flex().flex_col().items_start().gap(px(12.)).child(div().w_full().child(rows)).child(div().w_full().child(more))
     }
 }
 
@@ -266,6 +275,13 @@ mod tests {
         assert_eq!(when_label(&t("a", "schedule", Some("09:00 daily"))), "Every day at 09:00");
         assert_eq!(when_label(&t("a", "schedule", Some("weekdays 08:30"))), "Every weekday at 08:30");
         assert_eq!(when_label(&t("a", "schedule", Some("Mon 09:00"))), "Every Monday at 09:00");
+    }
+
+    #[test]
+    fn summary_joins_when_and_title() {
+        let mut x = t("a", "pr_merged", None);
+        x.title = "Check the release notes".into();
+        assert_eq!(summary(&x), "When a PR merges \u{2192} Check the release notes");
     }
 
     #[test]

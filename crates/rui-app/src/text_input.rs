@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
@@ -65,7 +65,10 @@ pub struct TextInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
+    /// Where the text was painted: the field's box shifted left by `scroll_x`.
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the line is scrolled left so the cursor stays inside the field.
+    scroll_x: f32,
     is_selecting: bool,
 }
 
@@ -81,6 +84,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: 0.,
             is_selecting: false,
         }
     }
@@ -88,14 +92,6 @@ impl TextInput {
     /// Current text.
     pub fn content(&self) -> String {
         self.content.to_string()
-    }
-
-    /// Replace the text, put the cursor at the end and notify.
-    pub fn set_content(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.reset();
-        self.content = text.to_string().into();
-        self.selected_range = text.len()..text.len();
-        cx.notify();
     }
 
     /// Clear the text and notify.
@@ -454,7 +450,26 @@ struct TextElement {
     input: Entity<TextInput>,
 }
 
+/// The next sideways scroll: as little as possible, keeping the cursor in a field `width` wide
+/// and not scrolling past the end of a line `text_w` wide.
+fn next_scroll(prev: f32, cursor_x: f32, text_w: f32, width: f32) -> f32 {
+    let margin = 2.;
+    let mut s = prev.min((text_w + margin - width).max(0.));
+    if cursor_x < s {
+        s = cursor_x;
+    }
+    if cursor_x + margin > s + width {
+        s = cursor_x + margin - width;
+    }
+    s.max(0.)
+}
+
 struct PrepaintState {
+    /// The field's box, to clip the text to.
+    clip: Bounds<Pixels>,
+    /// The field's box shifted left by the scroll; text, cursor and selection are placed in it.
+    shifted: Bounds<Pixels>,
+    scroll_x: f32,
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
@@ -556,6 +571,9 @@ impl Element for TextElement {
             .shape_line(display_text, font_size, &runs, None);
 
         let cursor_pos = line.x_for_index(cursor);
+        let scroll_x = next_scroll(input.scroll_x, f32::from(cursor_pos), f32::from(line.width), f32::from(bounds.size.width));
+        let clip = bounds;
+        let bounds = Bounds::new(point(bounds.left() - px(scroll_x), bounds.top()), size(bounds.size.width + px(scroll_x), bounds.size.height));
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -586,6 +604,9 @@ impl Element for TextElement {
             )
         };
         PrepaintState {
+            clip,
+            shifted: bounds,
+            scroll_x,
             line: Some(line),
             cursor,
             selection,
@@ -608,22 +629,24 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
+        let (shifted, scroll_x) = (prepaint.shifted, prepaint.scroll_x);
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
-
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let focused = focus_handle.is_focused(window);
+        // Clip to the field so a long line never paints past its edge.
+        window.with_content_mask(Some(ContentMask { bounds: prepaint.clip }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            line.paint(shifted.origin, window.line_height(), window, cx).unwrap();
+            if focused && let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
-            input.last_bounds = Some(bounds);
+            input.last_bounds = Some(shifted);
+            input.scroll_x = scroll_x;
         });
     }
 }
@@ -673,5 +696,19 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::next_scroll;
+
+    #[test]
+    fn scroll_keeps_the_cursor_in_view() {
+        assert_eq!(next_scroll(0., 50., 50., 100.), 0.);
+        assert_eq!(next_scroll(0., 150., 150., 100.), 52.);
+        assert_eq!(next_scroll(52., 10., 150., 100.), 10.);
+        assert_eq!(next_scroll(52., 100., 120., 100.), 22.);
+        assert_eq!(next_scroll(52., 0., 0., 100.), 0.);
     }
 }

@@ -29,5 +29,8 @@ In why, write: the question in one line, the options, and your recommendation,
 so the owner can answer in one click.
 Also pass risk (low, medium or high), reversible (true or false) and
 if_approved (2 to 5 short steps that run after the owner approves).
+When you escalate, also pass question (one short plain sentence the owner can
+answer at a glance) and options (2 to 4 short answers, recommendation first).
+Keep the reasoning in why.
 
 Call exactly one of them. You have no other tools.

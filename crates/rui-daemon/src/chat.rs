@@ -8,11 +8,30 @@ use crate::roster;
 use anyhow::{Context, Result};
 use rui_core::{ChatMessage, ChatRole, Role};
 use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
 const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__create_client,mcp__rui__set_up_pod,mcp__rui__create_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
+
+/// Clients the owner picked for a message, kept in memory until that message's turn starts.
+static PICKED: Mutex<Option<HashMap<i64, String>>> = Mutex::new(None);
+
+/// Remember the client picked for one message (not stored in the DB).
+pub fn pick_client(msg_id: i64, name: &str) {
+    PICKED.lock().unwrap().get_or_insert_with(HashMap::new).insert(msg_id, name.to_string());
+}
+
+fn take_picked(msg_id: i64) -> Option<String> {
+    PICKED.lock().unwrap().as_mut()?.remove(&msg_id)
+}
+
+/// The turn prompt: the owner's text, with a client line on top when one was picked.
+fn turn_prompt(text: &str, client: Option<&str>) -> String {
+    let Some(name) = client else { return text.to_string() };
+    format!("The owner picked the client for this message: {name}. Use this client for any client work (report_status, create_task client={name}, run_apps).\n\n{text}")
+}
 
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
@@ -54,7 +73,7 @@ fn chat_run(db: &Db, cfg: &Config, msg: ChatMessage) -> Result<AgentRun> {
         role: Role::Rui,
         task_id: None,
         cwd: cfg.data_dir.clone(),
-        prompt: msg.content,
+        prompt: turn_prompt(&msg.content, take_picked(id).as_deref()),
         system_prompt: system_prompt(&cfg.data_dir),
         allowed_tools: allowed_tools(),
         // Rui reads and researches with real tools; risky Bash calls go through
@@ -94,6 +113,21 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_prompt_names_the_picked_client_only_when_given() {
+        let with = turn_prompt("hello", Some("Acme"));
+        assert!(with.starts_with("The owner picked the client for this message: Acme."));
+        assert!(with.contains("create_task client=Acme") && with.ends_with("hello"));
+        assert_eq!(turn_prompt("hello", None), "hello");
+    }
+
+    #[test]
+    fn picked_client_is_taken_once() {
+        pick_client(987_654, "Acme");
+        assert_eq!(take_picked(987_654).as_deref(), Some("Acme"));
+        assert_eq!(take_picked(987_654), None);
+    }
 
     #[tokio::test]
     async fn chat_runs_get_the_secret_deny_settings() {
