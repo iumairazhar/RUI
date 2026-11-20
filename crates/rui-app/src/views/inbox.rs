@@ -138,20 +138,6 @@ impl InboxPanel {
         }
     }
 
-    /// Reset for a fresh slide-in.
-    pub fn opened(&mut self, cx: &mut Context<Self>) {
-        (self.closing, self.menu, self.tab, self.expanded) = (false, None, Tab::All, None);
-        cx.notify();
-    }
-
-    /// Show the All tab with one item's row open, scrolled into view.
-    pub fn open_item(&mut self, kind: &str, id: i64, cx: &mut Context<Self>) {
-        (self.closing, self.menu, self.tab, self.expanded) = (false, None, Tab::All, None);
-        let key = (kind.to_string(), id);
-        self.scroll_to = Some(key.clone());
-        self.expand(key, cx);
-    }
-
     /// Slide out, then tell the root to remove the panel.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.closing {

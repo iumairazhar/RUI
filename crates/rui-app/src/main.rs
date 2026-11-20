@@ -312,17 +312,6 @@ impl Root {
         views::inbox::awake_count(&s.inbox, &s.snoozed, store::now_secs())
     }
 
-    /// The rail's Inbox item opens the slide-over over the current page, or closes it.
-    fn toggle_inbox(&mut self, cx: &mut Context<Self>) {
-        if self.inbox_open {
-            self.inbox.update(cx, |p, cx| p.close(cx));
-            return;
-        }
-        self.inbox_open = true;
-        self.inbox.update(cx, |p, cx| p.opened(cx));
-        cx.notify();
-    }
-
     /// Switch to Cost → Seats, closing the Inbox slide-over if it is open.
     fn go_to_seats(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |s, _| s.tabs.insert(Sec::Cost.key(), 1));
@@ -333,11 +322,13 @@ impl Root {
     }
 
     /// Open the Inbox slide-over on the Decisions tab with one question's row expanded.
+    /// Switch to the Inbox page with one question open, closing the slide-over if it is up.
     fn open_in_inbox(&mut self, qid: i64, cx: &mut Context<Self>) {
-        if !self.inbox_open {
-            self.toggle_inbox(cx);
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
         }
-        self.inbox.update(cx, |p, cx| p.open_item("question", qid, cx));
+        self.select(Nav::Inbox, cx);
+        self.questions.update(cx, |q, cx| q.open_kind("question", qid, cx));
     }
 
     fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {
@@ -396,10 +387,7 @@ impl Root {
             .justify_center()
             .cursor_pointer()
             .child(icon)
-            .on_click(cx.listener(move |this, _, _, cx| match nav {
-                Nav::Inbox => this.toggle_inbox(cx),
-                _ => this.select(nav, cx),
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.select(nav, cx)))
             .tooltip(move |_, cx| cx.new(|_| Tooltip(label.into())).into());
         let item = if active { item } else { item.hover(move |s| s.bg(hairline)) };
         let count = if nav == Nav::Inbox { self.open_questions(cx) } else { 0 };

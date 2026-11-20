@@ -127,7 +127,9 @@ impl ThreadsView {
         }
         let title = text(t.task.title.clone(), th.fg).flex_1().min_w_0().truncate();
         let row = row.child(threads.child("Threads")).child(sep()).child(title);
-        div().id("task-crumbs").flex().flex_none().px(px(30.)).pt(px(14.)).child(row.min_w_0()).into_any_element()
+        let back = chip("task-back", "\u{2190} Back", cx).on_click(cx.listener(|this, _, _, cx| this.close(cx)));
+        let bar = div().flex().items_center().gap(px(12.)).min_w_0().child(back).child(row.min_w_0());
+        div().id("task-crumbs").flex().flex_none().px(px(30.)).pt(px(14.)).child(bar).into_any_element()
     }
 
     /// Eyebrow, title, status word with its reason, model and time, and Stop or Resume on the right.
