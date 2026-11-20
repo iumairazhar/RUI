@@ -170,6 +170,26 @@ pub struct SeatInfo {
     pub org_name: Option<String>,
     pub last_model: Option<String>,
     pub error: Option<String>,
+    /// Latest Claude usage-limit windows seen in a run (newest rate-limit line).
+    #[serde(default)]
+    pub limits: Vec<LimitWindow>,
+    /// Unix seconds when that rate-limit line was stored.
+    #[serde(default)]
+    pub limits_seen_at: Option<i64>,
+}
+
+/// One Claude usage-limit window, e.g. `five_hour` or `seven_day`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LimitWindow {
+    pub name: String,
+    /// 0 to 100; `None` when the CLI gave no utilization.
+    #[serde(default)]
+    pub used_pct: Option<f64>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// The latest agent run for a task: which model and seat kind it used.

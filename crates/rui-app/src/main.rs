@@ -278,7 +278,9 @@ impl Root {
 
     fn summary(&self, cx: &Context<Self>) -> String {
         let s = self.store.read(cx);
-        summary_text(s.clients.len(), open_threads(&s.tasks), seat::seats_free(s))
+        let base = summary_text(s.clients.len(), open_threads(&s.tasks), seat::seats_free(s));
+        let limit = s.seat.as_ref().and_then(|x| seat::limits::summary(x, views::activity::local_offset()));
+        limit.map_or(base.clone(), |l| format!("{base} \u{b7} {l}"))
     }
 
     fn header(&self, th: &Theme, cx: &Context<Self>) -> impl IntoElement + use<> {

@@ -390,6 +390,7 @@ async fn list_events(
 async fn get_seat(State(s): State<ApiState>) -> ApiResult<Json<SeatInfo>> {
     let mut info = s.seat.read().await.clone();
     info.last_model = s.db.latest_model()?;
+    (info.limits, info.limits_seen_at) = crate::seats::current_limits(&s.db)?;
     Ok(Json(info))
 }
 

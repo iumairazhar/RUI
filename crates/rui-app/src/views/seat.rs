@@ -2,6 +2,7 @@
 
 mod cards;
 mod form;
+pub mod limits;
 
 use super::activity::section;
 use super::library::{run, toast};
@@ -172,8 +173,9 @@ impl Render for SeatView {
         let row = seat_row(s, free == 1, &th, cx);
         let login = section("Login", vec![row.into_any_element()]);
         let top = section_top(Sec::Cost, Some(lead(free, &th)), None, cx);
+        let limits = section("Limits", limits::cards(s.seat.as_ref(), store::now_secs(), &th, cx));
         let seats = self.seats_section(&th, cx);
         let page = div().id("seat-page").flex().flex_col().gap(px(24.)).size_full().overflow_y_scroll().pr(px(40.)).pb(px(28.));
-        page.child(top).child(login).child(seats)
+        page.child(top).child(limits).child(login).child(seats)
     }
 }

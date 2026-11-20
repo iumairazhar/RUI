@@ -886,6 +886,7 @@ async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str
     let res = run_agent_with(cli, &run, |p| {
         on_line(live, LiveKey::Task(task_id), p);
         let Some((kind, payload)) = line_event(p) else { return };
+        seats::record_limits(&payload, crate::thread::now_secs());
         let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
     })
     .await;
