@@ -279,14 +279,32 @@ impl ThreadsView {
         let data = CardData::from_node(t, &node);
         let card = data.as_ref().map(|d| self.cards.bare(d, &self.store, Self::on_card, cx));
         let i = self.inspect.as_ref()?;
+        // Hidden until the owner clicks a step on the map.
+        if !i.picked {
+            return None;
+        }
         let rows = match (&data, card) {
             (Some(d), Some(card)) => self.decision_rows(&node, d, card, i, th, cx),
             _ => self.node_rows(&node, i, th, cx),
         };
         let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).py(px(18.));
         let body = body.flex().flex_col().gap(px(18.)).children(rows);
-        let panel = panel_shell(th).child(self.inspector_head(&node, now, th)).child(body);
-        Some(panel.into_any_element())
+        let panel = panel_shell(th).relative().child(self.inspector_head(&node, now, th)).child(body);
+        Some(panel.child(self.close_button(th, cx)).into_any_element())
+    }
+
+    /// The "×" in the panel's top-right corner: hides the panel until a step is clicked again.
+    fn close_button(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let hide = cx.listener(|this, _, _, cx| {
+            if let Some(i) = this.inspect.as_mut() {
+                i.picked = false;
+            }
+            cx.notify();
+        });
+        let hover = th.surface_2;
+        let x = div().id("inspector-close").absolute().top(px(12.)).right(px(12.)).size(px(28.)).rounded(px(8.));
+        let x = x.flex().items_center().justify_center().cursor_pointer().text_size(px(16.)).text_color(th.fg_2);
+        x.hover(move |st| st.bg(hover)).on_click(hide).child("\u{d7}").into_any_element()
     }
 
     /// A step that isn't a decision: its controls, then the log, output, tool calls, check and cost.
@@ -317,7 +335,7 @@ impl ThreadsView {
         let link = div().text_size(px(11.5)).text_color(th.accent_text).child(if open { "Hide" } else { "Show" });
         let head = div().flex().items_center().justify_between().child(div().text_size(px(11.5)).text_color(th.muted).child("What happened")).child(link);
         let body = div().mt(px(6.)).text_size(px(13.5)).text_color(th.fg);
-        let body = if open { body.child(text) } else { body.overflow_hidden().whitespace_nowrap().text_ellipsis().child(text) };
+        let body = if open { body.child(text) } else { body.overflow_hidden().whitespace_nowrap().text_ellipsis().child(first_line(&text)) };
         let row = div().id("inspector-story").cursor_pointer().child(head).child(body);
         row.on_click(toggle).into_any_element()
     }
