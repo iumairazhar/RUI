@@ -113,11 +113,15 @@ pub fn drop_task(db: &Db, runs: &Runs, id: i64) -> Res<Vec<i64>> {
     Ok(ids)
 }
 
+/// The answer recorded on questions closed because their task was dropped. Not the owner's words,
+/// so the thread map leaves these out.
+pub const DROPPED_ANSWER: &str = "Dropped by the owner";
+
 /// Closes a dropped task's open questions so they stop showing as "Needs you". Nothing is
 /// delivered to an agent: the task is no longer running.
 fn close_open_questions(db: &Db, task_id: i64) -> Res<()> {
     for q in db.questions_for_task(task_id)?.into_iter().filter(|q| q.status == QuestionStatus::Open) {
-        db.answer_question(q.id, "Dropped by the owner", None)?;
+        db.answer_question(q.id, DROPPED_ANSWER, None)?;
     }
     Ok(())
 }

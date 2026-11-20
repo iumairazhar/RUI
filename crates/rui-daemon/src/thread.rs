@@ -299,7 +299,9 @@ fn instruction_nodes(ctx: &Ctx) -> Vec<Node> {
 }
 
 fn answer_nodes(ctx: &Ctx) -> Vec<Node> {
-    let answered = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Answered && q.level == "owner");
+    // Questions closed by dropping the task weren't answered by the owner: leave them off the map.
+    let dropped = |q: &&Question| q.answer.as_deref() == Some(crate::control::DROPPED_ANSWER);
+    let answered = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Answered && q.level == "owner").filter(|q| !dropped(q));
     let title = |q: &Question| format!("You answered: {}", q.answer.as_deref().unwrap_or_default());
     answered.map(|q| node(format!("q:{}", q.id), "in", "answer", "done", title(q), &q.created_at)).collect()
 }
@@ -1096,6 +1098,15 @@ mod tests {
         assert!(["task_in", "instruction", "answer", "plan", "subtask", "app"].iter().all(|x| k.contains(x)));
         let app = th.nodes.iter().find(|n| n.kind == "app").unwrap();
         assert_eq!(app.output.as_ref().unwrap().label, "App running on :3000");
+    }
+
+    #[test]
+    fn questions_closed_by_a_drop_are_not_shown_as_answers() {
+        let (db, _top, sub) = setup(TaskStatus::InProgress);
+        let q = db.create_ladder_question(sub, Role::Builder, "owner", &[], "Pick").unwrap();
+        db.answer_question(q.id, crate::control::DROPPED_ANSWER, None).unwrap();
+        let th = get(&db, _top, real_now());
+        assert!(!kinds(&th).contains(&"answer"));
     }
 
     #[test]
