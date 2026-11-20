@@ -389,7 +389,10 @@ impl InboxPanel {
             Kind::Review => {
                 let good = one(0, "Looks good", cx).on_click(cx.listener(move |this, _, _, cx| this.task_act(task, TaskAct::Approve, cx)));
                 let changes = one(1, "Ask for changes", cx).on_click(cx.listener(move |this, _, _, cx| this.ask_changes(key.clone(), cx)));
-                vec![good.into_any_element(), changes.into_any_element()]
+                let s = self.store.read(cx);
+                let links = task.and_then(|t| s.task_client(t)).map(|c| s.app_links(c)).unwrap_or_default();
+                let open = crate::views::apps::open_chips(&format!("inbox-p-{i}"), &links, cx);
+                [good.into_any_element(), changes.into_any_element()].into_iter().chain(open).collect()
             }
             Kind::Ask => {
                 let reply = one(1, "Reply", cx).on_click(cx.listener(move |this, _, _, cx| this.expand(key.clone(), cx)));

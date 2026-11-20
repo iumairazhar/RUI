@@ -46,6 +46,11 @@ pub fn now_secs() -> i64 {
     since.map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Apps of `project` that are up, as (name, url).
+pub fn running_links(apps: &[AppInfo], project: &str) -> Vec<(String, String)> {
+    apps.iter().filter(|a| a.project == project && a.status == "running").map(|a| (a.name.clone(), a.url.clone())).collect()
+}
+
 /// The app's store as a global, so click handlers without a view can reach it.
 pub struct StoreHandle(pub Entity<Store>);
 
@@ -611,6 +616,17 @@ impl Store {
         self.open_thread(id, cx);
     }
 
+    /// A client's running apps as (name, url), for "Open" links on its threads.
+    pub fn app_links(&self, client_id: i64) -> Vec<(String, String)> {
+        let Some(c) = self.clients.iter().find(|c| c.id == client_id) else { return vec![] };
+        running_links(&self.apps, &c.name)
+    }
+
+    /// The client of a task, by task id.
+    pub fn task_client(&self, task_id: i64) -> Option<i64> {
+        self.tasks.iter().find(|t| t.id == task_id).map(|t| t.client_id)
+    }
+
     /// Hide an inbox item until `until` (unix seconds).
     pub fn snooze(&mut self, key: ItemKey, until: i64, cx: &mut Context<Self>) {
         self.snoozed.insert(key, until);
@@ -859,6 +875,21 @@ pub fn observe<V: 'static>(store: &Entity<Store>, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn running_links_only_lists_live_apps_of_the_client() {
+        let app = |project: &str, name: &str, status: &str| AppInfo {
+            project: project.into(),
+            name: name.into(),
+            port: 8100,
+            url: format!("http://localhost:8100/{name}"),
+            status: status.into(),
+            log: vec![],
+        };
+        let apps = vec![app("acme", "web", "running"), app("acme", "api", "failed"), app("other", "web", "running")];
+        assert_eq!(running_links(&apps, "acme"), vec![("web".to_string(), "http://localhost:8100/web".to_string())]);
+        assert!(running_links(&apps, "nobody").is_empty());
+    }
+
     use super::*;
 
     fn question(ladder: serde_json::Value) -> Question {

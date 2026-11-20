@@ -13,6 +13,17 @@ use std::collections::HashSet;
 const LOG_LINES: usize = 20;
 const EMPTY: &str = "No apps running yet. When a team finishes a task, Rui starts its apps here and posts the links in chat.";
 
+/// "Open web · localhost:8100" chips; clicking one opens the app in the browser.
+pub fn open_chips(prefix: &str, links: &[(String, String)], cx: &gpui::App) -> Vec<AnyElement> {
+    let one = |(i, (name, url)): (usize, &(String, String))| {
+        let short = url.trim_start_matches("http://").trim_start_matches("https://");
+        let url = url.clone();
+        let c = chip(format!("{prefix}-open-app-{i}"), &format!("Open {name} \u{b7} {short} \u{2197}"), cx);
+        c.on_click(move |_, _, cx| cx.open_url(&url)).into_any_element()
+    };
+    links.iter().enumerate().map(one).collect()
+}
+
 /// Apps page: one card per project.
 pub struct AppsView {
     store: Entity<Store>,
