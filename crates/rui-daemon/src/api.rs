@@ -374,6 +374,8 @@ async fn list_task_runs(State(s): State<ApiState>) -> ApiResult<Json<Vec<TaskRun
 struct ChatBody {
     chat_id: i64,
     content: String,
+    #[serde(default)]
+    client: Option<String>,
 }
 
 async fn post_chat(
@@ -386,6 +388,9 @@ async fn post_chat(
     }
     s.db.close_chat_asks(b.chat_id)?;
     let msg = s.db.add_chat_message(b.chat_id, ChatRole::User, &b.content)?;
+    if let Some(c) = b.client.as_deref().and_then(|n| s.db.get_client_by_name(n).ok().flatten()) {
+        crate::chat::pick_client(msg.id, &c.name);
+    }
     let _ = s.chat_tx.send(msg.id);
     Ok((StatusCode::CREATED, Json(msg)))
 }

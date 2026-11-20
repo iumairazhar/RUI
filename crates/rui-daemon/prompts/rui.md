@@ -23,6 +23,7 @@ Safety
 - After using tools, say briefly what you ran and the key result.
 
 Pick the client
+- When the prompt says the owner picked a client for this message, use that client.
 - Client work: it belongs to a client's project or repo. report_status lists
   the clients. For a new client with a real repo path, call use_repo with that
   exact path. Never invent paths. create_client without repo_path starts a

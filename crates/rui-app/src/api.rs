@@ -530,9 +530,9 @@ pub fn delete_chat(id: i64) -> Result<()> {
     library("DELETE", &format!("/chats/{id}"), None).map(|_| ())
 }
 
-/// Post a user message to a chat.
-pub fn post_chat(chat_id: i64, content: &str) -> Result<()> {
-    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content }))
+/// Post a user message to a chat, with the client the owner picked for it (if any).
+pub fn post_chat(chat_id: i64, content: &str, client: Option<&str>) -> Result<()> {
+    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content, "client": client }))
 }
 
 /// How to undo a held owner answer before `run_at` (unix seconds).

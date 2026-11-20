@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 mod support;
+pub mod chat_clients_file;
 pub mod snooze_file;
 
 const MAX_EVENTS: usize = 300;
@@ -120,6 +121,8 @@ pub struct Store {
     pub sending: HashMap<i64, Sending>,
     /// Inbox items hidden until a unix time, saved in `snoozes.json`.
     pub snoozed: HashMap<ItemKey, i64>,
+    /// Client picked per chat id (0 while there is no chat yet), saved in `chat_clients.json`.
+    pub chat_clients: HashMap<i64, i64>,
     /// Set with `open_task` to show the task page's Changes tab; the root clears it.
     pub open_changes: bool,
     /// (updated_at, needs-you count) of each needs-you thread when it was last loaded.
@@ -194,12 +197,12 @@ fn fetch_all(after_id: Option<i64>, wanted: Option<i64>) -> Snapshot {
 }
 
 /// Create the chat first when there is none, then post; returns the chat id.
-fn send_to(current: Option<i64>, text: &str) -> anyhow::Result<i64> {
+fn send_to(current: Option<i64>, text: &str, client: Option<&str>) -> anyhow::Result<i64> {
     let id = match current {
         Some(id) => id,
         None => api::create_chat()?.id,
     };
-    api::post_chat(id, text)?;
+    api::post_chat(id, text, client)?;
     Ok(id)
 }
 
@@ -256,6 +259,7 @@ impl Store {
             toast: None,
             sending: HashMap::new(),
             snoozed: snooze_file::load(&snooze_file::path()),
+            chat_clients: chat_clients_file::load(&chat_clients_file::path()),
             open_changes: false,
             needs_marks: HashMap::new(),
             watched: None,
@@ -651,10 +655,12 @@ impl Store {
     /// Post a message to the current chat (creating one if none), then refresh.
     pub fn send_chat(&mut self, text: String, cx: &mut Context<Self>) {
         let current = self.current_chat;
+        let client = self.picked_client().map(|c| c.name.clone());
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { send_to(current, &text) }).await;
+            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref()) }).await;
             this.update(cx, |s, cx| {
                 if let Ok(id) = res {
+                    s.adopt_new_chat_pick(id);
                     s.current_chat.get_or_insert(id);
                 }
                 s.refresh(cx);
@@ -662,6 +668,34 @@ impl Store {
             .ok();
         })
         .detach();
+    }
+
+    /// The client picked for the current chat; `None` means Auto (or a client that is gone).
+    pub fn picked_client(&self) -> Option<&Client> {
+        let id = self.chat_clients.get(&self.current_chat.unwrap_or(0))?;
+        self.clients.iter().find(|c| c.id == *id)
+    }
+
+    /// Pick a client for the current chat, or `None` for Auto, and save it.
+    pub fn pick_client(&mut self, client: Option<i64>, cx: &mut Context<Self>) {
+        let key = self.current_chat.unwrap_or(0);
+        match client {
+            Some(id) => self.chat_clients.insert(key, id),
+            None => self.chat_clients.remove(&key),
+        };
+        chat_clients_file::save(&chat_clients_file::path(), &self.chat_clients);
+        cx.notify();
+    }
+
+    /// A chat created by the first message keeps the pick made before it existed.
+    fn adopt_new_chat_pick(&mut self, id: i64) {
+        if self.current_chat.is_some() {
+            return;
+        }
+        if let Some(c) = self.chat_clients.remove(&0) {
+            self.chat_clients.insert(id, c);
+            chat_clients_file::save(&chat_clients_file::path(), &self.chat_clients);
+        }
     }
 
     /// Show another chat, then refresh.

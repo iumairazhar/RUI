@@ -30,6 +30,7 @@ pub struct ChatView {
     last_chat: Option<i64>,
     confirm_delete: Option<(i64, String)>,
     open_tools: HashSet<String>,
+    client_menu: bool,
 }
 
 impl ChatView {
@@ -38,7 +39,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new() }
+        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -193,6 +194,30 @@ impl ChatView {
         card.border_1().border_color(th.hairline).flex().flex_col().gap(px(6.)).child(head).child(body).child(scope).child(foot).into_any_element()
     }
 
+    fn choose_client(&mut self, client: Option<i64>, cx: &mut Context<Self>) {
+        self.client_menu = false;
+        self.store.update(cx, |s, cx| s.pick_client(client, cx));
+    }
+
+    /// The "Client: …" chip; its menu lists Auto and every client.
+    fn client_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = self.store.read(cx);
+        let label = format!("Client: {}", s.picked_client().map_or("Auto", |c| c.name.as_str()));
+        let mut options: Vec<(Option<i64>, String)> = vec![(None, "Auto".into())];
+        options.extend(s.clients.iter().map(|c| (Some(c.id), c.name.clone())));
+        let chip = chip("chat-client", &label, cx).on_click(cx.listener(|this, _, _, cx| {
+            this.client_menu = !this.client_menu;
+            cx.notify();
+        }));
+        let menu = self.client_menu.then(|| {
+            let items = options.into_iter().enumerate().map(|(i, (id, name))| {
+                super::chip(format!("chat-client-{i}"), &name, cx).on_click(cx.listener(move |this, _, _, cx| this.choose_client(id, cx)))
+            });
+            div().flex().flex_col().gap(px(4.)).children(items)
+        });
+        div().flex().flex_col().gap(px(4.)).children(menu).child(chip).into_any_element()
+    }
+
     fn composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let send = primary_button("send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
@@ -212,6 +237,7 @@ impl ChatView {
                     .rounded(px(14.))
                     .bg(th.surface)
                     .shadow(th.card_shadow())
+                    .child(self.client_picker(cx))
                     .child(div().flex_1().child(self.input.clone()))
                     .child(send),
             )
