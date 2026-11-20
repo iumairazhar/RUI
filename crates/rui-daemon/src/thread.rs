@@ -14,10 +14,10 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 23] = [
+const KINDS: [&str; 25] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
     "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
-    "handed_back", "pr_merged", "pr_closed", "deploy_requested", "deploy_started", "deploy_finished",
+    "handed_back", "pr_merged", "pr_closed", "deploy_requested", "deploy_started", "deploy_finished", "team_asked", "team_reply",
 ];
 const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
 const TAKEOVER_REASON: &str = "You're doing this step";
@@ -139,6 +139,8 @@ struct Ctx<'a> {
     questions: Vec<Question>,
     last: HashMap<i64, i64>,
     cost: HashMap<i64, f64>,
+    /// What each planning meeting's turns cost, by `team_asked` event id.
+    meeting_cost: HashMap<i64, f64>,
     now: i64,
     stall: i64,
 }
@@ -320,9 +322,7 @@ fn plan_node(ctx: &Ctx) -> Option<Node> {
 }
 
 fn role_name(t: &Task) -> String {
-    let name = t.agent.as_deref().unwrap_or(t.role.as_str());
-    let mut chars = name.chars();
-    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+    capitalize(t.agent.as_deref().unwrap_or(t.role.as_str()))
 }
 
 fn done_checks(evs: &[Event]) -> Vec<DoneCheck> {
@@ -391,6 +391,53 @@ fn review_nodes(ctx: &Ctx) -> Vec<Node> {
         n
     };
     sent_back.map(build).collect()
+}
+
+/// One "meeting" node per planning meeting: running until every role replied, then done.
+fn meeting_nodes(ctx: &Ctx) -> Vec<Node> {
+    let asked = ctx.events.iter().filter(|e| e.kind == "team_asked" && e.task_id == Some(ctx.top.id));
+    asked.map(|req| meeting_node(ctx, req)).collect()
+}
+
+fn meeting_node(ctx: &Ctx, req: &Event) -> Node {
+    let mine = |e: &&Event| e.kind == "team_reply" && e.payload["roles_request_event_id"] == req.id;
+    let replies: Vec<Event> = ctx.events.iter().filter(mine).cloned().collect();
+    let roles = crate::team::roles_of(req);
+    let open = !crate::team::waiting_roles(req, &replies).is_empty();
+    let names: Vec<String> = roles.iter().map(|r| capitalize(r)).collect();
+    let title = format!("Planning meeting: {}", names.join(", "));
+    let mut n = node(ev_id(req.id), "work", "meeting", if open { "running" } else { "done" }, title, &req.created_at);
+    n.ended_at = (!open).then(|| replies.last().map(|r| r.created_at.clone())).flatten();
+    n.event_ids = std::iter::once(req.id).chain(replies.iter().map(|r| r.id)).collect();
+    n.cost_usd = Some(ctx.meeting_cost.get(&req.id).copied().unwrap_or(0.0));
+    let label = format!("{} of {} answered", replies.len(), roles.len());
+    let lines: Vec<String> = replies.iter().map(|r| meeting_line(&r.payload)).collect();
+    n.output = Some(Output { kind: "meeting", label, url: None, preview: Some(lines.join("\n")), output_tail: None });
+    n
+}
+
+/// "Tester (S): approach. Proof: cargo test"
+fn meeting_line(p: &serde_json::Value) -> String {
+    let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+    format!("{} ({}): {} Proof: {}", capitalize(&s("role")), s("size"), s("approach"), s("proof"))
+}
+
+fn capitalize(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// What each meeting's planning turns cost, read from their `result` events on the top task.
+fn meeting_costs(db: &Db, top: i64, events: &[Event]) -> Result<HashMap<i64, f64>> {
+    let mut out = HashMap::new();
+    if !events.iter().any(|e| e.kind == "team_asked") {
+        return Ok(out);
+    }
+    for e in db.events_for_tasks(&[top], &["result"], 0, i64::MAX)? {
+        let Some(id) = e.agent.strip_prefix("team:").and_then(|r| r.split(':').next()?.parse::<i64>().ok()) else { continue };
+        *out.entry(id).or_insert(0.0) += e.payload["total_cost_usd"].as_f64().unwrap_or(0.0);
+    }
+    Ok(out)
 }
 
 // ---- decisions ----
@@ -587,6 +634,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     let mut v = vec![task_in_node(ctx)];
     v.extend(instruction_nodes(ctx));
     v.extend(answer_nodes(ctx));
+    v.extend(meeting_nodes(ctx));
     v.extend(plan_node(ctx));
     v.extend(ctx.subs.iter().map(|t| subtask_node(ctx, t)));
     v.extend(takeover_nodes(ctx));
@@ -634,7 +682,9 @@ pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
     let subs = db.subtasks(top.id)?;
     let ids: Vec<i64> = std::iter::once(top.id).chain(subs.iter().map(|s| s.id)).collect();
     let events = db.events_for_tasks(&ids, &KINDS, 0, i64::MAX)?;
-    let ctx = Ctx { top, subs: &subs, events, questions: open_questions(db, &ids)?, last: db.last_activity(&ids)?, cost: db.cost_by_task(&ids)?, now, stall };
+    let meeting_cost = meeting_costs(db, top.id, &events)?;
+    let (questions, last, cost) = (open_questions(db, &ids)?, db.last_activity(&ids)?, db.cost_by_task(&ids)?);
+    let ctx = Ctx { top, subs: &subs, events, questions, last, cost, meeting_cost, now, stall };
     let nodes = nodes(&ctx);
     let mut statuses: Vec<&str> = nodes.iter().map(|n| n.status).collect();
     let all_planned = !subs.is_empty() && subs.iter().all(|s| task_status(&ctx, s) == "planned");
@@ -826,6 +876,25 @@ mod tests {
         let th = get(&db, top, real_now());
         assert_eq!(sub_status(&th, sub), "planned");
         assert!(th.nodes.iter().any(|n| n.kind == "takeover" && n.status == "done"));
+    }
+
+    #[test]
+    fn meeting_node_runs_until_every_role_replied() {
+        let (db, top, _) = setup(TaskStatus::Open);
+        let req = db.add_event(Some(top), "lead", "team_asked", &json!({"roles": ["designer", "tester"], "question": "How?"})).unwrap();
+        let reply = |role: &str| json!({"roles_request_event_id": req, "role": role, "approach": "do it", "risks": [], "needs": [], "size": "S", "proof": "cargo test"});
+        db.add_event(Some(top), &crate::team::agent_name(req, "designer"), "team_reply", &reply("designer")).unwrap();
+        db.add_event(Some(top), &crate::team::agent_name(req, "designer"), "result", &json!({"total_cost_usd": 0.25})).unwrap();
+        let meeting = |th: &Thread| th.nodes.iter().find(|n| n.kind == "meeting").cloned().unwrap();
+        let n = meeting(&get(&db, top, real_now()));
+        assert_eq!((n.title.as_str(), n.status, n.lane), ("Planning meeting: Designer, Tester", "running", "work"));
+        assert_eq!((n.cost_usd, n.event_ids.len()), (Some(0.25), 2));
+        db.add_event(Some(top), &crate::team::agent_name(req, "tester"), "team_reply", &reply("tester")).unwrap();
+        let n = meeting(&get(&db, top, real_now()));
+        assert_eq!(n.status, "done");
+        let out = n.output.unwrap();
+        assert_eq!(out.label, "2 of 2 answered");
+        assert!(out.preview.unwrap().contains("Tester (S): do it Proof: cargo test"));
     }
 
     #[test]
