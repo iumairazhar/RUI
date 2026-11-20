@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const RUI_PROMPT: &str = include_str!("../prompts/rui.md");
-const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__staff_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
+const RUI_TOOLS: &str = "mcp__rui__use_repo,mcp__rui__create_client,mcp__rui__set_up_pod,mcp__rui__create_task,mcp__rui__report_status,mcp__rui__run_apps,mcp__rui__stop_apps,mcp__rui__stop_task,mcp__rui__instruct_task,mcp__rui__ask_owner";
 
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
@@ -46,9 +46,11 @@ fn allowed_tools() -> Vec<String> {
     RUI_TOOLS.split(',').chain(extra).map(String::from).collect()
 }
 
-async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<()> {
+/// The Rui chat run for one owner message. Its Read and Edit tools are denied the private
+/// files, since Rui reads untrusted text (email, meetings, web pages, PR comments).
+fn chat_run(db: &Db, cfg: &Config, msg: ChatMessage) -> Result<AgentRun> {
     let (id, chat_id) = (msg.id, msg.chat_id);
-    let run = AgentRun {
+    Ok(AgentRun {
         role: Role::Rui,
         task_id: None,
         cwd: cfg.data_dir.clone(),
@@ -61,10 +63,18 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
         permission_mode: None,
         permission_prompt_tool: Some("mcp__rui__approve".into()),
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
-        mcp_headers: vec![("X-Rui-Source-Ref".into(), format!("chat:{id}"))],
+        grant: crate::run_tokens::RunGrant { server: crate::run_tokens::Server::Rui, task_id: None, source_ref: Some(format!("chat:{id}")) },
         resume: db.get_rui_session(chat_id)?,
+        seat: None,
+        sandbox: None,
+        deny_secrets: Some(cfg.data_dir.clone()),
         partial: true,
-    };
+    })
+}
+
+async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<()> {
+    let chat_id = msg.chat_id;
+    let run = chat_run(db, cfg, msg)?;
     let key = LiveKey::Chat(chat_id);
     let _guard = LiveGuard(live.clone(), key);
     let out = run_agent(&run, |p| {
@@ -84,6 +94,21 @@ async fn handle(db: &Db, cfg: &Config, live: &Live, msg: ChatMessage) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chat_runs_get_the_secret_deny_settings() {
+        let data = tempfile::tempdir().unwrap();
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+        let msg = ChatMessage { id: 1, chat_id: chat.id, role: ChatRole::User, content: "hi".into(), created_at: String::new() };
+        let mut run = chat_run(&db, &cfg, msg).unwrap();
+        run.cwd = data.path().to_path_buf();
+        let v = crate::runner::tests::captured_settings(&run).await.expect("--settings passed");
+        let want = crate::sandbox::secret_deny_rules(&std::fs::canonicalize(data.path()).unwrap());
+        assert_eq!(v["permissions"]["deny"], serde_json::json!(want));
+        assert!(run.sandbox.is_none(), "chat keeps the approve prompt, not the member sandbox");
+    }
 
     #[test]
     fn prompt_and_tools_cover_stop_and_instruct() {

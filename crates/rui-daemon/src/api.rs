@@ -32,6 +32,8 @@ pub struct ApiState {
     pub live: Live,
     pub data_dir: std::path::PathBuf,
     pub apps: Apps,
+    /// Owner token required in the `x-rui-owner` header.
+    pub owner_token: Arc<str>,
 }
 
 /// Error that renders as `{ "error": msg }` with a status code.
@@ -73,6 +75,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
+        .route("/approvals/{event_id}/cancel", post(cancel_approval))
         .route("/chats", get(list_chats).post(create_chat))
         .route("/chats/{id}", delete(delete_chat))
         .route("/chat", get(list_chat).post(post_chat))
@@ -84,6 +87,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/runs", get(list_task_runs))
         .route("/tasks/stopped", get(list_stopped))
         .route("/tasks/state", get(list_states))
+        .route("/threads", get(list_threads))
+        .route("/threads/{id}", get(get_thread))
+        .route("/threads/{id}/nodes/{node_id}", get(get_thread_node))
         .route("/inbox", get(get_inbox))
         .route("/tasks/{id}/changes", get(task_changes))
         .route("/tasks/{id}/file", get(task_file))
@@ -95,11 +101,19 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/review", post(review_task))
         .route("/tasks/{id}/drop", post(drop_task))
         .route("/tasks/{id}/retry", post(retry_task))
+        .route("/tasks/{id}/checkpoint", post(checkpoint_task))
+        .route("/tasks/{id}/take-over", post(take_over_task))
+        .route("/tasks/{id}/hand-back", post(hand_back_task))
         .route("/apps", get(list_apps))
         .route("/apps/{project}/restart", post(restart_apps))
         .route("/apps/{project}/stop", post(stop_apps))
         .route("/apps/{project}/{name}/stop", post(stop_app))
         .merge(crate::library_api::routes())
+        .merge(crate::seats_api::routes())
+        .merge(crate::support_api::routes())
+        .merge(crate::inputs_api::routes())
+        .merge(crate::costs::routes())
+        .route_layer(axum::middleware::from_fn_with_state(state.owner_token.clone(), crate::owner_auth::require))
         .with_state(state)
 }
 
@@ -111,9 +125,10 @@ async fn list_apps(State(s): State<ApiState>) -> Json<Vec<AppInfo>> {
 async fn restart_apps(State(s): State<ApiState>, Path(project): Path<String>) -> ApiResult<StatusCode> {
     let client = s.db.get_client_by_name(&project)?.ok_or_else(|| not_found("project not found"))?;
     let repo = crate::scheduler::expand_home(&client.repo_path);
+    let sb = crate::sandbox::for_client(&s.data_dir, &client.name, &repo);
     let apps = s.apps.clone();
     tokio::spawn(async move {
-        apps::start_project(&apps, &client.name, &repo).await;
+        apps::start_project(&apps, &sb, &client.name, &repo).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -147,7 +162,7 @@ async fn create_client_http(State(s): State<ApiState>, Json(b): Json<NewClient>)
     if !name.is_empty() && s.db.get_client_by_name(name)?.is_some() {
         return Err(conflict(&format!("client '{name}' already exists")));
     }
-    let client = crate::mcp::logic::register_client(&s.db, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
+    let client = crate::mcp::logic::register_client(&s.db, &s.data_dir, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
     Ok((StatusCode::CREATED, Json(client)))
 }
 
@@ -298,6 +313,42 @@ async fn list_states(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::own
     Ok(Json(crate::owner_state::all_states(&s.db)?))
 }
 
+#[derive(Deserialize)]
+struct ThreadsQuery {
+    client_id: Option<i64>,
+    state: Option<String>,
+    all: Option<String>,
+}
+
+/// Threads (top-level tasks as conversations), needs-you first.
+async fn list_threads(State(s): State<ApiState>, Query(q): Query<ThreadsQuery>) -> ApiResult<Json<Vec<crate::thread::ThreadSummary>>> {
+    let all = matches!(q.all.as_deref(), Some("1" | "true"));
+    let list = crate::thread::summaries(&s.db, q.client_id, q.state.as_deref(), all, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    Ok(Json(list))
+}
+
+async fn get_thread(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<crate::thread::Thread>> {
+    let th = crate::thread::thread(&s.db, id, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    th.map(Json).ok_or_else(|| not_found("thread not found"))
+}
+
+#[derive(Deserialize)]
+struct NodeQuery {
+    after_id: Option<i64>,
+}
+
+/// One node's events, cost and done checks, a page at a time.
+async fn get_thread_node(
+    State(s): State<ApiState>,
+    Path((id, node_id)): Path<(i64, String)>,
+    Query(q): Query<NodeQuery>,
+) -> ApiResult<Json<crate::thread::Inspector>> {
+    let th = crate::thread::thread(&s.db, id, crate::thread::now_secs(), crate::thread::STALL_SECS)?;
+    let th = th.ok_or_else(|| not_found("thread not found"))?;
+    let seen = crate::thread::inspect(&s.db, &th, &node_id, q.after_id.unwrap_or(0))?;
+    seen.map(Json).ok_or_else(|| not_found("node not found"))
+}
+
 /// Everything that needs the owner, newest first.
 async fn get_inbox(State(s): State<ApiState>) -> ApiResult<Json<Vec<crate::inbox::InboxItem>>> {
     Ok(Json(crate::inbox::inbox(&s.db)?))
@@ -379,18 +430,45 @@ struct AnswerBody {
     why: Option<String>,
 }
 
+/// The answered question plus how to undo it before it takes effect.
+#[derive(serde::Serialize)]
+struct AnswerReply {
+    #[serde(flatten)]
+    question: Question,
+    undo: Undo,
+}
+
+#[derive(serde::Serialize)]
+struct Undo {
+    event_id: i64,
+    run_at: i64,
+}
+
+/// Stores the owner's answer and holds it for the undo window; the scheduler delivers it after.
 async fn answer_question(
     State(s): State<ApiState>,
     Path(id): Path<i64>,
     Json(b): Json<AnswerBody>,
-) -> ApiResult<Json<Question>> {
+) -> ApiResult<Json<AnswerReply>> {
     require_text(&b.answer, "answer")?;
     let q = s.db.get_question(id)?.ok_or_else(|| not_found("question not found"))?;
     if q.status == QuestionStatus::Answered {
         return Err(conflict("question is already answered"));
     }
     let why = b.why.as_deref().map(str::trim).filter(|w| !w.is_empty());
-    Ok(Json(crate::scheduler::answer_question(&s.db, id, &b.answer, why, "owner")?))
+    let now = crate::thread::now_secs();
+    let held = crate::scheduler::answer_with_undo(&s.db, id, &b.answer, why, now)?;
+    let undo = Undo { event_id: held.event_id, run_at: held.run_at };
+    Ok(Json(AnswerReply { question: held.question, undo }))
+}
+
+/// Undoes a held owner answer inside its window and returns the reopened question.
+async fn cancel_approval(State(s): State<ApiState>, Path(event_id): Path<i64>) -> ApiResult<Json<Question>> {
+    let now = crate::thread::now_secs();
+    match crate::scheduler::cancel_held(&s.db, event_id, now)? {
+        Some(q) => Ok(Json(q)),
+        None => Err(conflict("too late: the answer was already delivered or cancelled")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -512,7 +590,7 @@ async fn review_task(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Js
     if !["ok", "changes"].contains(&b.verdict.as_str()) {
         return Err(bad_request("verdict must be ok or changes"));
     }
-    Ok(Json(crate::control::review(&s.db, &s.runs, id, &b.verdict, b.text.as_deref())?))
+    Ok(Json(crate::control::review(&s.db, &s.runs, &s.data_dir, id, &b.verdict, b.text.as_deref())?))
 }
 
 /// Drops a task: stops it and its team for good.
@@ -531,15 +609,66 @@ async fn retry_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult
     Ok(Json(serde_json::json!({ "resumed": ids })))
 }
 
+#[derive(Deserialize)]
+struct CheckpointBody {
+    on: bool,
+}
+
+/// Holds a subtask that has not started ("wait for me before this step"), or releases it.
+async fn checkpoint_task(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<CheckpointBody>) -> ApiResult<Json<Task>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if task.parent_id.is_none() || !matches!(task.status, TaskStatus::New | TaskStatus::Open) {
+        return Err(bad_request("only a subtask that has not started can be held"));
+    }
+    if crate::scheduler::owner_hold(&s.db, id)? == Some("takeover") {
+        return Err(conflict("this step is taken over"));
+    }
+    let kind = if b.on { "checkpoint_set" } else { "checkpoint_cleared" };
+    s.db.add_event(Some(id), "owner", kind, &serde_json::json!({}))?;
+    Ok(Json(task))
+}
+
+/// Stops a subtask's agent so the owner can do the step by hand.
+async fn take_over_task(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<crate::control::TakeOver>> {
+    Ok(Json(crate::control::take_over(&s.db, &s.runs, &s.data_dir, id)?))
+}
+
+#[derive(Deserialize)]
+struct HandBackBody {
+    note: String,
+    #[serde(default)]
+    force: bool,
+}
+
+/// Gives a taken-over step back: runs its check, then lands it or sends the note to the agent.
+async fn hand_back_task(
+    State(s): State<ApiState>,
+    Path(id): Path<i64>,
+    Json(b): Json<HandBackBody>,
+) -> ApiResult<Json<crate::scheduler::HandBack>> {
+    let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
+    if crate::scheduler::owner_hold(&s.db, id)? != Some("takeover") {
+        return Err(conflict("this step is not taken over"));
+    }
+    if !crate::scheduler::subtask_worktree(&s.data_dir, id).exists() {
+        return Err(conflict("this step has no worktree to check"));
+    }
+    Ok(Json(crate::scheduler::hand_back(&s.db, &s.data_dir, &task, &b.note, b.force).await?))
+}
+
 /// Files changed by a task: committed diff when done, else the live worktree diff.
 async fn task_changes(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Change>>> {
     let task = s.db.get_task(id)?.ok_or_else(|| not_found("task not found"))?;
-    let dir = s.data_dir.join("worktrees").join(id.to_string());
+    let top = task.parent_id.is_none();
+    let name = if top { format!("task-{id}") } else { id.to_string() };
+    let dir = s.data_dir.join("worktrees").join(name);
     if !dir.exists() {
         return Ok(Json(vec![]));
     }
     let done = task.status == TaskStatus::Done;
-    let list = tokio::task::spawn_blocking(move || worktree::changes(&dir, done))
+    let list = tokio::task::spawn_blocking(move || {
+        if top { worktree::changes_vs_base(&dir) } else { worktree::changes(&dir, done) }
+    })
         .await
         .map_err(anyhow::Error::from)??;
     Ok(Json(list))
@@ -637,11 +766,11 @@ mod tests {
     fn setup() -> (Router, Arc<Db>, UnboundedReceiver<i64>) {
         let db = Arc::new(Db::open_test());
         let (chat_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() }), db, rx)
+        (router(ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default(), owner_token: crate::owner_auth::test_token() }), db, rx)
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let mut req = Request::builder().method(method).uri(uri);
+        let mut req = Request::builder().method(method).uri(uri).header(crate::owner_auth::HEADER, "test-owner-token");
         let body = match body {
             Some(b) => {
                 req = req.header("content-type", "application/json");
@@ -674,6 +803,37 @@ mod tests {
             })
             .unwrap();
         (c.id, t.id)
+    }
+
+    async fn status_with(app: &Router, uri: &str, token: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(t) = token {
+            req = req.header(crate::owner_auth::HEADER, t);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn owner_routes_need_the_token_but_mcp_uses_run_tokens() {
+        let (app, db, _rx) = setup();
+        let app = app.merge(crate::mcp::mcp_router(db, std::env::temp_dir(), Apps::default(), Runs::default()));
+        assert_eq!(status_with(&app, "/tasks", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/tasks", Some("wrong")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/skills", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_with(&app, "/tasks", Some("test-owner-token")).await, StatusCode::OK);
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let mcp = |token: Option<&str>| {
+            let mut req = Request::post("/mcp/rui").header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream").header("host", "localhost");
+            if let Some(t) = token {
+                req = req.header(crate::run_tokens::HEADER, t);
+            }
+            req.body(Body::from(init)).unwrap()
+        };
+        assert_eq!(app.clone().oneshot(mcp(Some("test-owner-token"))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let grant = crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None);
+        let run = crate::run_tokens::global().issue(grant).unwrap();
+        assert_eq!(app.oneshot(mcp(Some(run.value()))).await.unwrap().status(), StatusCode::OK);
     }
 
     fn seed_task_for(db: &Db, client_id: i64) -> i64 {
@@ -795,8 +955,15 @@ mod tests {
         let uri = format!("/questions/{}/answer", owner_q.id);
         let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "go", "why": "scope"}))).await;
         assert_eq!((st, v["why"].as_str()), (StatusCode::OK, Some("scope")));
+        assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::WaitingAnswer);
+        assert!(db.pending_instructions(member.id).unwrap().is_empty());
+        let event_id = v["undo"]["event_id"].as_i64().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        crate::scheduler::deliver_held(&db, data.path(), event_id).unwrap();
         assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::Open);
         assert_eq!(db.pending_instructions(member.id).unwrap().len(), 1);
+        let cancel = format!("/approvals/{event_id}/cancel");
+        assert_eq!(call(&app, "POST", &cancel, None).await.0, StatusCode::CONFLICT);
         let (st, _) = call(&app, "POST", &uri, Some(json!({"answer": "again"}))).await;
         assert_eq!(st, StatusCode::CONFLICT);
         db.set_question_level(lead_q.id, "owner", &[]).unwrap();
@@ -864,7 +1031,7 @@ mod tests {
         let (chat_tx, _rx2) = tokio::sync::mpsc::unbounded_channel();
         let live = Live::default();
         live.lock().unwrap().insert(crate::live::LiveKey::Chat(cid), Default::default());
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let busy_app = router(state);
         assert_eq!(call(&busy_app, "DELETE", &format!("/chats/{cid}"), None).await.0, StatusCode::CONFLICT);
         assert!(db.get_chat(cid).unwrap().is_some());
@@ -1055,6 +1222,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_take_over_and_hand_back_guards() {
+        let (app, db, _rx) = setup();
+        let (cid, parent) = seed_task(&db);
+        let kid = seed_child(&db, cid, Some(parent));
+        let cp_uri = format!("/tasks/{kid}/checkpoint");
+        let cp = |on: bool| call(&app, "POST", &cp_uri, Some(json!({"on": on})));
+        assert_eq!(cp(true).await.0, StatusCode::OK);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), Some("checkpoint"));
+        assert_eq!(cp(false).await.0, StatusCode::OK);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), None);
+        let top = call(&app, "POST", &format!("/tasks/{parent}/checkpoint"), Some(json!({"on": true}))).await.0;
+        assert_eq!(top, StatusCode::BAD_REQUEST);
+        let hb_uri = format!("/tasks/{kid}/hand-back");
+        assert_eq!(call(&app, "POST", &hb_uri, Some(json!({"note": "x"}))).await.0, StatusCode::CONFLICT);
+        db.set_task_status(kid, TaskStatus::InProgress).unwrap();
+        let (st, v) = call(&app, "POST", &format!("/tasks/{kid}/take-over"), None).await;
+        assert_eq!((st, v["branch"].clone(), v["worktree"].clone()), (StatusCode::OK, json!(format!("rui/{kid}")), Value::Null));
+        assert_eq!(db.get_task(kid).unwrap().unwrap().status, TaskStatus::Open);
+        assert_eq!(crate::scheduler::owner_hold(&db, kid).unwrap(), Some("takeover"));
+        db.set_task_status(kid, TaskStatus::Done).unwrap();
+        assert_eq!(cp(true).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn inbox_lists_stuck_task_and_instruct_reply_has_note() {
         let (app, db, _rx) = setup();
         let (_, tid) = seed_task(&db);
@@ -1193,7 +1384,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let runs = Runs::default();
-        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: runs.clone(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default() };
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: runs.clone(), live: Live::default(), data_dir: std::env::temp_dir().join("rui-api-test-none"), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let app = router(state);
         let (_, tid) = seed_task(&db);
         let join = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(3600)));
@@ -1219,7 +1410,7 @@ mod tests {
         let db = Arc::new(Db::open_test());
         let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (_, tid) = seed_task(&db);
-        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default() };
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         (router(state), tid)
     }
 
@@ -1231,7 +1422,7 @@ mod tests {
         let st = crate::live::LiveState { text: "hi".into(), tool: Some("Bash".into()), ..Default::default() };
         live.lock().unwrap().insert(crate::live::LiveKey::Task(5), st);
         live.lock().unwrap().insert(crate::live::LiveKey::Chat(2), Default::default());
-        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default() };
+        let state = ApiState { db, chat_tx, seat: SeatCache::default(), runs: Runs::default(), live, data_dir: std::env::temp_dir(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
         let (code, v) = call(&router(state), "GET", "/live", None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["tasks"]["5"]["text"], "hi");
@@ -1287,5 +1478,91 @@ mod tests {
         assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "task not found"})));
         let (st, v) = call(&app, "GET", &format!("/tasks/{tid}/results"), None).await;
         assert_eq!((st, v), (StatusCode::OK, json!([])));
+    }
+
+    #[tokio::test]
+    async fn threads_list_puts_needs_you_first() {
+        let (app, db, _rx) = setup();
+        let (client, first) = seed_task(&db);
+        let second = seed_task_for(&db, client);
+        db.create_ladder_question(second, Role::Lead, "owner", &[], "Pick one").unwrap();
+        let (code, v) = call(&app, "GET", "/threads", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let ids: Vec<i64> = v.as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![second, first]);
+        assert_eq!(v[0]["state"], "needs_you");
+        assert_eq!(v[0]["needs_you_count"], 1);
+        let (_, only) = call(&app, "GET", "/threads?state=planned", None).await;
+        assert_eq!(only.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_get_404s_for_a_subtask_id() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        let (code, v) = call(&app, "GET", &format!("/threads/{top}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["id"], top);
+        let (code, _) = call(&app, "GET", &format!("/threads/{sub}"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn thread_node_inspector_pages_events() {
+        let (app, db, _rx) = setup();
+        let (client, top) = seed_task(&db);
+        let sub = seed_child(&db, client, Some(top));
+        for _ in 0..250 {
+            db.add_event(Some(sub), "builder", "tool_call", &json!({"tool": "x"})).unwrap();
+        }
+        let uri = format!("/threads/{top}/nodes/task:{sub}");
+        let (code, page) = call(&app, "GET", &uri, None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(page["events"].as_array().unwrap().len(), 200);
+        let next = page["next_after_id"].as_i64().unwrap();
+        let (_, rest) = call(&app, "GET", &format!("{uri}?after_id={next}"), None).await;
+        assert_eq!(rest["events"].as_array().unwrap().len(), 50);
+        assert!(rest["next_after_id"].is_null());
+        let (code, _) = call(&app, "GET", &format!("/threads/{top}/nodes/task:9999"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owner_answer_is_logged_for_the_account_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let (_, tid) = seed_task(&db);
+        crate::client_state::ensure(dir.path(), "acme", "/repo", None).unwrap();
+        let q = db.create_question(tid, Role::Lead, "why?").unwrap();
+        let uri = format!("/questions/{}/answer", q.id);
+        let (st, v) = call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await;
+        assert_eq!(st, StatusCode::OK);
+        let log_path = dir.path().join("clients/acme/decisions.log");
+        assert!(std::fs::read_to_string(&log_path).unwrap_or_default().is_empty());
+        crate::scheduler::deliver_held(&db, dir.path(), v["undo"]["event_id"].as_i64().unwrap()).unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains(&format!("Owner answered Q{} (task {tid}): because", q.id)), "{log}");
+    }
+
+    #[tokio::test]
+    async fn owner_answer_can_be_undone_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let (_, tid) = seed_task(&db);
+        let q = db.create_question(tid, Role::Lead, "why?").unwrap();
+        let uri = format!("/questions/{}/answer", q.id);
+        let (_, v) = call(&app, "POST", &uri, Some(json!({"answer": "because"}))).await;
+        assert_eq!(v["status"], "answered");
+        let cancel = format!("/approvals/{}/cancel", v["undo"]["event_id"]);
+        let (st, back) = call(&app, "POST", &cancel, None).await;
+        assert_eq!((st, back["status"].as_str(), back["answer"].is_null()), (StatusCode::OK, Some("open"), true));
+        assert_eq!(call(&app, "POST", &cancel, None).await.0, StatusCode::CONFLICT);
     }
 }

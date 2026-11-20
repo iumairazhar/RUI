@@ -5,10 +5,22 @@
 /// Placeholders filled in `builder.md`.
 pub const BUILDER_VARS: [&str; 6] = ["role", "title", "job", "done_command", "progress_file", "playbook"];
 /// Placeholders filled in `decide.md`.
-pub const DECIDE_VARS: [&str; 8] =
-    ["question", "member_role", "subtask_title", "lead_why", "brief", "client_playbook", "global_playbook", "prior_rulings"];
+pub const DECIDE_VARS: [&str; 9] = [
+    "question", "member_role", "subtask_title", "lead_why", "brief", "owner_knowledge", "client_playbook", "global_playbook",
+    "prior_rulings",
+];
 /// Placeholders filled in `rui.md`.
 pub const RUI_VARS: [&str; 1] = ["role_catalog"];
+
+/// Placeholders filled in `account_lead.md`.
+pub const ACCOUNT_LEAD_VARS: [&str; 6] =
+    ["client", "event", "client_log", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
+
+/// Placeholders filled in `scout.md`.
+pub const SCOUT_VARS: [&str; 7] = ["question", "asked_by", "tools", "brief", "last_check", "events_tail", "context"];
+
+/// Placeholders filled in `coach.md`.
+pub const COACH_VARS: [&str; 6] = ["title", "brief", "lessons", "client_playbook", "global_playbook", "library"];
 
 /// What a placeholder gets when there is nothing to say yet.
 pub const NONE_YET: &str = "(none yet)";
@@ -62,7 +74,9 @@ mod tests {
             (include_str!("../prompts/builder.md"), all(&BUILDER_VARS)),
             (include_str!("../prompts/decide.md"), all(&DECIDE_VARS)),
             (include_str!("../prompts/rui.md"), all(&RUI_VARS)),
-            (include_str!("../prompts/lead.md"), vec![]),
+            (include_str!("../prompts/account_lead.md"), all(&ACCOUNT_LEAD_VARS)),
+            (include_str!("../prompts/scout.md"), all(&SCOUT_VARS)),
+            (include_str!("../prompts/coach.md"), all(&COACH_VARS)),
         ];
         for (template, vars) in cases {
             assert_eq!(unfilled(&fill(template, &vars)), Vec::<String>::new());

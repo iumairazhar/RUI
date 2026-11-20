@@ -1,5 +1,9 @@
-//! Runs the apps a project declares in `.rui/apps.json`, each on its own port.
+//! Runs the apps a project declares in `.rui/apps.json`, each on its own port, inside srt.
+//! The app may write only in its project, bind a local port and reach the allowed hosts.
+//! With local binding on, srt opens loopback to every port, the daemon's included; the
+//! daemon's routes still need the owner token or a run token, and both stay hidden.
 
+use crate::sandbox::Sandbox;
 use anyhow::{Context, Result};
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,8 @@ pub struct AppInfo {
 pub struct AppEntry {
     pub info: AppInfo,
     child: Option<Child>,
+    /// The app's srt settings and temp folder, removed when the app stops.
+    run: Option<crate::srt::Prepared>,
 }
 
 /// All apps, keyed by (project, name).
@@ -140,6 +146,7 @@ fn stop_entry(e: &mut AppEntry) {
     if let Some(child) = e.child.take() {
         terminate(child);
     }
+    e.run = None;
     e.info.status = "stopped".into();
 }
 
@@ -171,12 +178,13 @@ fn pump_log<R: AsyncRead + Unpin + Send + 'static>(apps: Apps, key: Key, stream:
     });
 }
 
-fn spawn_app(apps: &Apps, key: &Key, repo: &Path, spec: &AppSpec, port: u16, env: &[(String, String)]) -> Result<()> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(expand_command(&spec.command, port));
-    cmd.current_dir(repo.join(&spec.dir)).envs(env.iter().cloned());
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.kill_on_drop(true).process_group(0);
+fn spawn_app(apps: &Apps, key: &Key, sb: &Sandbox, repo: &Path, spec: &AppSpec, port: u16, env: &[(String, String)]) -> Result<()> {
+    let run = crate::srt::prepare(crate::srt::bin_for(sb), sb, repo, true)?;
+    let mut std_cmd = run.command(&expand_command(&spec.command, port), &repo.join(&spec.dir));
+    std_cmd.envs(env.iter().cloned());
+    std_cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = Command::from(std_cmd);
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning app")?;
     if let Some(out) = child.stdout.take() {
         pump_log(apps.clone(), key.clone(), out);
@@ -184,7 +192,10 @@ fn spawn_app(apps: &Apps, key: &Key, repo: &Path, spec: &AppSpec, port: u16, env
     if let Some(err) = child.stderr.take() {
         pump_log(apps.clone(), key.clone(), err);
     }
-    with_entry(apps, key, |e| e.child = Some(child));
+    with_entry(apps, key, |e| {
+        e.child = Some(child);
+        e.run = Some(run);
+    });
     Ok(())
 }
 
@@ -231,10 +242,10 @@ fn new_entry(project: &str, spec: &AppSpec, port: u16) -> AppEntry {
         status: "starting".into(),
         log: Vec::new(),
     };
-    AppEntry { info, child: None }
+    AppEntry { info, child: None, run: None }
 }
 
-async fn start_one(apps: &Apps, project: &str, repo: &Path, spec: &AppSpec, earlier: &[(String, String)]) {
+async fn start_one(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path, spec: &AppSpec, earlier: &[(String, String)]) {
     let key: Key = (project.to_string(), spec.name.clone());
     let Some(port) = free_port(PORTS, &taken_ports(apps)) else {
         let mut e = new_entry(project, spec, 0);
@@ -250,7 +261,7 @@ async fn start_one(apps: &Apps, project: &str, repo: &Path, spec: &AppSpec, earl
         m.insert(key.clone(), new_entry(project, spec, port));
     }
     let env = env_for(spec, port, earlier);
-    if let Err(e) = spawn_app(apps, &key, repo, spec, port, &env) {
+    if let Err(e) = spawn_app(apps, &key, sb, repo, spec, port, &env) {
         return set_status(apps, &key, "failed", Some(&format!("{e:#}")));
     }
     match wait_healthy(apps, &key, port).await {
@@ -262,7 +273,7 @@ async fn start_one(apps: &Apps, project: &str, repo: &Path, spec: &AppSpec, earl
 }
 
 /// Starts every app of a project in order, waiting for each to answer HTTP.
-pub async fn start_project(apps: &Apps, project: &str, repo: &Path) -> Vec<AppInfo> {
+pub async fn start_project(apps: &Apps, sb: &Sandbox, project: &str, repo: &Path) -> Vec<AppInfo> {
     stop_project(apps, project);
     let specs = match read_specs(repo) {
         Ok(s) => s,
@@ -273,7 +284,7 @@ pub async fn start_project(apps: &Apps, project: &str, repo: &Path) -> Vec<AppIn
     };
     let mut earlier: Vec<(String, String)> = Vec::new();
     for spec in &specs {
-        start_one(apps, project, repo, spec, &earlier).await;
+        start_one(apps, sb, project, repo, spec, &earlier).await;
         let key = (project.to_string(), spec.name.clone());
         if let Some(url) = with_entry(apps, &key, |e| e.info.url.clone()) {
             earlier.push((spec.name.clone(), url));
@@ -343,7 +354,8 @@ mod tests {
         let json = r#"[{"name":"site","dir":".","command":"python3 -m http.server $PORT"}]"#;
         std::fs::write(dir.path().join(".rui/apps.json"), json).unwrap();
         let apps = Apps::default();
-        let infos = start_project(&apps, "demo", dir.path()).await;
+        let sb = crate::srt::tests::sandbox(dir.path(), dir.path());
+        let infos = start_project(&apps, &sb, "demo", dir.path()).await;
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].status, "running", "log: {:?}", infos[0].log);
         assert!(http_ok(infos[0].port).await);

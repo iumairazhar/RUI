@@ -21,8 +21,10 @@ use theme::{Theme, theme};
 use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
-    activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, clients,
+    activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, client_knowledge::ClientDrawer, clients,
+    inbox::{InboxPanel, PanelEvent},
     library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
+    spend::{Mode as SpendMode, SpendView},
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -144,7 +146,14 @@ struct Root {
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
     seats: Entity<SeatView>,
+    spend: Entity<SpendView>,
+    analytics: Entity<SpendView>,
     results: Entity<ResultsView>,
+    /// Drawer of the client opened from the Clients page.
+    client_drawer: Entity<ClientDrawer>,
+    /// The Inbox slide-over, shown over the current page while `inbox_open`.
+    inbox: Entity<InboxPanel>,
+    inbox_open: bool,
 }
 
 impl Root {
@@ -165,8 +174,12 @@ impl Root {
                 store.update(cx, |s, _| s.tabs.insert(Sec::Work.key(), 0));
                 this.select(Nav::Work, cx);
             }
+            if store.update(cx, |s, _| std::mem::take(&mut s.open_seats)) {
+                this.go_to_seats(cx);
+            }
             if let Some(id) = store.update(cx, |s, _| s.open_task.take()) {
-                this.activity.update(cx, |v, cx| v.open_thread(id, cx));
+                let changes = store.update(cx, |s, _| std::mem::take(&mut s.open_changes));
+                this.activity.update(cx, |v, cx| if changes { v.show_changes(id, cx) } else { v.open_thread(id, cx) });
             }
             if let Some(req) = store.update(cx, |s, _| s.result_request.take()) {
                 this.results.update(cx, |v, cx| v.open(req, cx));
@@ -174,7 +187,11 @@ impl Root {
             cx.notify();
         })
         .detach();
+        let inbox = cx.new(|cx| InboxPanel::new(store.clone(), cx));
+        cx.subscribe(&inbox, |this, _, ev: &PanelEvent, cx| this.panel_event(ev, cx)).detach();
         Self {
+            inbox,
+            inbox_open: false,
             nav: Nav::from_env(),
             pill_from: Nav::from_env(),
             pill_seq: 0,
@@ -185,7 +202,10 @@ impl Root {
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
+            spend: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Spend, cx)),
+            analytics: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Analytics, cx)),
             results: cx.new(|cx| ResultsView::new(store.clone(), cx)),
+            client_drawer: cx.new(|cx| ClientDrawer::new(store.clone(), cx)),
             store,
         }
     }
@@ -201,7 +221,7 @@ impl Root {
                 _ => self.apps.clone().into_any_element(),
             },
             Nav::Clients => match tab(Sec::Clients) {
-                0 => clients::page(self.add_client_button(cx), cx),
+                0 => clients::page(self.add_client_button(cx), &self.client_drawer, cx),
                 _ => self.agents.clone().into_any_element(),
             },
             Nav::Knowledge => match tab(Sec::Knowledge) {
@@ -209,10 +229,10 @@ impl Root {
                 _ => playbook::page(cx),
             },
             Nav::Cost => match tab(Sec::Cost) {
-                0 => empty_page(Sec::Cost, "Cost tracking comes later.", cx),
+                0 => self.spend.clone().into_any_element(),
                 _ => self.seats.clone().into_any_element(),
             },
-            Nav::Analytics => empty_page(Sec::Analytics, "Analytics comes later.", cx),
+            Nav::Analytics => self.analytics.clone().into_any_element(),
             Nav::Settings => empty_page(Sec::Settings, "Settings come later.", cx),
         }
     }
@@ -283,9 +303,41 @@ impl Root {
             .children(error.map(|e| e.text_size(px(12.))))
     }
 
+    /// Inbox items that are not snoozed.
     fn open_questions(&self, cx: &Context<Self>) -> usize {
         let s = self.store.read(cx);
-        s.inbox.len()
+        views::inbox::awake_count(&s.inbox, &s.snoozed, store::now_secs())
+    }
+
+    /// The rail's Inbox item opens the slide-over over the current page, or closes it.
+    fn toggle_inbox(&mut self, cx: &mut Context<Self>) {
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
+            return;
+        }
+        self.inbox_open = true;
+        self.inbox.update(cx, |p, cx| p.opened(cx));
+        cx.notify();
+    }
+
+    /// Switch to Cost → Seats, closing the Inbox slide-over if it is open.
+    fn go_to_seats(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, _| s.tabs.insert(Sec::Cost.key(), 1));
+        if self.inbox_open {
+            self.inbox.update(cx, |p, cx| p.close(cx));
+        }
+        self.select(Nav::Cost, cx);
+    }
+
+    fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {
+        self.inbox_open = false;
+        if let PanelEvent::OpenFull(item) = ev {
+            self.select(Nav::Inbox, cx);
+            if let Some((kind, id)) = item.clone() {
+                self.questions.update(cx, |q, cx| q.open_kind(&kind, id, cx));
+            }
+        }
+        cx.notify();
     }
 
     fn badge(&self, th: &Theme, count: usize) -> impl IntoElement + use<> {
@@ -333,7 +385,10 @@ impl Root {
             .justify_center()
             .cursor_pointer()
             .child(icon)
-            .on_click(cx.listener(move |this, _, _, cx| this.select(nav, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| match nav {
+                Nav::Inbox => this.toggle_inbox(cx),
+                _ => this.select(nav, cx),
+            }))
             .tooltip(move |_, cx| cx.new(|_| Tooltip(label.into())).into());
         let item = if active { item } else { item.hover(move |s| s.bg(hairline)) };
         let count = if nav == Nav::Inbox { self.open_questions(cx) } else { 0 };
@@ -348,6 +403,12 @@ impl Root {
         self.pill_seq += 1;
         if nav == Nav::Knowledge {
             self.store.update(cx, |s, cx| s.refresh_skills(cx));
+        }
+        if nav == Nav::Cost {
+            self.spend.update(cx, |v, cx| v.load(cx));
+        }
+        if nav == Nav::Analytics {
+            self.analytics.update(cx, |v, cx| v.load(cx));
         }
         if nav == Nav::Work {
             self.activity.update(cx, |v, _| v.reset_motion());
@@ -432,6 +493,7 @@ impl Render for Root {
             .child(self.rail(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
             .children(self.results.read(cx).is_open().then(|| self.results.clone()))
+            .children(self.inbox_open.then(|| self.inbox.clone()))
     }
 }
 

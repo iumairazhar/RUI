@@ -3,12 +3,15 @@
 use crate::apps::{self, AppInfo, Apps};
 use crate::results::ResultFile;
 use crate::db::Db;
+use crate::client_state;
 use crate::prompts;
+use crate::protected;
 use crate::live::{Live, LiveGuard, LiveKey, on_line};
-use crate::runner::{AgentRun, ParsedLine, RunOutcome, run_agent};
+use crate::runner::{AgentRun, Cli, ParsedLine, RunOutcome, run_agent_with};
 use crate::roster;
+use crate::seats;
 use crate::skills::{self, Skill};
-use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, diff_vs_main, land, run_done_command};
+use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, ensure_task_worktree, merge_into, run_done_command};
 use anyhow::{Context, Result};
 use rui_core::{ChatRole, Client, Question, QuestionStatus, Role, Rung, SourceKind, Task, TaskStatus};
 use serde_json::{Value, json};
@@ -17,11 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const LEAD_PROMPT: &str = include_str!("../prompts/lead.md");
+const ACCOUNT_LEAD_PROMPT: &str = include_str!("../prompts/account_lead.md");
 const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
-mcp__rui__set_limit,mcp__rui__set_done_command";
+mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
+mcp__rui__ask_scout";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -40,8 +44,16 @@ pub enum Action {
     StartLead { task_id: i64, answers: Vec<(String, String)> },
     StartBuilder { task_id: i64 },
     Rollup { task_id: i64, status: TaskStatus },
+    /// All subtasks are done: wake the Account Lead to review the work.
+    Review { task_id: i64 },
     /// Run a Lead or Rui decision turn for an open question at `level`.
     Decide { question_id: i64, level: String },
+    /// The owner's undo window ran out: deliver the held answer.
+    DeliverAnswer { question_id: i64, event_id: i64 },
+    /// Run the Scout once for an unanswered `scout_requested` event.
+    Scout { task_id: i64, request_event_id: i64 },
+    /// Run the Coach once over a finished top-level task.
+    Coach { task_id: i64 },
 }
 
 // ---- pure decision layer ----
@@ -49,16 +61,35 @@ pub enum Action {
 /// Looks at the database and returns what should happen now, skipping running tasks.
 /// Decision turns are tracked in `running` under the key `-question_id`.
 pub fn plan_tick(db: &Db, running: &HashSet<i64>) -> Result<Vec<Action>> {
+    plan_tick_at(db, running, crate::thread::now_secs())
+}
+
+/// `plan_tick` with the clock passed in, so tests can move time.
+pub fn plan_tick_at(db: &Db, running: &HashSet<i64>, now: i64) -> Result<Vec<Action>> {
     let tasks = db.list_tasks()?;
     let by_id: HashMap<i64, &Task> = tasks.iter().map(|t| (t.id, t)).collect();
+    let pending = pending_approvals(db)?;
+    let held: HashSet<i64> = pending.iter().map(approval_question).collect();
     let mut actions = Vec::new();
     for t in tasks.iter().filter(|t| !running.contains(&t.id)) {
-        if let Some(a) = plan_task(db, t, &by_id)? {
+        if let Some(a) = plan_task(db, t, &by_id, &held)? {
             actions.push(a);
         }
     }
     actions.extend(plan_decisions(db, running, &by_id)?);
+    actions.extend(plan_deliveries(&pending, now));
+    actions.extend(crate::scout::plan(db, running)?);
+    actions.extend(crate::coach::plan(db, running)?);
     Ok(actions)
+}
+
+/// One delivery per held answer whose undo window has run out.
+fn plan_deliveries(pending: &[rui_core::Event], now: i64) -> Vec<Action> {
+    pending
+        .iter()
+        .filter(|e| approval_run_at(e) <= now)
+        .map(|e| Action::DeliverAnswer { question_id: approval_question(e), event_id: e.id })
+        .collect()
 }
 
 /// One decision turn per open lead or rui question whose member is still waiting.
@@ -72,19 +103,20 @@ fn plan_decisions(db: &Db, running: &HashSet<i64>, by_id: &HashMap<i64, &Task>) 
         .collect())
 }
 
-fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>) -> Result<Option<Action>> {
+fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>, held: &HashSet<i64>) -> Result<Option<Action>> {
     match (t.parent_id, t.status) {
         (None, TaskStatus::New) => Ok(Some(Action::StartLead { task_id: t.id, answers: vec![] })),
-        (None, TaskStatus::WaitingAnswer) => plan_answered(db, t),
-        (Some(p), TaskStatus::Open) => Ok(builder_ready(t, by_id.get(&p).copied(), by_id)),
+        (None, TaskStatus::WaitingAnswer) => plan_answered(db, t, held),
+        (Some(p), TaskStatus::Open) => plan_builder(db, t, by_id.get(&p).copied(), by_id),
         (_, TaskStatus::Split) => plan_rollup(db, t),
         _ => Ok(None),
     }
 }
 
-fn plan_answered(db: &Db, t: &Task) -> Result<Option<Action>> {
+/// Wakes the Lead once every question is answered. An answer still in its undo window (`held`) does not count.
+fn plan_answered(db: &Db, t: &Task, held: &HashSet<i64>) -> Result<Option<Action>> {
     let qs = db.questions_for_task(t.id)?;
-    if qs.is_empty() || qs.iter().any(|q| q.status != QuestionStatus::Answered) {
+    if qs.is_empty() || qs.iter().any(|q| q.status != QuestionStatus::Answered || held.contains(&q.id)) {
         return Ok(None);
     }
     let answers = qs
@@ -92,6 +124,32 @@ fn plan_answered(db: &Db, t: &Task) -> Result<Option<Action>> {
         .filter_map(|q| q.answer.map(|a| (q.text, a)))
         .collect();
     Ok(Some(Action::StartLead { task_id: t.id, answers }))
+}
+
+/// Starts a ready subtask unless the owner holds it (a checkpoint or a takeover).
+fn plan_builder(db: &Db, t: &Task, parent: Option<&Task>, by_id: &HashMap<i64, &Task>) -> Result<Option<Action>> {
+    if owner_hold(db, t.id)?.is_some() {
+        return Ok(None);
+    }
+    Ok(builder_ready(t, parent, by_id))
+}
+
+/// Event kinds that set or clear an owner hold on a subtask.
+pub const HOLD_KINDS: [&str; 4] = ["checkpoint_set", "checkpoint_cleared", "taken_over", "handed_back"];
+
+/// The hold the newest hold event puts on a task: "checkpoint", "takeover" or none.
+pub fn hold_of<'a>(events: impl IntoIterator<Item = &'a rui_core::Event>) -> Option<&'static str> {
+    let last = events.into_iter().filter(|e| HOLD_KINDS.contains(&e.kind.as_str())).max_by_key(|e| e.id)?;
+    match last.kind.as_str() {
+        "checkpoint_set" => Some("checkpoint"),
+        "taken_over" => Some("takeover"),
+        _ => None,
+    }
+}
+
+/// Whether the owner holds a subtask: Some("checkpoint") or Some("takeover").
+pub fn owner_hold(db: &Db, task_id: i64) -> Result<Option<&'static str>> {
+    Ok(hold_of(&db.events_for_tasks(&[task_id], &HOLD_KINDS, 0, i64::MAX)?))
 }
 
 fn builder_ready(t: &Task, parent: Option<&Task>, by_id: &HashMap<i64, &Task>) -> Option<Action> {
@@ -112,12 +170,34 @@ fn plan_rollup(db: &Db, t: &Task) -> Result<Option<Action>> {
     }
     let rollup = |status| Some(Action::Rollup { task_id: t.id, status });
     if subs.iter().all(|s| s.status == TaskStatus::Done) {
-        return Ok(rollup(TaskStatus::Done));
+        if forwarded_since_done(db, t.id, &subs)? {
+            return Ok(rollup(TaskStatus::Done));
+        }
+        return Ok(Some(Action::Review { task_id: t.id }));
     }
     if subs.iter().any(|s| s.status == TaskStatus::Stuck) {
         return Ok(rollup(TaskStatus::Stuck));
     }
     Ok(None)
+}
+
+/// True when the Account Lead forwarded the task after the last subtask finished, and after
+/// any PR feedback was routed to it (so a Lead handling feedback is not closed early).
+fn forwarded_since_done(db: &Db, task_id: i64, subs: &[Task]) -> Result<bool> {
+    let Some(ev) = latest_event(db, task_id, "forwarded")? else { return Ok(false) };
+    if latest_event(db, task_id, "pr_feedback_routed")?.is_some_and(|r| r.id > ev.id) {
+        return Ok(false);
+    }
+    Ok(subs.iter().all(|s| ev.created_at.as_str() >= s.updated_at.as_str()))
+}
+
+fn latest_event(db: &Db, task_id: i64, kind: &str) -> Result<Option<rui_core::Event>> {
+    Ok(db.list_events(Some(task_id), 100_000)?.into_iter().rev().find(|e| e.kind == kind))
+}
+
+/// Payload of the task's latest `forwarded` event: the Account Lead's remarks and PR url.
+pub fn latest_forwarded(db: &Db, task_id: i64) -> Result<Option<Value>> {
+    Ok(latest_event(db, task_id, "forwarded")?.map(|e| e.payload))
 }
 
 /// After a lead turn: a lead that neither asked nor split gets the task marked stuck.
@@ -156,7 +236,7 @@ pub fn after_done_check(db: &Db, data_dir: &Path, task_id: i64, check: &DoneChec
 }
 
 /// Counts a failed attempt. Open to try again; at the loop limit the member waits on a Lead question.
-fn count_failed_loop(db: &Db, data_dir: &Path, task: &Task, reason: &str) -> Result<TaskStatus> {
+pub(crate) fn count_failed_loop(db: &Db, data_dir: &Path, task: &Task, reason: &str) -> Result<TaskStatus> {
     let used = db.increment_loops(task.id)?;
     if used < task.max_loops {
         return Ok(TaskStatus::Open);
@@ -201,6 +281,86 @@ pub fn answer_question(db: &Db, id: i64, answer: &str, why: Option<&str>, by: &s
     Ok(q)
 }
 
+/// Seconds the owner has to undo an answer before it takes effect.
+pub const UNDO_SECS: i64 = 10;
+
+const APPROVAL_KINDS: [&str; 3] = ["approval_pending", "approval_cancelled", "approval_delivered"];
+
+/// A held owner answer: the question, the `approval_pending` event id and when it goes out.
+pub struct HeldAnswer {
+    pub question: Question,
+    pub event_id: i64,
+    pub run_at: i64,
+}
+
+/// Stores the owner's answer but holds delivery for `UNDO_SECS`, logging `approval_pending`.
+pub fn answer_with_undo(db: &Db, id: i64, answer: &str, why: Option<&str>, now: i64) -> Result<HeldAnswer> {
+    let q = db.get_question(id)?.context("question not found")?;
+    if q.status == QuestionStatus::Answered {
+        anyhow::bail!("question {id} is already answered");
+    }
+    let question = db.answer_question(id, answer, why)?.context("question not found")?;
+    let run_at = now + UNDO_SECS;
+    let payload = json!({"question_id": id, "run_at": run_at});
+    let event_id = db.add_event(Some(question.task_id), "owner", "approval_pending", &payload)?;
+    Ok(HeldAnswer { question, event_id, run_at })
+}
+
+/// `approval_pending` events not yet cancelled or delivered, oldest first.
+pub fn pending_approvals(db: &Db) -> Result<Vec<rui_core::Event>> {
+    let evs = db.events_of_kinds(&APPROVAL_KINDS)?;
+    let closed: HashSet<i64> =
+        evs.iter().filter(|e| e.kind != "approval_pending").filter_map(|e| e.payload["event_id"].as_i64()).collect();
+    Ok(evs.into_iter().filter(|e| e.kind == "approval_pending" && !closed.contains(&e.id)).collect())
+}
+
+pub fn approval_run_at(e: &rui_core::Event) -> i64 {
+    e.payload["run_at"].as_i64().unwrap_or(0)
+}
+
+pub fn approval_question(e: &rui_core::Event) -> i64 {
+    e.payload["question_id"].as_i64().unwrap_or(0)
+}
+
+/// Held while an undo or a delivery checks and closes a pending answer, so the two never both win.
+static APPROVAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn approval_lock() -> std::sync::MutexGuard<'static, ()> {
+    APPROVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Delivers a held owner answer, marks it `approval_delivered`, then writes the decisions log.
+/// Does nothing if the event is no longer pending (cancelled or delivered), checked under the lock.
+pub fn deliver_held(db: &Db, data_dir: &Path, event_id: i64) -> Result<()> {
+    let _lock = approval_lock();
+    let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(()) };
+    let q = db.get_question(approval_question(&e))?.context("question not found")?;
+    deliver_answer(db, &q, "owner")?;
+    db.add_event(e.task_id, "scheduler", "approval_delivered", &json!({"event_id": event_id}))?;
+    log_owner_answer(db, data_dir, &q)
+}
+
+/// Undoes a held answer while its window is open: logs `approval_cancelled` and reopens the question.
+/// None when the event is not pending any more (delivered, checked under the lock) or its window has run out.
+pub fn cancel_held(db: &Db, event_id: i64, now: i64) -> Result<Option<Question>> {
+    let _lock = approval_lock();
+    let Some(e) = pending_approvals(db)?.into_iter().find(|e| e.id == event_id) else { return Ok(None) };
+    if now >= approval_run_at(&e) {
+        return Ok(None);
+    }
+    db.add_event(e.task_id, "owner", "approval_cancelled", &json!({"event_id": event_id}))?;
+    db.reopen_question(approval_question(&e))
+}
+
+/// Writes the owner's answer to the client's decisions log, where the Account Lead reads it.
+pub fn log_owner_answer(db: &Db, data_dir: &Path, q: &Question) -> Result<()> {
+    let Some(task) = db.get_task(q.task_id)? else { return Ok(()) };
+    let Some(client) = db.get_client(task.client_id)? else { return Ok(()) };
+    let answer: String = q.answer.as_deref().unwrap_or_default().chars().take(300).collect();
+    let line = format!("Owner answered Q{} (task {}): {answer}", q.id, task.id);
+    client_state::append_decision(data_dir, &client.name, &line)
+}
+
 fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     let Some(task) = db.get_task(q.task_id)? else { return Ok(()) };
     if task.parent_id.is_none() {
@@ -212,10 +372,17 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
         text.push_str(&format!("\nWhy: {why}"));
     }
     db.add_event(Some(task.id), by, "instruction", &json!({"text": text}))?;
-    if task.status == TaskStatus::WaitingAnswer {
-        db.set_task_status(task.id, TaskStatus::Open)?;
+    if task.status != TaskStatus::WaitingAnswer {
+        return Ok(());
     }
-    Ok(())
+    // The Lead may have raised the limit before answering, so read the task again.
+    let fresh = db.get_task(task.id)?.unwrap_or(task);
+    if fresh.loops_used < fresh.max_loops {
+        return db.set_task_status(fresh.id, TaskStatus::Open);
+    }
+    let payload = json!({"loops_used": fresh.loops_used, "max_loops": fresh.max_loops, "by": by});
+    db.add_event(Some(fresh.id), by, "loop_limit", &payload)?;
+    db.set_task_status(fresh.id, TaskStatus::Stuck)
 }
 
 /// The owner's reply to a "stopped" question on a top-level task: cancel leaves it stuck,
@@ -245,7 +412,12 @@ pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
         return Ok(vec![]);
     }
     let mut ids = vec![id];
+    let mut raised = vec![];
     for sub in db.subtasks(id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
+        if sub.loops_used >= sub.max_loops {
+            db.set_max_loops(sub.id, sub.loops_used + 3)?;
+            raised.push(sub.id);
+        }
         db.set_task_status(sub.id, TaskStatus::Open)?;
         ids.push(sub.id);
     }
@@ -256,12 +428,17 @@ pub fn retry_stuck(db: &Db, id: i64, by: &str) -> Result<Vec<i64>> {
         (_, false) => TaskStatus::New,
     };
     db.set_task_status(id, next)?;
-    db.add_event(Some(id), by, "resumed", &json!({"ids": ids, "by": by}))?;
+    db.add_event(Some(id), by, "resumed", &json!({"ids": ids, "by": by, "raised_limit": raised}))?;
     Ok(ids)
 }
 
 /// Passes an open question up one level: lead to rui, rui to owner.
 pub fn escalate_question(db: &Db, id: i64, who: &str, why: &str) -> Result<Question> {
+    escalate_question_with(db, id, who, why, &json!({}))
+}
+
+/// Like `escalate_question`, merging the keys of `extra` (an object) into the `escalated` event.
+pub fn escalate_question_with(db: &Db, id: i64, who: &str, why: &str, extra: &serde_json::Value) -> Result<Question> {
     let q = db.get_question(id)?.context("question not found")?;
     if q.status == QuestionStatus::Answered {
         anyhow::bail!("question {id} is already answered");
@@ -274,7 +451,10 @@ pub fn escalate_question(db: &Db, id: i64, who: &str, why: &str) -> Result<Quest
     let mut ladder = q.ladder.clone();
     ladder.push(Rung { who: who.into(), why: why.into() });
     db.set_question_level(id, next, &ladder)?;
-    let payload = json!({"question_id": id, "from": q.level, "to": next, "why": why});
+    let mut payload = json!({"question_id": id, "from": q.level, "to": next, "why": why});
+    if let (Some(p), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+        p.extend(e.clone());
+    }
     db.add_event(Some(q.task_id), "scheduler", "escalated", &payload)?;
     db.get_question(id)?.context("question not found")
 }
@@ -295,16 +475,30 @@ pub fn settle_decision(db: &Db, id: i64, level: &str) -> Result<()> {
 /// Abort handles of the turns currently running, keyed by task id (decision turns: `-question_id`).
 pub type Runs = Arc<Mutex<HashMap<i64, tokio::task::AbortHandle>>>;
 
+/// One lock per client, so only one Account Lead wake runs at a time for it.
+pub type ClientLocks = Arc<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// The client's wake lock, created on first use.
+pub fn client_lock(locks: &ClientLocks, client_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(client_id).or_default().clone()
+}
+
 /// Runs forever: every tick, plan and execute. Never exits on error.
-pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, live: Live, apps: Apps) {
+pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, locks: ClientLocks, live: Live, apps: Apps) {
+    let mut last_beat = std::time::Instant::now();
     loop {
         tokio::time::sleep(cfg.tick).await;
         let snapshot: HashSet<i64> =
             running.lock().map(|r| r.keys().copied().collect()).unwrap_or_default();
-        match plan_tick(&db, &snapshot) {
+        if last_beat.elapsed() >= Duration::from_secs(crate::heartbeat::HEARTBEAT_SECS) {
+            last_beat = std::time::Instant::now();
+            beat(&db, &cfg, &running, &snapshot);
+        }
+        match plan_gated(&db, &cfg.data_dir, &snapshot, crate::thread::now_secs()) {
             Ok(actions) => {
                 for a in actions {
-                    execute(&db, &cfg, &running, &live, &apps, a);
+                    execute(&db, &cfg, &running, &locks, &live, &apps, a);
                 }
             }
             Err(e) => report_error(&db, None, &e),
@@ -312,12 +506,51 @@ pub async fn run(db: Arc<Db>, cfg: Config, running: Runs, live: Live, apps: Apps
     }
 }
 
-fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
+/// `plan_tick_at`, then the seat gate: while every seat is used up, no new turn starts.
+pub fn plan_gated(db: &Db, data_dir: &Path, running: &HashSet<i64>, now: i64) -> Result<Vec<Action>> {
+    let actions = plan_tick_at(db, running, now)?;
+    let free = seats::check_gate(db, data_dir, now)?;
+    Ok(hold_turns(actions, free))
+}
+
+/// Drops every action that would start an agent turn unless a seat is free. Running turns are not touched.
+pub fn hold_turns(actions: Vec<Action>, seat_free: bool) -> Vec<Action> {
+    if seat_free {
+        return actions;
+    }
+    let keep = |a: &Action| matches!(a, Action::Rollup { .. } | Action::DeliverAnswer { .. });
+    actions.into_iter().filter(keep).collect()
+}
+
+/// Runs the heartbeat once; errors are logged. PR polling runs on a blocking thread.
+fn beat(db: &Arc<Db>, cfg: &Config, running: &Runs, snapshot: &HashSet<i64>) {
+    let now = crate::thread::now_secs();
+    if let Err(e) = crate::heartbeat::heartbeat(db, &cfg.data_dir, running, snapshot, now) {
+        report_error(db, None, &e);
+    }
+    inputs_beat(db, &cfg.data_dir, now);
+    crate::pr_watch::spawn_poll(db.clone(), cfg.data_dir.clone(), running.clone());
+}
+
+/// Reads the drop folder, asks the Scout for briefs of meetings about to start and fires due
+/// schedule triggers; errors are logged.
+fn inputs_beat(db: &Db, data_dir: &Path, now: i64) {
+    let res = crate::drop::scan(db, data_dir).and_then(|_| crate::meeting::prep_due(db, data_dir, now));
+    if let Err(e) = res {
+        report_error(db, None, &e);
+    }
+    let local = chrono::Local::now().naive_local();
+    if let Err(e) = crate::triggers::fire_scheduled(db, data_dir, local) {
+        report_error(db, None, &e);
+    }
+}
+
+pub(crate) fn report_error(db: &Db, task_id: Option<i64>, e: &anyhow::Error) {
     eprintln!("scheduler error: {e:#}");
     let _ = db.add_event(task_id, "scheduler", "scheduler_error", &json!({"error": format!("{e:#}")}));
 }
 
-fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps, action: Action) {
+fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live: &Live, apps: &Apps, action: Action) {
     match action {
         Action::Rollup { task_id, status } => {
             let res = db
@@ -326,7 +559,7 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps,
             if let Err(e) = res {
                 report_error(db, Some(task_id), &e);
             } else if status == TaskStatus::Done {
-                launch_apps(db, apps, task_id);
+                launch_apps(db, &cfg.data_dir, apps, task_id);
             } else if status == TaskStatus::Stuck {
                 let reason = stuck_reason(db, task_id).ok().flatten();
                 if let Some(r) = reason {
@@ -335,21 +568,64 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, apps: &Apps,
             }
         }
         Action::StartLead { task_id, answers } => {
-            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, move |db, cfg, live| async move {
+            let lock = lock_for_task(db, locks, task_id);
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, lock, move |db, cfg, live| async move {
                 lead_turn(&db, &cfg, &live, task_id, answers).await
             });
         }
+        Action::Review { task_id } => {
+            let lock = lock_for_task(db, locks, task_id);
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::Clarifying, lock, move |db, cfg, live| async move {
+                review_turn(&db, &cfg, &live, task_id).await
+            });
+        }
         Action::StartBuilder { task_id } => {
-            spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, move |db, cfg, live| async move {
+            spawn_turn(db, cfg, running, live, task_id, TaskStatus::InProgress, None, move |db, cfg, live| async move {
                 builder_turn(&db, &cfg, &live, task_id).await
             });
         }
-        Action::Decide { question_id, level } => spawn_decision(db, cfg, running, live, question_id, level),
+        Action::Decide { question_id, level } => spawn_decision(db, cfg, running, locks, live, question_id, level),
+        Action::DeliverAnswer { event_id, .. } => {
+            if let Err(e) = deliver_held(db, &cfg.data_dir, event_id) {
+                report_error(db, None, &e);
+            }
+        }
+        Action::Scout { task_id, request_event_id } => {
+            let (db2, cfg2, live2) = (db.clone(), cfg.clone(), live.clone());
+            spawn_keyed(running, crate::scout::run_key(request_event_id), async move {
+                crate::scout::run(&db2, &cfg2, &live2, task_id, request_event_id).await
+            }, db, Some(task_id));
+        }
+        Action::Coach { task_id } => {
+            let (db2, cfg2, live2) = (db.clone(), cfg.clone(), live.clone());
+            spawn_keyed(running, crate::coach::run_key(task_id), async move {
+                crate::coach::run(&db2, &cfg2, &live2, task_id).await
+            }, db, Some(task_id));
+        }
     }
 }
 
+/// Runs one background turn under `key` in the running set; at most one per key. Errors are logged.
+fn spawn_keyed<Fut>(running: &Runs, key: i64, turn: Fut, db: &Arc<Db>, task_id: Option<i64>)
+where
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let Ok(mut map) = running.lock() else { return };
+    if map.contains_key(&key) {
+        return;
+    }
+    let (db, guard) = (db.clone(), RunGuard(running.clone(), key));
+    let handle = tokio::spawn(async move {
+        let _guard = guard;
+        if let Err(e) = turn.await {
+            report_error(&db, task_id, &e);
+        }
+    });
+    map.insert(key, handle.abort_handle());
+}
+
 /// Runs one decision turn in the background; at most one per question.
-fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: i64, level: String) {
+fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live: &Live, qid: i64, level: String) {
     let key = -qid;
     let Ok(mut map) = running.lock() else { return };
     if map.contains_key(&key) {
@@ -357,8 +633,13 @@ fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: 
     }
     let (db, cfg, live) = (db.clone(), cfg.clone(), live.clone());
     let guard = RunGuard(running.clone(), key);
+    let lock = if level == "lead" { question_client(&db, qid).map(|c| client_lock(locks, c)) } else { None };
     let handle = tokio::spawn(async move {
         let _guard = guard;
+        let _wake = match &lock {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
         if let Err(e) = decide(&db, &cfg, &live, qid, &level).await {
             report_error(&db, None, &e);
         }
@@ -369,24 +650,37 @@ fn spawn_decision(db: &Arc<Db>, cfg: &Config, running: &Runs, live: &Live, qid: 
     map.insert(key, handle.abort_handle());
 }
 
+/// The client of the task a question belongs to.
+fn question_client(db: &Db, qid: i64) -> Option<i64> {
+    let q = db.get_question(qid).ok()??;
+    Some(db.get_task(q.task_id).ok()??.client_id)
+}
+
+/// The client's wake lock for a task, if the task exists.
+fn lock_for_task(db: &Db, locks: &ClientLocks, task_id: i64) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    let task = db.get_task(task_id).ok()??;
+    Some(client_lock(locks, task.client_id))
+}
+
 /// After a top-level chat task is done, starts its project's apps and tells the chat.
-fn launch_apps(db: &Arc<Db>, apps: &Apps, task_id: i64) {
+fn launch_apps(db: &Arc<Db>, data_dir: &Path, apps: &Apps, task_id: i64) {
     let Ok(Some(task)) = db.get_task(task_id) else { return };
     if task.parent_id.is_some() || task.source_kind != SourceKind::Chat {
         return;
     }
-    let (db, apps) = (db.clone(), apps.clone());
+    let (db, apps, data_dir) = (db.clone(), apps.clone(), data_dir.to_path_buf());
     tokio::spawn(async move {
-        if let Err(e) = launch_and_report(&db, &apps, &task).await {
+        if let Err(e) = launch_and_report(&db, &data_dir, &apps, &task).await {
             report_error(&db, Some(task.id), &e);
         }
     });
 }
 
-async fn launch_and_report(db: &Db, apps: &Apps, task: &Task) -> Result<()> {
+async fn launch_and_report(db: &Db, data_dir: &Path, apps: &Apps, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
     let repo = expand_home(&client.repo_path);
-    let infos = apps::start_project(apps, &client.name, &repo).await;
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
+    let infos = apps::start_project(apps, &sb, &client.name, &repo).await;
     db.add_event(Some(task.id), "scheduler", "apps_started", &json!({"apps": infos}))?;
     post_done_notice(db, task, &client.repo_path, &infos)
 }
@@ -396,15 +690,26 @@ fn post_done_notice(db: &Db, task: &Task, repo: &str, infos: &[AppInfo]) -> Resu
     let Some(source) = task.source_ref.as_deref() else { return Ok(()) };
     let Some(chat_id) = db.chat_id_for_source_ref(source)? else { return Ok(()) };
     let files = crate::results::collect(db, task).unwrap_or_default();
-    db.add_chat_message(chat_id, ChatRole::Rui, &done_message(task, repo, infos, &files))?;
+    let text = format!("{}{}", done_message(task, repo, infos, &files), lead_note(db, task.id)?);
+    db.add_chat_message(chat_id, ChatRole::Rui, &text)?;
     Ok(())
+}
+
+/// The Account Lead's remarks (and PR link) for a forwarded task, or an empty string.
+fn lead_note(db: &Db, task_id: i64) -> Result<String> {
+    let Some(f) = latest_forwarded(db, task_id)? else { return Ok(String::new()) };
+    let mut note = format!("\n\n**Account Lead:** {}", f["remarks"].as_str().unwrap_or_default());
+    if let Some(url) = f["pr_url"].as_str() {
+        note.push_str(&format!("\n\nPR: {url}"));
+    }
+    Ok(note)
 }
 
 const STOPPED_MARK: &str = " stopped: ";
 
 /// For a top-level task that got stuck by an error, asks the owner (shows in the Inbox) what to do.
 /// Does nothing for subtasks, owner stops, or when such a question is already open.
-fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
+pub(crate) fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
     let Some(task) = db.get_task(task_id)? else { return Ok(()) };
     if task.parent_id.is_some() {
         return Ok(());
@@ -425,15 +730,21 @@ fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
 fn stuck_reason(db: &Db, parent_id: i64) -> Result<Option<String>> {
     for sub in db.subtasks(parent_id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
         let events = db.list_events(Some(sub.id), 30)?;
-        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped"].contains(&e.kind.as_str()));
+        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped", "loop_limit"].contains(&e.kind.as_str()));
         let Some(e) = last else { continue };
         match e.kind.as_str() {
             "land_failed" => return Ok(Some(format!("{} could not be merged (conflict in {})", sub.title, e.payload["files"]))),
             "stopped" => {}
+            "loop_limit" => return Ok(Some(loop_limit_reason(sub, e))),
             _ => return Ok(Some(format!("{}: {}", sub.title, e.payload["error"].as_str().unwrap_or("error")))),
         }
     }
     Ok(None)
+}
+
+fn loop_limit_reason(sub: &Task, e: &rui_core::Event) -> String {
+    let (used, max) = (&e.payload["loops_used"], &e.payload["max_loops"]);
+    format!("{} hit its loop limit ({used}/{max}) and was not given more attempts", sub.title)
 }
 
 /// The chat message announcing a finished task, its apps and the files it produced.
@@ -474,6 +785,7 @@ impl Drop for RunGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn<F, Fut>(
     db: &Arc<Db>,
     cfg: &Config,
@@ -481,6 +793,7 @@ fn spawn_turn<F, Fut>(
     live: &Live,
     task_id: i64,
     start_status: TaskStatus,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
     turn: F,
 ) where
     F: FnOnce(Arc<Db>, Config, Live) -> Fut + Send + 'static,
@@ -500,6 +813,10 @@ fn spawn_turn<F, Fut>(
     let live = live.clone();
     let handle = tokio::spawn(async move {
         let _guard = (guard, live_guard);
+        let _wake = match &lock {
+            Some(l) => Some(l.lock().await),
+            None => None,
+        };
         if let Err(e) = turn(db.clone(), cfg, live).await {
             report_error(&db, Some(task_id), &e);
             let _ = db.set_task_status(task_id, TaskStatus::Stuck);
@@ -534,31 +851,85 @@ fn client_for(db: &Db, task: &Task) -> Result<Client> {
     db.get_client(task.client_id)?.context("client not found")
 }
 
-/// Runs the agent, logging every line as an event for `agent`.
-async fn run_logged(db: &Db, live: &Live, agent: &str, task_id: i64, run: &AgentRun) -> Result<RunOutcome> {
-    run_agent(run, |p| {
-        on_line(live, LiveKey::Task(task_id), p);
-        let Some((kind, payload)) = line_event(p) else { return };
-        let _ = db.add_event(Some(task_id), agent, kind, &payload);
-    })
-    .await
+/// Runs the agent on the picked seat, logging every line as an event for `agent`.
+/// The `result` event carries `seat_id`, which is how usage per seat is counted.
+pub(crate) async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, run: AgentRun) -> Result<RunOutcome> {
+    run_logged_on(Cli::Claude, db, cfg, live, agent, task_id, run).await
 }
 
+/// `run_logged` on the given agent CLI.
+async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
+    let seat = seats::pick_from(db, &cfg.data_dir, crate::thread::now_secs())?.context("all seats are used up")?;
+    run.seat = Some(seat.clone());
+    let res = run_agent_with(cli, &run, |p| {
+        on_line(live, LiveKey::Task(task_id), p);
+        let Some((kind, payload)) = line_event(p) else { return };
+        let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
+    })
+    .await;
+    if seat_used_up(cli, &res) {
+        seats::mark_exhausted(db, &seat, crate::thread::now_secs())?;
+    }
+    res
+}
+
+/// True when a Claude turn failed on a usage limit. A Codex turn never uses up a Claude seat.
+pub fn seat_used_up(cli: Cli, res: &Result<RunOutcome>) -> bool {
+    cli == Cli::Claude && limit_text(res).is_some_and(|t| seats::hit_limit(&t))
+}
+
+/// A turn that ran over its time limit. The CLI is killed when its future is dropped.
+#[derive(Debug)]
+pub struct TimedOut;
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("timed out")
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Runs `fut` with a time limit; an error of type [`TimedOut`] when it runs over.
+pub async fn within<T>(limit: std::time::Duration, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(limit, fut).await.map_err(|_| anyhow::Error::new(TimedOut))?
+}
+
+/// Adds `seat_id` to a `result` payload.
+pub fn tag_seat(kind: &str, mut payload: Value, seat_id: &str) -> Value {
+    if kind == "result" && payload.is_object() {
+        payload["seat_id"] = json!(seat_id);
+    }
+    payload
+}
+
+/// The text of a failed turn: its error result or the run error. None for a good turn.
+fn limit_text(res: &Result<RunOutcome>) -> Option<String> {
+    match res {
+        Ok(out) if out.is_error => out.result_text.clone(),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    }
+}
+
+/// The task itself, plus the owner's answers when this wake follows questions.
+/// Every wake is a fresh session, so the task details are always included.
 fn lead_prompt(task: &Task, client: &Client, answers: &[(String, String)]) -> String {
+    let members: Vec<&str> = task.pod.iter().map(String::as_str).filter(|p| *p != "lead").collect();
+    let base = format!(
+        "Client: {}\nTask id: {}\nTitle: {}\n\n{}\n\nClient test command: {}\nPod roles for this task (create subtasks only for these agents): {}",
+        client.name,
+        task.id,
+        task.title,
+        task.body,
+        client.test_command.as_deref().unwrap_or("(none)"),
+        if members.is_empty() { "(any role)".into() } else { members.join(", ") }
+    );
     if answers.is_empty() {
-        let members: Vec<&str> = task.pod.iter().map(String::as_str).filter(|p| *p != "lead").collect();
-        return format!(
-            "Client: {}\nTask id: {}\nTitle: {}\n\n{}\n\nClient test command: {}\nYour pod (create subtasks only for these agents): {}",
-            client.name,
-            task.id,
-            task.title,
-            task.body,
-            client.test_command.as_deref().unwrap_or("(none)"),
-            if members.is_empty() { "(any role)".into() } else { members.join(", ") }
-        );
+        return base;
     }
     let pairs: Vec<String> = answers.iter().map(|(q, a)| format!("Q: {q}\nA: {a}")).collect();
-    format!("The owner answered:\n\n{}\n\nContinue: split the task.", pairs.join("\n\n"))
+    format!("{base}\n\nThe owner answered your questions:\n\n{}\n\nContinue: split the task.", pairs.join("\n\n"))
 }
 
 /// When the owner redirected a task that already has subtasks, lists them so the Lead can adjust them.
@@ -600,14 +971,54 @@ fn role_prompt(role: Option<&roster::Role>, prompt: &str) -> String {
     }
 }
 
-/// Role tools plus MCP tools for a Lead, or read-only tools when the role is missing.
-fn lead_tools(role: Option<&roster::Role>) -> Vec<String> {
+/// Role tools plus MCP tools for an Account Lead. It never writes files, so Edit and Write are dropped.
+fn account_lead_tools(role: Option<&roster::Role>) -> Vec<String> {
     let mut tools: Vec<String> = LEAD_MCP.split(',').map(String::from).collect();
     match role {
         Some(r) => tools.extend(roster::cli_tools(r)),
         None => tools.extend(READ_ONLY_TOOLS.map(String::from)),
     }
+    tools.retain(|t| t != "Edit" && t != "Write");
     tools
+}
+
+/// Last `max` chars of `text`, cut at a char boundary, with a leading "…" when cut.
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - max).collect();
+    format!("\u{2026}{tail}")
+}
+
+/// One line per pod role: its title and its own skills plus the pod's extra ones.
+fn pod_roles_and_skills(data_dir: &Path, client: &Client) -> Result<String> {
+    let pod = client_state::read_pod(data_dir, &client.name)?;
+    let mut lines = Vec::new();
+    for pr in &pod.roles {
+        let mut skills = roster::load(data_dir, &pr.role).map(|r| r.skills).unwrap_or_default();
+        skills.extend(pr.skills.iter().cloned());
+        let mut seen = HashSet::new();
+        skills.retain(|s| seen.insert(s.clone()));
+        let title = roster::title_of(data_dir, &pr.role);
+        lines.push(format!("- {} ({title}): skills {}", pr.role, skills.join(", ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Values for account_lead.md: the client, why it woke, its briefs and log, playbook and pod.
+fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Vec<(&'static str, String)>> {
+    let briefs = tail_chars(&client_state::read_briefs(data_dir, &client.name)?, 6000);
+    let log = client_state::read_log(data_dir, &client.name, 60)?;
+    Ok(vec![
+        ("client", client.name.clone()),
+        ("event", event.to_string()),
+        ("client_log", format!("Briefs:\n{briefs}\n\nDecisions log (latest last):\n{log}")),
+        ("owner_knowledge", client_state::read_knowledge(data_dir, &client.name)?),
+        ("client_playbook", client_state::read_playbook(data_dir, &client.name)?),
+        ("pod_roles_and_skills", pod_roles_and_skills(data_dir, client)?),
+    ])
 }
 
 /// Installs the role's skills plus the client's attached ones in `wt`, logs one `skill_used` event
@@ -629,26 +1040,38 @@ fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, cl
     Ok(unique)
 }
 
-/// Builds the Lead's run for `task` (a parent task) in the client's repo, with the role's skills installed.
-fn lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, prompt: String) -> Result<AgentRun> {
+/// The top-level task's worktree and branch, cut from the client's base branch.
+fn task_worktree(cfg: &Config, client: &Client, repo: &Path, task_id: i64) -> Result<(PathBuf, String)> {
+    let base = client_state::base_for(&cfg.data_dir, &client.name, repo)?;
+    ensure_task_worktree(repo, &cfg.data_dir.join("worktrees"), task_id, &base)
+}
+
+/// Builds an Account Lead wake for `task`: a fresh session in the task worktree, read-only tools.
+fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: &str, prompt: String) -> Result<AgentRun> {
     let role = roster::load(&cfg.data_dir, "lead");
     let repo = expand_home(&client.repo_path);
+    let (wt, branch) = task_worktree(cfg, client, &repo, task.id)?;
+    record_parent_branch(db, task.id, &branch)?;
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
-    install_logged(db, cfg, &repo, task, "lead", &client.name, &names)?;
+    install_logged(db, cfg, &wt, task, "lead", &client.name, &names)?;
+    let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &account_lead_vars(&cfg.data_dir, client, event)?);
     Ok(AgentRun {
         role: Role::Lead,
         task_id: Some(task.id),
-        cwd: repo,
+        cwd: wt,
         prompt,
-        system_prompt: role_prompt(role.as_ref(), LEAD_PROMPT),
-        allowed_tools: lead_tools(role.as_ref()),
+        system_prompt: role_prompt(role.as_ref(), &filled),
+        allowed_tools: account_lead_tools(role.as_ref()),
         builtin_tools: None,
         permission_mode: None,
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/lead", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task.id.to_string())],
-        resume: db.get_session(Role::Lead, Some(task.id))?,
+        grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Lead, Some(task.id)),
+        resume: None,
         partial: true,
+        seat: None,
+        sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
+        deny_secrets: None,
     })
 }
 
@@ -657,17 +1080,82 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let client = client_for(db, &task)?;
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
-    let run = lead_run(db, cfg, &task, &client, prompt)?;
-    match run_logged(db, live, "lead", task_id, &run).await {
-        Ok(out) => {
-            if let Some(id) = out.session_id {
-                db.set_session(Role::Lead, Some(task_id), &id)?;
-            }
-        }
-        Err(e) => return agent_failed(db, task_id, &e),
+    let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
+    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    if sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    if let Err(e) = res {
+        return agent_failed(db, task_id, &e);
     }
     after_lead_turn(db, task_id)?;
     Ok(())
+}
+
+/// The Account Lead reviews a task whose subtasks are all done and calls send_back or forward_pr.
+async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
+    let task = db.get_task(task_id)?.context("task not found")?;
+    let client = client_for(db, &task)?;
+    let prompt = review_prompt(db, &cfg.data_dir, &task, &client)?;
+    let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
+    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    if sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    if let Err(e) = res {
+        return agent_failed(db, task_id, &e);
+    }
+    if after_lead_turn(db, task_id)? == TaskStatus::Stuck {
+        raise_stuck_question(db, task_id, "the Account Lead finished its review without send_back or forward_pr")?;
+    }
+    Ok(())
+}
+
+fn review_prompt(db: &Db, data_dir: &Path, task: &Task, client: &Client) -> Result<String> {
+    let lines: Vec<String> = db
+        .subtasks(task.id)?
+        .iter()
+        .map(|s| {
+            format!(
+                "- #{} {} [{}] done_command: {}",
+                s.id,
+                s.title,
+                s.agent.as_deref().unwrap_or("any"),
+                s.done_command.as_deref().unwrap_or("(none)")
+            )
+        })
+        .collect();
+    let base = client_state::base_for(data_dir, &client.name, &expand_home(&client.repo_path)).unwrap_or_else(|_| "main".into());
+    Ok(format!(
+        "{}\n\nAll subtasks are done. Review the work on branch {} (compare with `git diff {base}...HEAD`).\nSubtasks:\n{}\n\nCall send_back(task_id={id}, remarks) or forward_pr(task_id={id}, remarks).",
+        lead_prompt(task, client, &[]),
+        crate::worktree::task_branch_name(task.id),
+        lines.join("\n"),
+        id = task.id,
+    ))
+}
+
+/// When a Claude run stopped at startup because no sandbox is available, or was refused
+/// because Claude Code is too old, stops the task with that reason and returns true. The run
+/// is never retried unsandboxed.
+fn sandbox_missing(db: &Db, task_id: i64, res: &Result<RunOutcome>) -> Result<bool> {
+    let Some(text) = limit_text(res) else { return Ok(false) };
+    let reason = if text.starts_with(crate::cli_version::TOO_OLD) {
+        crate::cli_version::TOO_OLD
+    } else if crate::sandbox::unavailable_text(&text) {
+        crate::sandbox::UNAVAILABLE
+    } else {
+        return Ok(false);
+    };
+    stop_for_sandbox(db, task_id, &text, reason)?;
+    Ok(true)
+}
+
+/// Records an `agent_error` carrying `reason` and sends the task down the stuck path.
+pub(crate) fn stop_for_sandbox(db: &Db, task_id: i64, error: &str, reason: &str) -> Result<()> {
+    db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": error, "reason": reason}))?;
+    db.set_task_status(task_id, TaskStatus::Stuck)?;
+    raise_stuck_question(db, task_id, reason)
 }
 
 fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
@@ -677,13 +1165,14 @@ fn agent_failed(db: &Db, task_id: i64, e: &anyhow::Error) -> Result<()> {
 }
 
 /// The prompt a Lead or Rui gets to decide one escalated question.
-pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: Option<&str>, escalate_tool: &str) -> String {
+pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: Option<&str>, owner_answers: &str, escalate_tool: &str) -> String {
     let ladder: Vec<String> = q.ladder.iter().map(|r| format!("- {}: {}", r.who, r.why)).collect();
     format!(
         "Question {id} from member task {mid} ({title}):\n{text}\n\nLadder so far:\n{ladder}\n\n\
          Member job: {job}\nDone command: {done}\nLoops: {used} of {max}\n\
          Output of the member's last check:\n{check}\n\n\
          Task brief: {brief}\nPod: {pod}\n\n\
+         Owner answers on this task:\n{owner}\n\n\
          Decide it: call rule(question_id={id}, answer, why). If you cannot, call {escalate_tool}(question_id={id}, why). \
          You must call one of them.",
         id = q.id,
@@ -698,7 +1187,21 @@ pub fn decision_prompt(q: &Question, member: &Task, parent: &Task, last_check: O
         check = last_check.unwrap_or("(none)"),
         brief = parent.body,
         pod = parent.pod.join(", "),
+        owner = if owner_answers.is_empty() { "(none)" } else { owner_answers },
     )
+}
+
+/// Answered owner-level questions from all subtasks of `parent_id`, as "- Q<id>: <first line> \u{2192} <answer>".
+fn owner_answers(db: &Db, parent_id: i64) -> Result<String> {
+    let mut lines = Vec::new();
+    for sub in db.subtasks(parent_id)? {
+        for q in db.questions_for_task(sub.id)?.into_iter().filter(|q| q.level == "owner") {
+            let Some(answer) = q.answer.as_deref() else { continue };
+            let first = q.text.lines().next().unwrap_or_default();
+            lines.push(format!("- Q{}: {first} \u{2192} {answer}", q.id));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The member, its parent task and its client for a question.
@@ -717,22 +1220,27 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let _live = LiveGuard(live.clone(), LiveKey::Task(parent.id));
     let last = last_done_output(db, member.id)?;
     let tool = if level == "lead" { "escalate" } else { "escalate_to_owner" };
-    let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), tool);
+    let answers = owner_answers(db, parent.id)?;
+    let prompt = decision_prompt(&q, &member, &parent, last.as_deref(), &answers, tool);
     if level == "lead" {
-        let run = lead_run(db, cfg, &parent, &client, prompt)?;
-        let out = run_logged(db, live, "lead", parent.id, &run).await?;
-        if let Some(id) = out.session_id {
-            db.set_session(Role::Lead, Some(parent.id), &id)?;
+        let run = account_lead_run(db, cfg, &parent, &client, "a member's question", prompt)?;
+        let res = run_logged(db, cfg, live, "lead", parent.id, run).await;
+        if !sandbox_missing(db, parent.id, &res)? {
+            res?;
         }
         return Ok(());
     }
-    let system = prompts::fill(DECIDE_PROMPT, &decide_vars(db, &q, &member, &parent)?);
-    run_logged(db, live, "rui", parent.id, &rui_decision_run(cfg, &parent, prompt, system)).await?;
+    let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
+    let mut vars = decide_vars(db, &q, &member, &parent, playbook)?;
+    vars.push(("global_playbook", client_state::read_global_playbook(&cfg.data_dir)?));
+    vars.push(("owner_knowledge", client_state::read_knowledge(&cfg.data_dir, &client.name)?));
+    let system = prompts::fill(DECIDE_PROMPT, &vars);
+    run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
 }
 
 /// Values for decide.md: the question, who asked and why it came up, the brief, earlier rulings.
-fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task) -> Result<Vec<(&'static str, String)>> {
+fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task, client_playbook: String) -> Result<Vec<(&'static str, String)>> {
     let lead_why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
     Ok(vec![
         ("question", q.text.clone()),
@@ -740,8 +1248,7 @@ fn decide_vars(db: &Db, q: &Question, member: &Task, parent: &Task) -> Result<Ve
         ("subtask_title", member.title.clone()),
         ("lead_why", lead_why),
         ("brief", parent.body.clone()),
-        ("client_playbook", String::new()),
-        ("global_playbook", String::new()),
+        ("client_playbook", client_playbook),
         ("prior_rulings", prior_rulings(db, parent.id, q.id)?),
     ])
 }
@@ -771,9 +1278,12 @@ fn rui_decision_run(cfg: &Config, parent: &Task, prompt: String, system_prompt: 
         permission_mode: None,
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/rui", cfg.port),
-        mcp_headers: vec![],
+        grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None),
         resume: None,
         partial: true,
+        seat: None,
+        sandbox: None,
+        deny_secrets: None,
     }
 }
 
@@ -813,12 +1323,13 @@ fn member_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str,
     let names = install_logged(db, cfg, wt, task, agent, &client.name, &names)?;
     let loaded: Vec<Skill> = names.iter().filter_map(|n| skills::load(&cfg.data_dir, n)).collect();
     let tools = member_tools(role.as_ref(), &loaded, client, done);
-    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done)?);
+    let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
+    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done, playbook)?);
     Ok((role_prompt(role.as_ref(), &prompt), tools))
 }
 
 /// Values for builder.md: who the member is, its job, and its own progress notes so far.
-fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str) -> Result<Vec<(&'static str, String)>> {
+fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str, playbook: String) -> Result<Vec<(&'static str, String)>> {
     let who = role.map(|r| r.title.clone()).or_else(|| task.agent.clone()).unwrap_or_else(|| "builder".into());
     Ok(vec![
         ("role", who),
@@ -826,7 +1337,7 @@ fn builder_vars(db: &Db, task: &Task, role: Option<&roster::Role>, done: &str) -
         ("job", task.body.clone()),
         ("done_command", done.to_string()),
         ("progress_file", progress_notes(db, task.id)?),
-        ("playbook", String::new()),
+        ("playbook", playbook),
     ])
 }
 
@@ -852,7 +1363,15 @@ fn builder_prompt(task: &Task, done_command: &str, last_output: Option<&str>) ->
     p
 }
 
-/// On daemon start: orphaned in_progress tasks go back to open, clarifying ones to new.
+/// A clarifying top-level task that already has subtasks was split; it must not get a "new task" wake again.
+pub(crate) fn recovered_status(db: &Db, t: &Task, to: TaskStatus) -> Result<TaskStatus> {
+    if to == TaskStatus::New && t.parent_id.is_none() && !db.subtasks(t.id)?.is_empty() {
+        return Ok(TaskStatus::Split);
+    }
+    Ok(to)
+}
+
+/// On daemon start: orphaned in_progress tasks go back to open, clarifying ones to new (split if they already have subtasks).
 pub fn recover_on_start(db: &Db) -> Result<usize> {
     let moves = [
         (TaskStatus::InProgress, TaskStatus::Open),
@@ -861,6 +1380,7 @@ pub fn recover_on_start(db: &Db) -> Result<usize> {
     let mut count = 0;
     for (from, to) in moves {
         for t in db.tasks_with_status(from)? {
+            let to = recovered_status(db, &t, to)?;
             db.set_task_status(t.id, to)?;
             let payload = json!({"from": from.as_str(), "to": to.as_str()});
             db.add_event(Some(t.id), "scheduler", "recovered", &payload)?;
@@ -870,12 +1390,16 @@ pub fn recover_on_start(db: &Db) -> Result<usize> {
     Ok(count)
 }
 
-async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
+async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let done_command = task.done_command.clone().context("subtask has no done_command")?;
     let client = client_for(db, &task)?;
     let repo = expand_home(&client.repo_path);
-    let (wt, branch) = create_worktree(&repo, &cfg.data_dir.join("worktrees"), task_id, None)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let worktrees = cfg.data_dir.join("worktrees");
+    let (_, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
+    record_parent_branch(db, parent_id, &task_branch)?;
+    let (wt, branch) = create_worktree(&repo, &worktrees, task_id, Some(&task_branch))?;
     db.set_task_branch(task_id, &branch)?;
     let last = last_done_output(db, task_id)?;
     let block = take_instructions(db, task_id)?;
@@ -892,11 +1416,23 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
         permission_mode: Some("acceptEdits".into()),
         permission_prompt_tool: None,
         mcp_url: format!("http://127.0.0.1:{}/mcp/builder", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task_id.to_string())],
+        grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Builder, Some(task_id)),
         resume,
         partial: true,
+        seat: None,
+        sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
+        deny_secrets: None,
     };
-    match run_logged(db, live, "builder", task_id, &run).await {
+    let cli = crate::codex::for_member(&cfg.data_dir, &client.name, task.agent.as_deref().unwrap_or("builder"));
+    if cli == Cli::Codex && crate::sandbox::codex_refused() {
+        let why = "Codex runs can still read RUI's data folder; use Claude for this client";
+        return stop_for_sandbox(db, task_id, why, crate::sandbox::CODEX_REFUSED);
+    }
+    let res = run_logged_on(cli, db, cfg, live, "builder", task_id, run).await;
+    if cli == Cli::Claude && sandbox_missing(db, task_id, &res)? {
+        return Ok(());
+    }
+    match res {
         Ok(out) => {
             if let Some(id) = out.session_id {
                 db.set_session(Role::Builder, Some(task_id), &id)?;
@@ -906,26 +1442,200 @@ async fn builder_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Resul
             db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
         }
     }
-    finish_builder(db, cfg, live, &task, &wt, &done_command).await
+    finish_builder(db, cfg, &task, &wt, &done_command).await
 }
 
-async fn finish_builder(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
+/// Remembers the per-task branch on the parent, once.
+fn record_parent_branch(db: &Db, parent_id: i64, branch: &str) -> Result<()> {
+    let parent = db.get_task(parent_id)?.context("parent task not found")?;
+    if parent.branch.is_none() {
+        db.set_task_branch(parent_id, branch)?;
+    }
+    Ok(())
+}
+
+async fn finish_builder(db: &Arc<Db>, cfg: &Config, task: &Task, wt: &Path, done_command: &str) -> Result<()> {
     let current = db.get_task(task.id)?.context("task not found")?;
     if matches!(current.status, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
         return Ok(());
     }
-    let check = run_done_command(wt, done_command).await?;
-    if check.passed && wants_evaluator(db, &current)? {
-        record_check(db, task.id, &check)?;
-        return commit_evaluate_land(db, cfg, live, &current, wt, done_command).await;
+    if reject_protected(db, cfg, task, wt)? {
+        return Ok(());
     }
+    let client = client_for(db, task)?;
+    let sb = crate::sandbox::for_client(&cfg.data_dir, &client.name, &expand_home(&client.repo_path));
+    let check = match run_done_command(&sb, wt, done_command).await {
+        Err(e) if crate::srt::is_unavailable(&e) => return stop_for_sandbox(db, task.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE),
+        other => other?,
+    };
     if after_done_check(db, &cfg.data_dir, task.id, &check)? != TaskStatus::Done {
         return Ok(());
     }
-    if commit_task(db, task, wt)? {
-        land_branch(db, task)?;
+    let (db, cfg, task, wt) = (db.clone(), cfg.clone(), task.clone(), wt.to_path_buf());
+    tokio::task::spawn_blocking(move || commit_and_merge(&db, &cfg, &task, &wt)).await?
+}
+
+/// Commits a passing subtask and merges it into the task branch (sync git, run off the async runtime).
+fn commit_and_merge(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<()> {
+    // Merge even when there was nothing new to commit: the agent may have committed its work itself.
+    commit_task(db, task, wt)?;
+    merge_subtask(db, cfg, task)
+}
+
+/// The worktree a subtask's builder works in.
+pub fn subtask_worktree(data_dir: &Path, task_id: i64) -> PathBuf {
+    data_dir.join("worktrees").join(task_id.to_string())
+}
+
+/// What came of the owner handing a taken-over subtask back.
+#[derive(Debug, serde::Serialize)]
+pub struct HandBack {
+    pub status: TaskStatus,
+    pub passed: bool,
+    pub output_tail: String,
+}
+
+/// Runs the check on a step the owner did by hand. A pass, or `force`, lands it like a
+/// builder's work; a failure sends the owner's note to the agent and opens the step again.
+pub async fn hand_back(db: &Arc<Db>, data_dir: &Path, task: &Task, note: &str, force: bool) -> Result<HandBack> {
+    // In progress while the check runs, so the scheduler does not start the agent meanwhile.
+    db.set_task_status(task.id, TaskStatus::InProgress)?;
+    db.add_event(Some(task.id), "owner", "handed_back", &json!({"note": note, "force": force}))?;
+    let check = match hand_back_check(db, data_dir, task).await {
+        Err(e) if crate::srt::is_unavailable(&e) => {
+            stop_for_sandbox(db, task.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE)?;
+            return Ok(HandBack { status: TaskStatus::Stuck, passed: false, output_tail: format!("{e:#}") });
+        }
+        res => res.unwrap_or_else(|e| DoneCheck { passed: false, output_tail: format!("{e:#}") }),
+    };
+    record_check(db, task.id, &check)?;
+    let status = if check.passed || force {
+        land_handed_back(db, data_dir, task, !check.passed).await?
+    } else {
+        reopen_with_note(db, task.id, note)?
+    };
+    Ok(HandBack { status, passed: check.passed, output_tail: check.output_tail })
+}
+
+/// Runs the subtask's done_command in its worktree under srt; a missing command fails the check.
+async fn hand_back_check(db: &Db, data_dir: &Path, task: &Task) -> Result<DoneCheck> {
+    let Some(cmd) = task.done_command.as_deref() else {
+        return Ok(DoneCheck { passed: false, output_tail: "this step has no done_command".into() });
+    };
+    let client = client_for(db, task)?;
+    let sb = crate::sandbox::for_client(data_dir, &client.name, &expand_home(&client.repo_path));
+    run_done_command(&sb, &subtask_worktree(data_dir, task.id), cmd).await
+}
+
+/// Marks the step done (logging `forced_done` when forced), then commits and merges it.
+async fn land_handed_back(db: &Arc<Db>, data_dir: &Path, task: &Task, forced: bool) -> Result<TaskStatus> {
+    db.set_task_status(task.id, TaskStatus::Done)?;
+    if forced {
+        db.add_event(Some(task.id), "owner", "forced_done", &json!({}))?;
     }
+    // commit_and_merge only reads the data dir from the config.
+    let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data_dir.to_path_buf() };
+    let wt = subtask_worktree(data_dir, task.id);
+    let (db2, task2) = (db.clone(), task.clone());
+    tokio::task::spawn_blocking(move || commit_and_merge(&db2, &cfg, &task2, &wt)).await??;
+    Ok(db.get_task(task.id)?.context("task not found")?.status)
+}
+
+/// Saves the owner's note as an instruction for the agent's next turn and opens the step again.
+fn reopen_with_note(db: &Db, task_id: i64, note: &str) -> Result<TaskStatus> {
+    let text = match note.trim() {
+        "" => "The owner handed this step back but the check still fails. Make the done command pass.",
+        n => n,
+    };
+    db.add_event(Some(task_id), "owner", "instruction", &json!({"text": text}))?;
+    db.set_task_status(task_id, TaskStatus::Open)?;
+    Ok(TaskStatus::Open)
+}
+
+/// Undoes edits to protected files and removes new protected files. True when something was rejected (the failed loop is counted).
+fn reject_protected(db: &Db, cfg: &Config, task: &Task, wt: &Path) -> Result<bool> {
+    let client = client_for(db, task)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let repo = expand_home(&client.repo_path);
+    let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
+    let pod = client_state::read_pod(&cfg.data_dir, &client.name)?;
+    let siblings = db.subtasks(parent_id)?;
+    let set = protected::protected_set(&task_wt, task, &siblings, &pod, &granted_paths(db, task)?)?;
+    let v = violations(wt, &task_branch, &set)?;
+    if v.is_empty() {
+        return Ok(false);
+    }
+    crate::worktree::restore_files(wt, &task_branch, &v.to_restore())?;
+    crate::worktree::remove_new_files(wt, &v.new)?;
+    record_rejection(db, cfg, task, &v)?;
+    Ok(true)
+}
+
+/// What a member's turn broke: protected files it edited or added, and files that lost a Tester's lines.
+struct Violations {
+    edited: Vec<String>,
+    new: Vec<String>,
+    tester_lines: Vec<String>,
+}
+
+impl Violations {
+    fn is_empty(&self) -> bool {
+        self.edited.is_empty() && self.new.is_empty() && self.tester_lines.is_empty()
+    }
+
+    /// Existing files to put back from the task branch, each once.
+    fn to_restore(&self) -> Vec<String> {
+        let mut all = self.edited.clone();
+        all.extend(self.tester_lines.iter().filter(|f| !self.edited.contains(f)).cloned());
+        all
+    }
+}
+
+fn violations(wt: &Path, task_branch: &str, set: &protected::Protected) -> Result<Violations> {
+    let mut edited = protected::touched_existing(wt, task_branch)?;
+    edited.retain(|f| protected::is_protected(f, set));
+    let mut new = protected::added_files(wt, task_branch)?;
+    new.retain(|f| protected::is_protected_new(f, set));
+    let tester_lines = protected::missing_tester_lines(wt, set);
+    Ok(Violations { edited, new, tester_lines })
+}
+
+/// Union of the protected paths the Lead granted this subtask.
+fn granted_paths(db: &Db, task: &Task) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for e in db.events_for_tasks(&[task.id], &["paths_granted"], 0, i64::MAX)? {
+        let list = e.payload["paths"].as_array().into_iter().flatten();
+        paths.extend(list.filter_map(|p| p.as_str().map(String::from)));
+    }
+    Ok(paths)
+}
+
+/// Records the rejection events and counts the failed loop.
+fn record_rejection(db: &Db, cfg: &Config, task: &Task, v: &Violations) -> Result<()> {
+    let all: Vec<&String> = v.edited.iter().chain(&v.new).collect();
+    let payload = json!({"files": all, "new": v.new, "tester_lines": v.tester_lines});
+    db.add_event(Some(task.id), "scheduler", "protected_rejected", &payload)?;
+    let reason = rejection_reason(&all, &v.tester_lines);
+    let text = format!(
+        "Your changes were rejected and undone: {reason}. Tests, eval files and files the done_command uses must not be edited, deleted or skipped, and lines the Tester added must stay. Make the done_command pass by doing the job."
+    );
+    db.add_event(Some(task.id), "scheduler", "instruction", &json!({"text": text}))?;
+    let status = count_failed_loop(db, &cfg.data_dir, task, &reason)?;
+    db.set_task_status(task.id, status)?;
     Ok(())
+}
+
+/// One line naming the protected files changed and the files whose Tester lines went missing.
+fn rejection_reason(files: &[&String], tester_lines: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !files.is_empty() {
+        let list = files.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ");
+        parts.push(format!("changed protected files: {list}"));
+    }
+    for f in tester_lines {
+        parts.push(format!("{f}: removed or changed tests the Tester wrote"));
+    }
+    parts.join("; ")
 }
 
 /// Commits the worktree; false when there was nothing to commit.
@@ -935,110 +1645,18 @@ fn commit_task(db: &Db, task: &Task, wt: &Path) -> Result<bool> {
     Ok(committed)
 }
 
-/// True when the member's parent pod has an evaluator.
-fn wants_evaluator(db: &Db, task: &Task) -> Result<bool> {
-    let Some(pid) = task.parent_id else { return Ok(false) };
-    let parent = db.get_task(pid)?;
-    Ok(parent.is_some_and(|p| p.pod.iter().any(|r| r == "evaluator")))
-}
-
-/// Check passed: commit, let the evaluator review, then land on PASS or send back on FAIL.
-async fn commit_evaluate_land(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done: &str) -> Result<()> {
-    if !commit_task(db, task, wt)? {
-        return db.set_task_status(task.id, TaskStatus::Done);
-    }
-    let text = evaluator_review(db, cfg, live, task, wt, done).await?;
-    if parse_verdict(&text) == Some(Verdict::Pass) {
-        db.set_task_status(task.id, TaskStatus::Done)?;
-        return land_branch(db, task);
-    }
-    let findings = if parse_verdict(&text).is_some() { text } else { format!("No verdict was given.\n{text}") };
-    send_back(db, &cfg.data_dir, task.id, &findings)?;
-    Ok(())
-}
-
-/// The evaluator's final verdict.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Verdict {
-    Pass,
-    Fail,
-}
-
-/// Reads `VERDICT: PASS` or `VERDICT: FAIL` from the last line that has one.
-pub fn parse_verdict(text: &str) -> Option<Verdict> {
-    let plain = |c: char| matches!(c, '*' | '`' | '_' | ' ');
-    text.lines().rev().find_map(|line| {
-        let line = line.trim().trim_matches(plain).to_uppercase();
-        match line.strip_prefix("VERDICT:")?.trim_matches(plain) {
-            "PASS" => Some(Verdict::Pass),
-            "FAIL" => Some(Verdict::Fail),
-            _ => None,
-        }
-    })
-}
-
-fn evaluator_prompt(task: &Task, done: &str, diff: &str) -> String {
-    format!(
-        "Job:\n{}\n\nDone command: {done}\n\nReview this change (git diff main) against the job:\n```diff\n{diff}\n```\n\n\
-         Reply with your findings. The final line must be exactly `VERDICT: PASS` or `VERDICT: FAIL`.",
-        task.body
-    )
-}
-
-/// Tools for the evaluator: its role's tools without Edit or Write.
-fn evaluator_tools(role: Option<&roster::Role>) -> Vec<String> {
-    let tools = match role {
-        Some(r) => roster::cli_tools(r),
-        None => READ_ONLY_TOOLS.map(String::from).to_vec(),
-    };
-    tools.into_iter().filter(|t| t != "Edit" && t != "Write").collect()
-}
-
-/// Runs the evaluator in the member's worktree and returns its final text.
-async fn evaluator_review(db: &Db, cfg: &Config, live: &Live, task: &Task, wt: &Path, done: &str) -> Result<String> {
-    let role = roster::load(&cfg.data_dir, "evaluator");
-    let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
+/// Merges a finished subtask branch into its parent's task branch; a conflict turns it Stuck.
+fn merge_subtask(db: &Db, cfg: &Config, task: &Task) -> Result<()> {
     let client = client_for(db, task)?;
-    install_logged(db, cfg, wt, task, "evaluator", &client.name, &names)?;
-    let run = AgentRun {
-        role: Role::Builder,
-        task_id: Some(task.id),
-        cwd: wt.to_path_buf(),
-        prompt: evaluator_prompt(task, done, &diff_vs_main(wt)?),
-        system_prompt: role.as_ref().map(|r| r.body.clone()).unwrap_or_default(),
-        allowed_tools: evaluator_tools(role.as_ref()),
-        builtin_tools: None,
-        permission_mode: None,
-        permission_prompt_tool: None,
-        mcp_url: format!("http://127.0.0.1:{}/mcp/builder", cfg.port),
-        mcp_headers: vec![("X-Rui-Task-Id".into(), task.id.to_string())],
-        resume: None,
-        partial: true,
-    };
-    let out = run_logged(db, live, "evaluator", task.id, &run).await?;
-    Ok(out.result_text.unwrap_or_default())
-}
-
-/// Evaluator said FAIL: record the findings as an instruction, count a loop, reopen the member.
-pub fn send_back(db: &Db, data_dir: &Path, task_id: i64, findings: &str) -> Result<TaskStatus> {
-    db.add_event(Some(task_id), "evaluator", "sent_back", &json!({"findings": findings}))?;
-    let text = format!("The evaluator sent your work back:\n{findings}");
-    db.add_event(Some(task_id), "evaluator", "instruction", &json!({"text": text}))?;
-    let task = db.get_task(task_id)?.context("task not found")?;
-    let reason = format!("the evaluator still rejects it: {findings}");
-    let next = count_failed_loop(db, data_dir, &task, &reason)?;
-    db.set_task_status(task_id, next)?;
-    Ok(next)
-}
-
-/// Merges the task branch into main; a conflict turns the finished task Stuck.
-fn land_branch(db: &Db, task: &Task) -> Result<()> {
-    let client = client_for(db, task)?;
+    let parent_id = task.parent_id.context("subtask has no parent")?;
+    let repo = expand_home(&client.repo_path);
+    let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     let branch = crate::worktree::branch_name(task.id);
     let message = format!("rui: task {}: {}", task.id, task.title);
-    match land(&expand_home(&client.repo_path), &branch, &message)? {
+    match merge_into(&task_wt, &branch, &message)? {
         LandResult::Merged => {
-            db.add_event(Some(task.id), "scheduler", "landed", &json!({"branch": branch}))?;
+            let payload = json!({"branch": branch, "into": task_branch});
+            db.add_event(Some(task.id), "scheduler", "merged_to_task_branch", &payload)?;
         }
         LandResult::Conflict(files) => {
             db.add_event(Some(task.id), "scheduler", "land_failed", &json!({"files": files}))?;
@@ -1070,6 +1688,51 @@ mod tests {
     }
     use crate::db::NewTask;
     use rui_core::SourceKind;
+
+    #[test]
+    fn rui_decide_runs_have_no_file_or_web_tools() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Split);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: "/tmp/d".into() };
+        crate::runner::tests::assert_no_file_or_web_tools(&rui_decision_run(&cfg, &t, "q".into(), String::new()));
+    }
+
+    #[test]
+    fn too_old_claude_stops_the_task_with_an_inbox_alert() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Clarifying);
+        let why = crate::cli_version::refusal(true, Some("Claude Code 2.1.200 is installed; v2.1.314 or later is needed")).unwrap();
+        assert!(sandbox_missing(&db, t.id, &Err(anyhow::anyhow!(why))).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(t.id), 10).unwrap();
+        let e = events.iter().find(|e| e.kind == "agent_error").unwrap();
+        assert_eq!(e.payload["reason"], crate::cli_version::TOO_OLD);
+        let items = crate::inbox::inbox(&db).unwrap();
+        let item = items.iter().find(|i| i.kind == "claude_too_old").unwrap();
+        assert!(item.title.contains("v2.1.314"), "{}", item.title);
+    }
+
+    #[test]
+    fn missing_sandbox_stops_the_task_and_other_failures_do_not() {
+        let db = Db::open_test();
+        let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
+        let t = mk(&db, c.id, None, TaskStatus::Clarifying);
+        let boom: Result<RunOutcome> = Err(anyhow::anyhow!("claude exited with failure: boom"));
+        assert!(!sandbox_missing(&db, t.id, &boom).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Clarifying);
+        let err = "claude exited with failure: sandbox required but unavailable. Set sandbox.failIfUnavailable=false to allow unsandboxed execution.";
+        assert!(sandbox_missing(&db, t.id, &Err(anyhow::anyhow!(err))).unwrap());
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(t.id), 10).unwrap();
+        let e = events.iter().find(|e| e.kind == "agent_error").unwrap();
+        assert_eq!(e.payload["reason"], crate::sandbox::UNAVAILABLE);
+        assert!(events.iter().any(|e| e.kind == "question_raised"), "goes down the stuck path");
+        let items = crate::inbox::inbox(&db).unwrap();
+        let item = items.iter().find(|i| i.kind == "sandbox_unavailable").unwrap();
+        assert_eq!((item.task_id, item.actions.clone()), (Some(t.id), vec!["retry".to_string()]));
+    }
 
     #[test]
     fn instructions_block_formats_items() {
@@ -1107,6 +1770,46 @@ mod tests {
     }
 
     #[test]
+    fn ask_scout_plans_one_scout_turn_and_the_lead_keeps_its_state() {
+        let (db, c) = setup();
+        let t = mk(&db, c, None, TaskStatus::Split);
+        let ctx = crate::mcp::Ctx { task_id: Some(t.id), source_ref: None };
+        let args = crate::mcp::AskScoutArgs { question: "Why does the build fail?".into() };
+        let id = crate::mcp::logic::ask_scout(&db, &ctx, args).unwrap()["request_event_id"].as_i64().unwrap();
+        assert_eq!(plan(&db), vec![Action::Scout { task_id: t.id, request_event_id: id }]);
+        assert_eq!(db.get_task(t.id).unwrap().unwrap().status, TaskStatus::Split);
+        let report = crate::scout::Report { summary: "Missing env var".into(), findings: vec![], sources: vec![] };
+        crate::scout::report(&db, id, Some(t.id), report).unwrap();
+        assert!(plan(&db).is_empty());
+        assert!(take_instructions(&db, t.id).unwrap().contains("Missing env var"));
+    }
+
+    #[test]
+    fn members_cannot_ask_the_scout() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        let sub = mk(&db, c, Some(p.id), TaskStatus::InProgress);
+        let ctx = crate::mcp::Ctx { task_id: Some(sub.id), source_ref: None };
+        assert!(crate::mcp::logic::ask_scout(&db, &ctx, crate::mcp::AskScoutArgs { question: "q".into() }).is_err());
+    }
+
+    #[test]
+    fn done_task_with_a_send_back_gets_one_coach_turn() {
+        let (db, c) = setup();
+        let t = mk(&db, c, None, TaskStatus::Done);
+        db.add_event(Some(t.id), "lead", "sent_back", &json!({"remarks": "r"})).unwrap();
+        assert_eq!(plan(&db), vec![Action::Coach { task_id: t.id }]);
+        db.add_event(Some(t.id), "coach", "coach_reviewed", &json!({})).unwrap();
+        assert!(plan(&db).is_empty());
+    }
+
+    #[test]
+    fn support_turns_wait_for_a_free_seat() {
+        let actions = vec![Action::Scout { task_id: 1, request_event_id: 2 }, Action::Coach { task_id: 1 }];
+        assert!(hold_turns(actions, false).is_empty());
+    }
+
+    #[test]
     fn recover_on_start_resets_orphans() {
         let (db, c) = setup();
         let parent = mk(&db, c, None, TaskStatus::Split);
@@ -1122,6 +1825,266 @@ mod tests {
         let evs = db.list_events(Some(sub.id), 10).unwrap();
         assert!(evs.iter().any(|e| e.kind == "recovered"));
         assert_eq!(recover_on_start(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn recover_sends_a_split_clarifying_task_to_split() {
+        let (db, c) = setup();
+        let parent = mk(&db, c, None, TaskStatus::Clarifying);
+        mk(&db, c, Some(parent.id), TaskStatus::Open);
+        assert_eq!(recover_on_start(&db).unwrap(), 1);
+        assert_eq!(db.get_task(parent.id).unwrap().unwrap().status, TaskStatus::Split);
+    }
+
+    #[test]
+    fn account_lead_vars_fill_every_placeholder() {
+        let (db, c) = setup();
+        let client = db.get_client(c).unwrap().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        client_state::ensure(data.path(), "acme", "/repo", None).unwrap();
+        client_state::append_brief(data.path(), "acme", 1, "Title", "the brief").unwrap();
+        client_state::append_decision(data.path(), "acme", "picked sqlite").unwrap();
+        client_state::append_knowledge(data.path(), "acme", "Owner says: no Docker").unwrap();
+        let pod = client_state::Pod {
+            roles: vec![client_state::PodRole { role: "backend".into(), skills: vec!["extra-skill".into()] }],
+            protected: vec![],
+            cli: None,
+        };
+        client_state::write_pod(data.path(), "acme", &pod).unwrap();
+        let vars = account_lead_vars(data.path(), &client, "a new task").unwrap();
+        let get = |k: &str| vars.iter().find(|v| v.0 == k).unwrap().1.clone();
+        assert!(get("client_log").contains("the brief") && get("client_log").contains("picked sqlite"));
+        assert!(get("pod_roles_and_skills").contains("backend") && get("pod_roles_and_skills").contains("extra-skill"));
+        assert_eq!(get("event"), "a new task");
+        assert!(get("owner_knowledge").contains("Owner says: no Docker"));
+        let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &vars);
+        assert!(prompts::unfilled(&filled).is_empty());
+        assert!(filled.find("no Docker").unwrap() < filled.find("Client Playbook").unwrap());
+    }
+
+    #[test]
+    fn account_lead_never_gets_edit_or_write() {
+        let role = roster::parse("---\nname: lead\ncode: L\ntitle: Lead\ndescription: d\ntools: [\"Read\", \"Edit\", \"Shell\"]\n---\nbody").unwrap();
+        let tools = account_lead_tools(Some(&role));
+        assert!(!tools.iter().any(|t| t == "Edit" || t == "Write"));
+        assert!(tools.iter().any(|t| t == "mcp__rui__log_decision"));
+        assert!(tools.iter().any(|t| t == "Bash"));
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// A repo with `tests/test_a.py` on main, a parent task, one subtask and its worktree.
+    fn protected_setup(data: &Path, repo: &Path) -> (Db, Config, Task, PathBuf) {
+        git_in(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("tests/test_a.py"), "orig").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Db::open_test();
+        let client = db.create_client("acme", &repo.to_string_lossy(), None, &[]).unwrap();
+        let parent = mk(&db, client.id, None, TaskStatus::Split);
+        let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.to_path_buf() };
+        let worktrees = data.join("worktrees");
+        let (_, tb) = ensure_task_worktree(repo, &worktrees, parent.id, &crate::worktree::base_branch(repo).unwrap()).unwrap();
+        let (wt, _) = create_worktree(repo, &worktrees, sub.id, Some(&tb)).unwrap();
+        (db, cfg, sub, wt)
+    }
+
+    #[test]
+    fn reject_protected_undoes_edits_and_counts_a_loop() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        std::fs::write(wt.join("tests/test_a.py"), "cheat").unwrap();
+        std::fs::write(wt.join("new.py"), "new").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("tests/test_a.py")).unwrap(), "orig");
+        assert!(wt.join("new.py").exists());
+        let events = db.list_events(Some(sub.id), 50).unwrap();
+        assert!(events.iter().any(|e| e.kind == "protected_rejected"));
+        assert!(events.iter().any(|e| e.kind == "instruction"));
+        let after = db.get_task(sub.id).unwrap().unwrap();
+        assert_eq!((after.loops_used, after.status), (1, TaskStatus::Open));
+    }
+
+    fn rejected(db: &Db, id: i64) -> bool {
+        db.list_events(Some(id), 50).unwrap().iter().any(|e| e.kind == "protected_rejected")
+    }
+
+    #[test]
+    fn reject_protected_removes_new_conftest() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        std::fs::write(wt.join("conftest.py"), "x").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert!(!wt.join("conftest.py").exists());
+        assert!(rejected(&db, sub.id));
+    }
+
+    #[test]
+    fn reject_protected_restores_edited_package_json() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir_all(repo.path()).unwrap();
+        std::fs::write(repo.path().join("package.json"), "{\"scripts\":{\"test\":\"jest\"}}").unwrap();
+        let (db, cfg, sub, wt) = {
+            let r = repo.path();
+            git_in(r, &["init", "-b", "main"]);
+            git_in(r, &["add", "."]);
+            git_in(r, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "pj"]);
+            let db = Db::open_test();
+            let client = db.create_client("acme", &r.to_string_lossy(), None, &[]).unwrap();
+            let parent = mk(&db, client.id, None, TaskStatus::Split);
+            let sub = mk(&db, client.id, Some(parent.id), TaskStatus::InProgress);
+            let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+            let worktrees = data.path().join("worktrees");
+            let (_, tb) = ensure_task_worktree(r, &worktrees, parent.id, &crate::worktree::base_branch(r).unwrap()).unwrap();
+            let (wt, _) = create_worktree(r, &worktrees, sub.id, Some(&tb)).unwrap();
+            (db, cfg, sub, wt)
+        };
+        std::fs::write(wt.join("package.json"), "{\"scripts\":{\"test\":\"true\"}}").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("package.json")).unwrap(), "{\"scripts\":{\"test\":\"jest\"}}");
+        assert!(rejected(&db, sub.id));
+    }
+
+    #[test]
+    fn reject_protected_honours_a_paths_granted_event() {
+        for granted in [false, true] {
+            let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+            if granted {
+                db.add_event(Some(sub.id), "lead", "paths_granted", &json!({"paths": ["package.json"]})).unwrap();
+            }
+            std::fs::write(wt.join("package.json"), "{}").unwrap();
+            assert_eq!(reject_protected(&db, &cfg, &sub, &wt).unwrap(), !granted);
+        }
+    }
+
+    #[test]
+    fn reject_protected_allows_plain_new_source_file() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/new.py"), "x").unwrap();
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert!(wt.join("src/new.py").exists());
+    }
+
+    const LIB: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+    const TESTS: &str = "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(2, 2), 4);\n    }\n}\n";
+
+    fn sub_task(db: &Db, client: i64, parent: i64, agent: Option<&str>, done: &str, status: TaskStatus) -> Task {
+        db.create_task(&NewTask {
+            client_id: client,
+            parent_id: Some(parent),
+            title: "t".into(),
+            body: String::new(),
+            status,
+            done_command: Some(done.into()),
+            max_loops: 2,
+            role: Role::Builder,
+            source_kind: SourceKind::User,
+            source_ref: None,
+            agent: agent.map(String::from),
+            pod: vec![],
+        })
+        .unwrap()
+    }
+
+    /// A Tester that appended tests to existing src/lib.rs and created src/extra.rs, merged into
+    /// the task branch; then a backend subtask (with `done`) and its worktree.
+    fn tester_setup(data: &Path, repo: &Path, done: &str) -> (Db, Config, Task, PathBuf) {
+        git_in(repo, &["init", "-b", "main"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), LIB).unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let db = Db::open_test();
+        let client = db.create_client("acme", &repo.to_string_lossy(), None, &[]).unwrap();
+        let parent = mk(&db, client.id, None, TaskStatus::Split);
+        let tester = sub_task(&db, client.id, parent.id, Some("tester"), "true", TaskStatus::Done);
+        let cfg = Config { port: 0, tick: Duration::from_secs(1), data_dir: data.to_path_buf() };
+        let worktrees = data.join("worktrees");
+        let (task_wt, tb) = ensure_task_worktree(repo, &worktrees, parent.id, &crate::worktree::base_branch(repo).unwrap()).unwrap();
+        let (twt, tbr) = create_worktree(repo, &worktrees, tester.id, Some(&tb)).unwrap();
+        std::fs::write(twt.join("src/lib.rs"), format!("{LIB}{TESTS}")).unwrap();
+        std::fs::write(twt.join("src/extra.rs"), "pub fn helper() {}\n").unwrap();
+        assert!(commit_all(&twt, "tests").unwrap());
+        assert_eq!(merge_into(&task_wt, &tbr, "merge tester").unwrap(), LandResult::Merged);
+        let backend = sub_task(&db, client.id, parent.id, None, done, TaskStatus::InProgress);
+        let (wt, _) = create_worktree(repo, &worktrees, backend.id, Some(&tb)).unwrap();
+        (db, cfg, backend, wt)
+    }
+
+    fn fixed_lib(tests: &str) -> String {
+        format!("{}{tests}", LIB.replace("a - b", "a + b"))
+    }
+
+    #[test]
+    fn backend_may_fix_code_in_a_file_the_tester_only_edited() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib(TESTS)).unwrap();
+        assert!(!reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), fixed_lib(TESTS));
+    }
+
+    #[test]
+    fn removing_or_changing_a_tester_line_is_rejected_and_restored() {
+        let changed = TESTS.replace("2, 2), 4", "2, 2), 0");
+        for tests in ["", changed.as_str()] {
+            let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+            std::fs::write(wt.join("src/lib.rs"), fixed_lib(tests)).unwrap();
+            assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+            assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+            let after = db.get_task(sub.id).unwrap().unwrap();
+            assert_eq!(after.loops_used, 1);
+            let events = db.list_events(Some(sub.id), 50).unwrap();
+            let text = events.iter().find(|e| e.kind == "instruction").unwrap().payload["text"].to_string();
+            assert!(text.contains("src/lib.rs: removed or changed tests the Tester wrote"), "{text}");
+        }
+    }
+
+    #[test]
+    fn tester_created_file_stays_fully_protected() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        std::fs::write(wt.join("src/extra.rs"), "pub fn helper() {}\npub fn more() {}\n").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/extra.rs")).unwrap(), "pub fn helper() {}\n");
+    }
+
+    #[test]
+    fn done_command_file_stays_fully_protected_even_if_tester_only_edited_it() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "cat src/lib.rs");
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib(TESTS)).unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+    }
+
+    #[test]
+    fn a_grant_cannot_lift_tester_protection() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = tester_setup(data.path(), repo.path(), "true");
+        db.add_event(Some(sub.id), "lead", "paths_granted", &json!({"paths": ["src/"]})).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), fixed_lib("")).unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+        assert_eq!(std::fs::read_to_string(wt.join("src/lib.rs")).unwrap(), format!("{LIB}{TESTS}"));
+        std::fs::write(wt.join("src/extra.rs"), "").unwrap();
+        assert!(reject_protected(&db, &cfg, &sub, &wt).unwrap());
+    }
+
+    #[test]
+    fn client_lock_is_per_client() {
+        let locks = ClientLocks::default();
+        assert!(Arc::ptr_eq(&client_lock(&locks, 1), &client_lock(&locks, 1)));
+        assert!(!Arc::ptr_eq(&client_lock(&locks, 1), &client_lock(&locks, 2)));
     }
 
     #[test]
@@ -1160,6 +2123,123 @@ mod tests {
     }
 
     #[test]
+    fn held_subtask_is_not_planned_until_released() {
+        let (db, c) = setup();
+        let parent = mk(&db, c, None, TaskStatus::Split);
+        let a = mk(&db, c, Some(parent.id), TaskStatus::Open);
+        db.add_event(Some(a.id), "owner", "checkpoint_set", &json!({})).unwrap();
+        assert_eq!(owner_hold(&db, a.id).unwrap(), Some("checkpoint"));
+        assert!(plan(&db).is_empty());
+        db.add_event(Some(a.id), "owner", "checkpoint_cleared", &json!({})).unwrap();
+        assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: a.id }]);
+        db.add_event(Some(a.id), "owner", "taken_over", &json!({})).unwrap();
+        assert!(plan(&db).is_empty());
+        db.add_event(Some(a.id), "owner", "handed_back", &json!({})).unwrap();
+        assert_eq!(owner_hold(&db, a.id).unwrap(), None);
+    }
+
+    /// The protected-files repo with the subtask taken over and running `cmd` as its check.
+    fn handed_setup(data: &Path, repo: &Path, cmd: &str) -> (Arc<Db>, Task, PathBuf) {
+        let (db, _cfg, sub, wt) = protected_setup(data, repo);
+        db.set_done_command(sub.id, cmd).unwrap();
+        db.add_event(Some(sub.id), "owner", "taken_over", &json!({})).unwrap();
+        let sub = db.get_task(sub.id).unwrap().unwrap();
+        (Arc::new(db), sub, wt)
+    }
+
+    fn has_event(db: &Db, id: i64, kind: &str) -> bool {
+        db.list_events(Some(id), 1000).unwrap().iter().any(|e| e.kind == kind)
+    }
+
+    fn assert_stopped_for_sandbox(db: &Db, id: i64) {
+        assert_eq!(db.get_task(id).unwrap().unwrap().status, TaskStatus::Stuck);
+        let events = db.list_events(Some(id), 1000).unwrap();
+        let e = events.iter().rev().find(|e| e.kind == "agent_error").expect("agent_error event");
+        assert_eq!(e.payload["reason"], crate::sandbox::UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn missing_srt_stops_the_done_check_and_runs_nothing() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        crate::srt::tests::set_override(data.path(), None);
+        let db = Arc::new(db);
+        finish_builder(&db, &cfg, &sub, &wt, "touch ran.txt").await.unwrap();
+        assert_stopped_for_sandbox(&db, sub.id);
+        assert!(!wt.join("ran.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_srt_stops_a_hand_back_and_runs_nothing() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, wt) = handed_setup(data.path(), repo.path(), "touch ran.txt");
+        crate::srt::tests::set_override(data.path(), None);
+        let out = hand_back(&db, data.path(), &sub, "", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Stuck, false));
+        assert_stopped_for_sandbox(&db, sub.id);
+        assert!(!wt.join("ran.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn failing_hand_back_reopens_with_the_note() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, _wt) = handed_setup(data.path(), repo.path(), "false");
+        let out = hand_back(&db, data.path(), &sub, "fix the edge case", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Open, false));
+        assert_eq!(db.get_task(sub.id).unwrap().unwrap().status, TaskStatus::Open);
+        let pending = db.pending_instructions(sub.id).unwrap();
+        assert_eq!(pending.last().unwrap().1, "fix the edge case");
+        assert_eq!(owner_hold(&db, sub.id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forced_hand_back_is_done_and_logged() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, _wt) = handed_setup(data.path(), repo.path(), "false");
+        let out = hand_back(&db, data.path(), &sub, "", true).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Done, false));
+        assert!(has_event(&db, sub.id, "forced_done"));
+        assert!(!has_event(&db, sub.id, "instruction"));
+    }
+
+    #[tokio::test]
+    async fn passing_hand_back_merges_into_the_task_branch() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, sub, wt) = handed_setup(data.path(), repo.path(), "test -f done.txt");
+        std::fs::write(wt.join("done.txt"), "by hand").unwrap();
+        let out = hand_back(&db, data.path(), &sub, "", false).await.unwrap();
+        assert_eq!((out.status, out.passed), (TaskStatus::Done, true));
+        assert!(has_event(&db, sub.id, "merged_to_task_branch"));
+        assert!(!has_event(&db, sub.id, "forced_done"));
+        let task_wt = data.path().join("worktrees").join(format!("task-{}", sub.parent_id.unwrap()));
+        assert!(task_wt.join("done.txt").exists());
+    }
+
+    #[test]
+    fn all_seats_used_holds_new_turns() {
+        let (db, c) = setup();
+        let d = tempfile::tempdir().unwrap();
+        let t = mk(&db, c, None, TaskStatus::New);
+        let now = crate::thread::now_secs();
+        let lead = vec![Action::StartLead { task_id: t.id, answers: vec![] }];
+        assert_eq!(plan_gated(&db, d.path(), &HashSet::new(), now).unwrap(), lead);
+        let only = seats::Seat { budget_usd: Some(1.0), ..seats::default_seat() };
+        seats::upsert(d.path(), only).unwrap();
+        db.add_event(Some(t.id), "lead", "result", &json!({"total_cost_usd": 0.95, "seat_id": "default"})).unwrap();
+        assert!(plan_gated(&db, d.path(), &HashSet::new(), now).unwrap().is_empty());
+        assert_eq!(db.events_of_kinds(&["seats_exhausted"]).unwrap().len(), 1);
+        let rollup = Action::Rollup { task_id: t.id, status: TaskStatus::Done };
+        let mixed = vec![rollup, Action::StartBuilder { task_id: 9 }, Action::Review { task_id: 9 }];
+        assert_eq!(hold_turns(mixed, false), [Action::Rollup { task_id: t.id, status: TaskStatus::Done }]);
+    }
+
+    #[test]
+    fn only_result_events_get_a_seat_id() {
+        assert_eq!(tag_seat("result", json!({"total_cost_usd": 1.0}), "w")["seat_id"], "w");
+        assert!(tag_seat("assistant", json!({}), "w").get("seat_id").is_none());
+    }
+
+    #[test]
     fn open_subtask_under_non_split_parent_waits() {
         let (db, c) = setup();
         let parent = mk(&db, c, None, TaskStatus::Clarifying);
@@ -1177,7 +2257,52 @@ mod tests {
         db.set_task_status(b.id, TaskStatus::Stuck).unwrap();
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Stuck }]);
         db.set_task_status(b.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+        forward(&db, p.id);
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Done }]);
+    }
+
+    fn forward(db: &Db, task_id: i64) {
+        std::thread::sleep(Duration::from_millis(5));
+        db.add_event(Some(task_id), "lead", "forwarded", &json!({"remarks": "ok", "pr_url": null})).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    #[test]
+    fn review_wakes_again_when_a_new_subtask_finishes_after_forwarding() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        mk(&db, c, Some(p.id), TaskStatus::Done);
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+        forward(&db, p.id);
+        assert_eq!(plan(&db), vec![Action::Rollup { task_id: p.id, status: TaskStatus::Done }]);
+        let extra = mk(&db, c, Some(p.id), TaskStatus::Open);
+        db.set_task_status(extra.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: p.id }]);
+    }
+
+    #[test]
+    fn review_prompt_lists_subtasks_and_tools() {
+        let (db, c) = setup();
+        let p = mk(&db, c, None, TaskStatus::Split);
+        let sub = mk(&db, c, Some(p.id), TaskStatus::Done);
+        let client = db.get_client(c).unwrap().unwrap();
+        let text = review_prompt(&db, std::path::Path::new("/nonexistent-data"), &p, &client).unwrap();
+        assert!(text.contains(&format!("rui/task-{}", p.id)) && text.contains(&format!("- #{} ", sub.id)));
+        assert!(text.contains(&format!("send_back(task_id={}", p.id)) && text.contains("forward_pr("));
+    }
+
+    #[test]
+    fn done_notice_includes_the_account_leads_remarks() {
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, ChatRole::User, "make it").unwrap();
+        let task = chat_task(&db, Some(format!("chat:{}", msg.id)));
+        db.add_event(Some(task.id), "lead", "forwarded", &json!({"remarks": "Mind the schema", "pr_url": "https://x.test/pr/2"})).unwrap();
+        post_done_notice(&db, &task, "/tmp/c", &[]).unwrap();
+        let last = db.list_chat(chat.id, 10).unwrap().pop().unwrap();
+        assert!(last.content.contains("**Account Lead:** Mind the schema"));
+        assert!(last.content.contains("PR: https://x.test/pr/2"));
     }
 
     #[test]
@@ -1326,57 +2451,6 @@ mod tests {
         assert!(answer_question(&db, q, "again", None, "owner").is_err());
     }
 
-    #[test]
-    fn verdict_parsing() {
-        assert_eq!(parse_verdict("ok\nVERDICT: PASS"), Some(Verdict::Pass));
-        assert_eq!(parse_verdict("bad\n**VERDICT: FAIL**\n"), Some(Verdict::Fail));
-        assert_eq!(parse_verdict("verdict: pass  "), Some(Verdict::Pass));
-        assert_eq!(parse_verdict("VERDICT: PASS\nlater\nVERDICT: FAIL"), Some(Verdict::Fail));
-        assert_eq!(parse_verdict("VERDICT: MAYBE"), None);
-        assert_eq!(parse_verdict("all good"), None);
-    }
-
-    #[test]
-    fn sent_back_records_findings_counts_a_loop_and_reopens() {
-        let (db, c) = setup();
-        let t = mk(&db, c, Some(1), TaskStatus::InProgress);
-        assert_eq!(send_back(&db, &dd(), t.id, "missing tests").unwrap(), TaskStatus::Open);
-        let now = db.get_task(t.id).unwrap().unwrap();
-        assert_eq!((now.status, now.loops_used), (TaskStatus::Open, 1));
-        let evs = db.list_events(Some(t.id), 10).unwrap();
-        assert!(evs.iter().any(|e| e.kind == "sent_back"));
-        assert!(db.pending_instructions(t.id).unwrap()[0].1.contains("missing tests"));
-        assert_eq!(send_back(&db, &dd(), t.id, "still bad").unwrap(), TaskStatus::WaitingAnswer);
-        assert_eq!(db.questions_for_task(t.id).unwrap()[0].level, "lead");
-    }
-
-    #[test]
-    fn evaluator_is_wanted_only_when_in_the_pod() {
-        let (db, c) = setup();
-        let mut parent = mk(&db, c, None, TaskStatus::Split);
-        let member = mk(&db, c, Some(parent.id), TaskStatus::InProgress);
-        assert!(!wants_evaluator(&db, &member).unwrap());
-        let with = db
-            .create_task(&NewTask {
-                client_id: c,
-                parent_id: None,
-                title: "p".into(),
-                body: String::new(),
-                status: TaskStatus::Split,
-                done_command: None,
-                max_loops: 5,
-                role: Role::Lead,
-                source_kind: SourceKind::User,
-                source_ref: None,
-                agent: Some("lead".into()),
-                pod: vec!["lead".into(), "evaluator".into()],
-            })
-            .unwrap();
-        parent = with;
-        let member = mk(&db, c, Some(parent.id), TaskStatus::InProgress);
-        assert!(wants_evaluator(&db, &member).unwrap());
-    }
-
     fn role(tools: &[&str]) -> roster::Role {
         let text = format!(
             "---\nname: r\ndescription: d\ntools: {}\n---\nI am r.\n",
@@ -1394,7 +2468,7 @@ mod tests {
     fn member_tools_allow_bash_broadly_only_with_shell() {
         let skill = skills::parse("---\nname: x\ndescription: d\nbash: [\"uv *\"]\n---\nb\n").unwrap();
         let client = client_with(&["ls"]);
-        let no_shell = member_tools(Some(&role(&["Read", "Edit", "Run tests"])), &[skill.clone()], &client, "make t");
+        let no_shell = member_tools(Some(&role(&["Read", "Edit", "Run tests"])), std::slice::from_ref(&skill), &client, "make t");
         assert!(no_shell.contains(&"Edit".to_string()) && no_shell.contains(&"Write".to_string()));
         assert!(!no_shell.contains(&"Bash".to_string()));
         for want in ["Bash(make t)", "Bash(ls)", "Bash(uv *)", "mcp__rui__ask_lead", "mcp__rui__report_status"] {
@@ -1407,13 +2481,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_tools_are_read_only() {
-        let tools = evaluator_tools(Some(&role(&["Read", "Edit", "Shell"])));
-        assert_eq!(tools, ["Read", "Bash"]);
-        assert_eq!(evaluator_tools(None), ["Read", "Glob", "Grep"]);
-    }
-
-    #[test]
     fn decision_prompt_has_question_ladder_and_check() {
         let (db, c) = setup();
         let (m, q) = waiting_member(&db, c, "lead");
@@ -1421,7 +2488,7 @@ mod tests {
         db.set_question_level(q, "lead", &ladder).unwrap();
         let (q, member) = (db.get_question(q).unwrap().unwrap(), db.get_task(m).unwrap().unwrap());
         let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
-        let p = decision_prompt(&q, &member, &parent, Some("boom"), "escalate");
+        let p = decision_prompt(&q, &member, &parent, Some("boom"), "", "escalate");
         for want in ["q?", "- Backend 7: which db?", "boom", "rule(question_id=", "escalate(question_id="] {
             assert!(p.contains(want), "{want}");
         }
@@ -1449,6 +2516,8 @@ mod tests {
         let sub = mk(&db, c, Some(parent.id), TaskStatus::Open);
         assert_eq!(plan(&db), vec![Action::StartBuilder { task_id: sub.id }]);
         db.set_task_status(sub.id, TaskStatus::Done).unwrap();
+        assert_eq!(plan(&db), vec![Action::Review { task_id: parent.id }]);
+        forward(&db, parent.id);
         assert_eq!(plan(&db), vec![Action::Rollup { task_id: parent.id, status: TaskStatus::Done }]);
     }
 
@@ -1562,4 +2631,190 @@ mod tests {
         assert_eq!(status(t.id), TaskStatus::New);
         assert_eq!(db.pending_instructions(t.id).unwrap()[0].1, "only the API part");
     }
+
+    /// A split parent with one waiting member at its loop limit and an open lead question.
+    fn limited_member(db: &Db, c: i64) -> (Task, Task, i64) {
+        let (m, q) = waiting_member(db, c, "lead");
+        db.increment_loops(m).unwrap();
+        db.increment_loops(m).unwrap();
+        let member = db.get_task(m).unwrap().unwrap();
+        let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
+        (parent, member, q)
+    }
+
+    #[test]
+    fn answer_at_the_loop_limit_sticks_instead_of_reopening() {
+        let (db, c) = setup();
+        let (parent, member, q) = limited_member(&db, c);
+        answer_question(&db, q, "try harder", None, "lead").unwrap();
+        let status = |id| db.get_task(id).unwrap().unwrap().status;
+        assert_eq!(status(member.id), TaskStatus::Stuck);
+        let events = db.list_events(Some(member.id), 100).unwrap();
+        assert!(events.iter().any(|e| e.kind == "loop_limit"));
+        assert!(events.iter().any(|e| e.kind == "instruction"));
+        assert!(matches!(plan_rollup(&db, &parent).unwrap(), Some(Action::Rollup { status: TaskStatus::Stuck, .. })));
+        assert!(stuck_reason(&db, parent.id).unwrap().unwrap().contains("loop limit (2/2)"));
+    }
+
+    #[test]
+    fn answer_below_or_after_raising_the_limit_reopens() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::Open);
+        let (_, member, q) = limited_member(&db, c);
+        db.set_max_loops(member.id, 5).unwrap();
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(db.get_task(member.id).unwrap().unwrap().status, TaskStatus::Open);
+    }
+
+    #[test]
+    fn retry_raises_the_limit_of_a_loop_limited_subtask() {
+        let (db, c) = setup();
+        let (parent, member, q) = limited_member(&db, c);
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        db.set_task_status(parent.id, TaskStatus::Stuck).unwrap();
+        retry_stuck(&db, parent.id, "owner").unwrap();
+        let after = db.get_task(member.id).unwrap().unwrap();
+        assert_eq!((after.status, after.max_loops), (TaskStatus::Open, 5));
+        let events = db.list_events(Some(parent.id), 100).unwrap();
+        let resumed = events.iter().find(|e| e.kind == "resumed").unwrap();
+        assert_eq!(resumed.payload["raised_limit"], json!([member.id]));
+    }
+
+    #[test]
+    fn decision_prompt_lists_owner_answers_from_sibling_subtasks() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        let member = db.get_task(m).unwrap().unwrap();
+        let sibling = mk(&db, c, member.parent_id, TaskStatus::Open);
+        let asked = db.create_ladder_question(sibling.id, Role::Builder, "owner", &[], "Which db?\nmore").unwrap();
+        db.answer_question(asked.id, "postgres", None).unwrap();
+        let parent = db.get_task(member.parent_id.unwrap()).unwrap().unwrap();
+        let q = db.get_question(q).unwrap().unwrap();
+        let answers = owner_answers(&db, parent.id).unwrap();
+        let p = decision_prompt(&q, &member, &parent, None, &answers, "escalate");
+        assert!(p.contains(&format!("- Q{}: Which db? \u{2192} postgres", asked.id)));
+        assert!(decision_prompt(&q, &member, &parent, None, "", "escalate").contains("Owner answers on this task:\n(none)"));
+    }
+
+    fn deliveries(db: &Db, now: i64) -> Vec<Action> {
+        let all = plan_tick_at(db, &HashSet::new(), now).unwrap();
+        all.into_iter().filter(|a| matches!(a, Action::DeliverAnswer { .. })).collect()
+    }
+
+    fn instructions(db: &Db, task: i64) -> usize {
+        db.list_events(Some(task), 100).unwrap().iter().filter(|e| e.kind == "instruction").count()
+    }
+
+    #[test]
+    fn owner_answer_waits_for_the_undo_window() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (m, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", None, 1000).unwrap();
+        assert_eq!(held.run_at, 1000 + UNDO_SECS);
+        assert_eq!(instructions(&db, m), 0);
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::WaitingAnswer);
+        assert!(deliveries(&db, 1000 + UNDO_SECS - 1).is_empty());
+        let want = vec![Action::DeliverAnswer { question_id: q, event_id: held.event_id }];
+        assert_eq!(deliveries(&db, 1000 + UNDO_SECS), want);
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        assert_eq!(db.get_task(m).unwrap().unwrap().status, TaskStatus::Open);
+        assert!(deliveries(&db, 2000).is_empty());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        let log = client_state::read_log(data.path(), "acme", 50).unwrap();
+        assert_eq!(log.matches(&format!("Owner answered Q{q}")).count(), 1);
+    }
+
+    #[test]
+    fn codex_limit_text_never_uses_up_a_seat() {
+        let limited = || RunOutcome { session_id: None, result_text: Some("Claude AI usage limit reached|1700000000".into()), is_error: true, exit_ok: false };
+        assert!(seat_used_up(Cli::Claude, &Ok(limited())));
+        assert!(!seat_used_up(Cli::Codex, &Ok(limited())));
+        assert!(!seat_used_up(Cli::Codex, &Err(anyhow::anyhow!("429 rate_limit_error"))));
+    }
+
+    #[tokio::test]
+    async fn within_reports_a_timeout() {
+        let slow = within(std::time::Duration::from_millis(10), async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(())
+        });
+        assert!(slow.await.unwrap_err().is::<TimedOut>());
+        assert_eq!(within(std::time::Duration::from_secs(1), async { Ok(7) }).await.unwrap(), 7);
+    }
+
+    #[test]
+    fn cancel_and_deliver_racing_close_each_answer_once() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let mut held_ids = vec![];
+        for _ in 0..20 {
+            let (_, q) = waiting_member(&db, c, "owner");
+            held_ids.push(answer_with_undo(&db, q, "yes", None, 0).unwrap().event_id);
+        }
+        let db = std::sync::Arc::new(db);
+        let (d1, d2, ids1, ids2, path) = (db.clone(), db.clone(), held_ids.clone(), held_ids.clone(), data.path().to_path_buf());
+        let a = std::thread::spawn(move || ids1.iter().for_each(|id| deliver_held(&d1, &path, *id).unwrap()));
+        let b = std::thread::spawn(move || ids2.iter().for_each(|id| { cancel_held(&d2, *id, 1).unwrap(); }));
+        a.join().unwrap();
+        b.join().unwrap();
+        let closes = db.events_of_kinds(&["approval_cancelled", "approval_delivered"]).unwrap();
+        for id in held_ids {
+            let n = closes.iter().filter(|e| e.payload["event_id"].as_i64() == Some(id)).count();
+            assert_eq!(n, 1, "approval {id} closed {n} times");
+        }
+    }
+
+    #[test]
+    fn cancel_inside_the_window_reopens_and_blocks_delivery() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (m, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", Some("r"), 1000).unwrap();
+        let back = cancel_held(&db, held.event_id, 1005).unwrap().unwrap();
+        assert_eq!((back.status, back.answer, back.why), (QuestionStatus::Open, None, None));
+        assert!(deliveries(&db, 5000).is_empty());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert_eq!(instructions(&db, m), 0);
+        assert!(cancel_held(&db, held.event_id, 1006).unwrap().is_none());
+        assert!(client_state::read_log(data.path(), "acme", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_after_delivery_or_window_is_refused() {
+        let (db, c) = setup();
+        let data = tempfile::tempdir().unwrap();
+        let (_, q) = waiting_member(&db, c, "owner");
+        let held = answer_with_undo(&db, q, "yes", None, 1000).unwrap();
+        assert!(cancel_held(&db, held.event_id, 1000 + UNDO_SECS).unwrap().is_none());
+        deliver_held(&db, data.path(), held.event_id).unwrap();
+        assert!(cancel_held(&db, held.event_id, 1001).unwrap().is_none());
+        assert_eq!(db.get_question(q).unwrap().unwrap().status, QuestionStatus::Answered);
+    }
+
+    #[test]
+    fn held_answer_on_a_top_level_task_does_not_wake_the_lead() {
+        let (db, c) = setup();
+        let top = mk(&db, c, None, TaskStatus::WaitingAnswer);
+        let q = db.create_ladder_question(top.id, Role::Lead, "owner", &[], "which db?").unwrap();
+        let held = answer_with_undo(&db, q.id, "sqlite", None, 1000).unwrap();
+        let wakes = |now| plan_tick_at(&db, &HashSet::new(), now).unwrap().into_iter().filter(|a| matches!(a, Action::StartLead { .. })).count();
+        assert_eq!(wakes(1001), 0);
+        db.add_event(Some(top.id), "scheduler", "approval_delivered", &json!({"event_id": held.event_id})).unwrap();
+        assert_eq!(wakes(1001), 1);
+    }
+
+    #[test]
+    fn non_owner_answers_deliver_at_once() {
+        let (db, c) = setup();
+        let (m, q) = waiting_member(&db, c, "lead");
+        answer_question(&db, q, "go", None, "lead").unwrap();
+        assert_eq!(instructions(&db, m), 1);
+        assert!(pending_approvals(&db).unwrap().is_empty());
+    }
 }
+

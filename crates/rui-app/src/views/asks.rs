@@ -56,16 +56,18 @@ pub fn ask_card<V: 'static>(a: &ChatAsk, inputs: &AskInputs, on_answer: OnAnswer
     let done = a.status == "answered";
     let st = if done { &th.done } else { &th.wait };
     let icon = if done { "icons/check.svg" } else { "icons/hand.svg" };
-    let mark = svg().path(icon).size(px(15.)).flex_none().text_color(st.fg);
-    let question = div().flex_1().min_w_0().font_weight(FontWeight::SEMIBOLD).child(markdown::render(&a.text, st.fg, 13., &th));
-    let head = div().flex().items_start().gap(px(8.)).child(mark).child(question);
+    // A plain block like a chat bubble, icon in the left margin: in a flex column gpui kept
+    // the card one line per paragraph tall and long text spilled over the next card.
+    let mark = svg().path(icon).absolute().left_0().top(px(2.)).size(px(15.)).text_color(st.fg);
+    let question = div().font_weight(FontWeight::SEMIBOLD).child(markdown::render(&a.text, st.fg, 13., &th));
+    let head = div().relative().pl(px(23.)).child(mark).child(question);
     let foot = match (done, a.answer.as_ref()) {
         (true, Some(answer)) => div().flex().child(tag(&th.done, answer)),
         (true, None) => div(),
         _ => answer_row(a, inputs, on_answer, cx),
     };
-    let card = div().id(eid("ask-card", a.id)).flex().flex_col().gap(px(12.)).p(px(16.)).max_w(px(660.));
-    card.rounded(px(9.)).bg(st.dim).border_1().border_color(st.rim).child(head).child(foot).into_any_element()
+    let card = div().id(eid("ask-card", a.id)).max_w(px(660.)).p(px(16.));
+    card.rounded(px(9.)).bg(st.dim).border_1().border_color(st.rim).child(head).child(foot.mt(px(12.))).into_any_element()
 }
 
 fn answer_row<V: 'static>(a: &ChatAsk, inputs: &AskInputs, on_answer: OnAnswer<V>, cx: &mut Context<V>) -> gpui::Div {

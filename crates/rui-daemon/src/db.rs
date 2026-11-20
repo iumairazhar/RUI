@@ -18,6 +18,16 @@ const EVENT_COLS: &str = "id, task_id, chat_id, agent, kind, payload, created_at
 const CHAT_COLS: &str = "id, chat_id, role, content, created_at";
 const QUESTION_COLS: &str = "id, task_id, asked_by, text, answer, status, created_at, level, ladder, why";
 
+/// One `result` event's spend, as read for the cost report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultCost {
+    pub task_id: Option<i64>,
+    pub created_at: String,
+    pub usd: f64,
+    pub tokens: i64,
+    pub seat_id: Option<String>,
+}
+
 /// Handle to the SQLite database, safe to share across threads.
 pub struct Db {
     conn: Mutex<Connection>,
@@ -169,6 +179,11 @@ fn event_from_row(r: &Row) -> rusqlite::Result<Event> {
         payload: serde_json::from_str(&payload).map_err(|e| bad(5, e.to_string()))?,
         created_at: r.get(6)?,
     })
+}
+
+/// Task or event ids as a SQL list body. Integers only, so safe to inline.
+fn id_list(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
 /// Fill `depends_on` for each task from `task_deps`.
@@ -482,6 +497,16 @@ impl Db {
         fetch_question(&conn, id)
     }
 
+    /// Clear a question's answer and reason and mark it open again. None if the id does not exist.
+    pub fn reopen_question(&self, id: i64) -> Result<Option<Question>> {
+        let conn = self.conn()?;
+        let sql = "UPDATE questions SET answer = NULL, why = NULL, status = 'open' WHERE id = ?1";
+        if conn.execute(sql, [id])? == 0 {
+            return Ok(None);
+        }
+        fetch_question(&conn, id)
+    }
+
     // ---- chat ----
 
     /// Create an empty chat with the default title.
@@ -589,7 +614,7 @@ impl Db {
                 params![chat_title(content), chat_id, DEFAULT_CHAT_TITLE],
             )?;
         }
-        Ok(fetch_chat_message(&conn, id)?.ok_or_else(|| anyhow!("message vanished"))?)
+        fetch_chat_message(&conn, id)?.ok_or_else(|| anyhow!("message vanished"))
     }
 
     /// One chat message by id.
@@ -686,6 +711,108 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql)?;
         Ok(stmt.query_map(params![after_id, task_id, limit], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---- thread reads (read-only, scoped to a set of task ids) ----
+
+    /// Events of the given tasks and kinds with id > `after_id`, oldest first, at most `limit`.
+    pub fn events_for_tasks(&self, ids: &[i64], kinds: &[&str], after_id: i64, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let marks = vec!["?"; kinds.len()].join(",");
+        let sql = format!(
+            "SELECT {EVENT_COLS} FROM events WHERE task_id IN ({}) AND kind IN ({marks}) AND id > {after_id} \
+             ORDER BY id LIMIT {limit}",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map(rusqlite::params_from_iter(kinds.iter()), event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The events with these ids, oldest first.
+    pub fn events_by_ids(&self, ids: &[i64]) -> Result<Vec<Event>> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {EVENT_COLS} FROM events WHERE id IN ({}) ORDER BY id", id_list(ids));
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt.query_map([], event_from_row)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Epoch seconds of the newest activity per task: its newest event (heartbeat
+    /// bookkeeping like `stalled` and `heartbeat` does not count), or its own update.
+    pub fn last_activity(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT t.id, CAST(strftime('%s', MAX(t.updated_at, \
+               COALESCE((SELECT MAX(created_at) FROM events WHERE task_id = t.id \
+               AND kind NOT IN ('stalled', 'heartbeat')), t.updated_at))) AS INTEGER) \
+             FROM tasks t WHERE t.id IN ({})",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter_map(|(id, t)| Some((id, t?))).collect())
+    }
+
+    /// Sum of `total_cost_usd` over the `result` events of each task.
+    pub fn cost_by_task(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, f64>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT task_id, SUM(COALESCE(json_extract(payload, '$.total_cost_usd'), 0)) FROM events \
+             WHERE kind = 'result' AND task_id IN ({}) GROUP BY task_id",
+            id_list(ids)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every `result` event since `since` (an ISO time) as (task_id, created_at, usd, tokens, seat_id).
+    /// Tokens add up input, output and both cache counts from the result's `usage`.
+    pub fn result_costs_since(&self, since: &str) -> Result<Vec<ResultCost>> {
+        let conn = self.conn()?;
+        let tok = |k: &str| format!("COALESCE(json_extract(payload, '$.usage.{k}'), 0)");
+        let sql = format!(
+            "SELECT task_id, created_at, COALESCE(json_extract(payload, '$.total_cost_usd'), 0), {} + {} + {} + {}, \
+             json_extract(payload, '$.seat_id') FROM events WHERE kind = 'result' AND created_at >= ?1 ORDER BY id",
+            tok("input_tokens"), tok("output_tokens"), tok("cache_read_input_tokens"), tok("cache_creation_input_tokens")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(ResultCost { task_id: r.get(0)?, created_at: r.get(1)?, usd: r.get(2)?, tokens: r.get(3)?, seat_id: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Cost of one seat's turns since `since` (an ISO time), and when the oldest of them ran.
+    pub fn seat_usage_since(&self, seat_id: &str, since: &str) -> Result<(f64, Option<String>)> {
+        let conn = self.conn()?;
+        let sql = "SELECT COALESCE(SUM(COALESCE(json_extract(payload, '$.total_cost_usd'), 0)), 0), MIN(created_at) \
+                   FROM events WHERE kind = 'result' AND json_extract(payload, '$.seat_id') = ?1 AND created_at >= ?2";
+        Ok(conn.query_row(sql, params![seat_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
+    /// Highest event id among these tasks, or 0.
+    pub fn max_event_id(&self, ids: &[i64]) -> Result<i64> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT COALESCE(MAX(id), 0) FROM events WHERE task_id IN ({})", id_list(ids));
+        Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+    }
+
+    /// The newest `story` line of these tasks, else the newest `log_decision` line.
+    pub fn latest_story_line(&self, ids: &[i64]) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let list = id_list(ids);
+        let story = format!("SELECT json_extract(payload, '$.line') FROM events WHERE task_id IN ({list}) AND kind = 'story' ORDER BY id DESC LIMIT 1");
+        let logged = format!(
+            "SELECT json_extract(payload, '$.args.line') FROM events WHERE task_id IN ({list}) AND kind = 'tool_call' \
+             AND json_extract(payload, '$.tool') = 'log_decision' ORDER BY id DESC LIMIT 1"
+        );
+        for sql in [story, logged] {
+            let line: Option<Option<String>> = conn.query_row(&sql, [], |r| r.get(0)).optional()?;
+            if let Some(l) = line.flatten() {
+                return Ok(Some(l));
+            }
+        }
+        Ok(None)
     }
 
     /// How often each skill was installed in the last `days` days, from `skill_used` events.

@@ -14,6 +14,13 @@ use rui_core::TaskStatus;
 
 const RESUME_TEXT: &str = "Resume where you left off.";
 
+/// The thread's story, one line under the header.
+fn story_line(story: Option<&str>, th: &Theme) -> Option<AnyElement> {
+    let s = story.filter(|s| !s.trim().is_empty())?;
+    let line = div().id("task-story").px(px(40.)).pt(px(8.)).truncate().text_size(px(12.5)).text_color(th.fg_2);
+    Some(line.child(s.to_string()).into_any_element())
+}
+
 impl ThreadsView {
     /// The whole page for one task, replacing the board.
     pub(super) fn task_page(&mut self, t: &Thread, all: &[Thread], now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -30,7 +37,9 @@ impl ThreadsView {
             self.last_len = sig;
             self.scroll.scroll_to_bottom();
         }
+        let flow = self.store.read(cx).thread_cache.get(&t.task.id).cloned().filter(|_| t.task.parent_id.is_none());
         let body = match self.tab {
+            Tab::Flow => section("Flow", vec![self.flow(flow.as_ref(), th, cx)]),
             Tab::Trace => {
                 let mut items = self.trace_rows(&rows, th, cx);
                 items.extend(live.as_ref().map(|l| live_row(l, th)));
@@ -45,10 +54,13 @@ impl ThreadsView {
         let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
         let face = character(char_state(&t.task.status, live.as_ref()), px(58.), ("task-rui", t.task.id as usize), th.client_color(t.task.client_id), th);
         let head = self.page_head(t, now, face, th, cx);
+        let story = flow.as_ref().and_then(|f| story_line(f.story.as_deref(), th));
         let strip = self.team_strip(t, all, th, cx);
-        let tabs = div().id("task-tabs-wrap").px(px(40.)).pt(px(16.)).child(self.tabs(!results.is_empty(), th, cx));
-        let page = div().id("task-page").flex().flex_col().size_full();
-        page.child(self.back_button(th, cx)).child(head).children(strip).child(tabs).child(scroll).children(composer).into_any_element()
+        let has_flow = t.task.parent_id.is_none();
+        let tabs = div().id("task-tabs-wrap").px(px(40.)).pt(px(16.)).child(self.tabs(has_flow, !results.is_empty(), th, cx));
+        let inspector = self.inspector_view(flow.as_ref(), th, cx);
+        let page = div().id("task-page").relative().flex().flex_col().size_full().child(self.back_button(th, cx)).child(head);
+        page.children(story).children(strip).child(tabs).child(scroll).children(composer).children(inspector).into_any_element()
     }
 
     fn back_button(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {

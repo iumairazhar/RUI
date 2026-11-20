@@ -60,6 +60,34 @@ pub fn stop_one(db: &Db, runs: &Runs, id: i64, by: &str, source: Option<&str>, r
     load(db, id)
 }
 
+/// Where the owner does a taken-over step by hand.
+#[derive(Debug, serde::Serialize)]
+pub struct TakeOver {
+    pub task: Task,
+    pub worktree: Option<String>,
+    pub branch: String,
+}
+
+/// Stops a subtask's agent without marking it stuck and hands the step to the owner.
+/// A stuck team is resumed so the step can finish once it is handed back.
+pub fn take_over(db: &Db, runs: &Runs, data_dir: &std::path::Path, id: i64) -> Res<TakeOver> {
+    let task = load(db, id)?;
+    if task.parent_id.is_none() || task.status == TaskStatus::Done {
+        return Err(ControlError::Conflict("only an unfinished subtask can be taken over".into()));
+    }
+    if crate::scheduler::owner_hold(db, id)? == Some("takeover") {
+        return Err(ControlError::Conflict("this step is already taken over".into()));
+    }
+    abort_run(runs, id);
+    db.set_task_status(id, TaskStatus::Open)?;
+    resume_chain(db, id, "owner")?;
+    let wt = crate::scheduler::subtask_worktree(data_dir, id);
+    let worktree = wt.exists().then(|| wt.to_string_lossy().into_owned());
+    let branch = task.branch.clone().unwrap_or_else(|| crate::worktree::branch_name(id));
+    db.add_event(Some(id), "owner", "taken_over", &json!({"worktree": worktree, "branch": branch}))?;
+    Ok(TakeOver { task: load(db, id)?, worktree, branch })
+}
+
 /// Stops a task and, when it has subtasks, every subtask that is not done. Returns the stopped ids.
 pub fn stop_tree(db: &Db, runs: &Runs, id: i64, by: &str, source: Option<&str>, reason: Option<&str>) -> Res<Vec<i64>> {
     let task = load(db, id)?;
@@ -85,12 +113,13 @@ pub fn drop_task(db: &Db, runs: &Runs, id: i64) -> Res<Vec<i64>> {
 }
 
 /// Records the owner's verdict on landed work. "changes" sends the text back to the Lead.
-pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) -> Res<Task> {
+pub fn review(db: &Db, runs: &Runs, data_dir: &std::path::Path, id: i64, verdict: &str, text: Option<&str>) -> Res<Task> {
     let task = load(db, id)?;
     if task.status != TaskStatus::Done || task.parent_id.is_some() {
         return Err(ControlError::Conflict("only finished top-level tasks can be reviewed".into()));
     }
     if verdict == "ok" {
+        land_approved(db, data_dir, &task)?;
         db.add_event(Some(id), "owner", "reviewed", &json!({"verdict": "ok", "by": "owner"}))?;
         return load(db, id);
     }
@@ -99,6 +128,30 @@ pub fn review(db: &Db, runs: &Runs, id: i64, verdict: &str, text: Option<&str>) 
     db.add_event(Some(id), "owner", "reviewed", &json!({"verdict": "changes"}))?;
     queue_instruction(db, runs, &task, text, "owner")?;
     load(db, id)
+}
+
+/// Merges an approved task's branch into the base branch, for repos with no remote.
+fn land_approved(db: &Db, data_dir: &std::path::Path, task: &Task) -> Res<()> {
+    let Some(branch) = task.branch.as_deref() else { return Ok(()) };
+    let client = db.get_client(task.client_id)?.ok_or_else(|| ControlError::NotFound("client not found".into()))?;
+    let repo = crate::scheduler::expand_home(&client.repo_path);
+    if crate::worktree::has_remote(&repo) {
+        return Ok(());
+    }
+    let message = format!("rui: task {}: {}", task.id, task.title);
+    let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+    match crate::worktree::land(&repo, branch, &base, &message) {
+        Err(e) => Err(ControlError::Conflict(format!("could not merge: {e:#}"))),
+        Ok(crate::worktree::LandResult::Merged) => {
+            db.add_event(Some(task.id), "owner", "landed", &json!({"branch": branch}))?;
+            crate::deploy::request(db, data_dir, task, None)?;
+            Ok(())
+        }
+        Ok(crate::worktree::LandResult::Conflict(files)) => {
+            db.add_event(Some(task.id), "owner", "land_failed", &json!({"files": files}))?;
+            Err(ControlError::Conflict(format!("could not merge: conflict in {}", files.join(", "))))
+        }
+    }
 }
 
 /// Pushes one task into `todo`, if it is stuck, and remembers it in `changed`.
@@ -147,6 +200,37 @@ pub fn resume_chain(db: &Db, id: i64, by: &str) -> Res<Vec<Task>> {
     Ok(changed)
 }
 
+/// Checks the range and stores a subtask's new loop limit. Shared by the Lead's tool and the owner's button.
+pub fn apply_limit(db: &Db, task_id: i64, max_loops: i64) -> anyhow::Result<()> {
+    if !(1..=20).contains(&max_loops) {
+        anyhow::bail!("max_loops must be between 1 and 20");
+    }
+    db.set_max_loops(task_id, max_loops)
+}
+
+/// True when the newest cause that stopped the task is its loop limit.
+fn stuck_on_limit(db: &Db, task: &Task) -> Res<bool> {
+    const CAUSES: [&str; 5] = ["loop_limit", "stopped", "agent_error", "scheduler_error", "land_failed"];
+    let evs = db.events_for_tasks(&[task.id], &CAUSES, 0, i64::MAX)?;
+    Ok(task.status == TaskStatus::Stuck && evs.last().is_some_and(|e| e.kind == "loop_limit"))
+}
+
+/// The owner raises or lowers a subtask's loop limit. A subtask stuck on its limit that now has
+/// loops left goes back to open, and its stuck team is resumed.
+pub fn set_limit(db: &Db, id: i64, max_loops: i64) -> Res<Task> {
+    let task = load(db, id)?;
+    if task.parent_id.is_none() {
+        return Err(ControlError::Conflict("only a subtask has a loop limit".into()));
+    }
+    apply_limit(db, id, max_loops).map_err(|e| ControlError::Conflict(e.to_string()))?;
+    db.add_event(Some(id), "owner", "limit_set", &json!({"max_loops": max_loops, "by": "owner"}))?;
+    if stuck_on_limit(db, &task)? && max_loops > task.loops_used {
+        db.set_task_status(id, TaskStatus::Open)?;
+        resume_chain(db, id, "owner")?;
+    }
+    load(db, id)
+}
+
 /// "Resuming A and B so C can continue.", or None when nothing was resumed.
 fn resume_note(changed: &[Task], task: &Task) -> Option<String> {
     let names: Vec<&str> = changed.iter().map(|t| t.title.as_str()).collect();
@@ -179,6 +263,17 @@ pub fn instruct(db: &Db, runs: &Runs, id: i64, text: &str, by: &str) -> Res<(Tas
     queue_instruction(db, runs, &task, text, by)?;
     let changed = resume_chain(db, id, by)?;
     Ok((load(db, id)?, resume_note(&changed, &task)))
+}
+
+/// Wakes the Lead of a finished top-level task with an instruction, like feedback on its PR.
+/// Same path as `instruct`, but a done task is allowed: it goes back to new for a Lead turn.
+pub fn wake_lead(db: &Db, runs: &Runs, id: i64, text: &str, by: &str) -> Res<Task> {
+    let task = load(db, id)?;
+    if task.parent_id.is_some() || task.role != Role::Lead {
+        return Err(ControlError::Conflict("only a top-level Lead task can be woken".into()));
+    }
+    queue_instruction(db, runs, &task, text, by)?;
+    load(db, id)
 }
 
 #[cfg(test)]
@@ -303,17 +398,43 @@ mod tests {
     fn review_and_drop() {
         let (db, runs) = (Db::open_test(), Runs::default());
         let (parent, subs) = pod(&db);
-        assert!(matches!(review(&db, &runs, parent.id, "ok", None), Err(ControlError::Conflict(_))));
+        assert!(matches!(review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "ok", None), Err(ControlError::Conflict(_))));
         db.set_task_status(parent.id, TaskStatus::Done).unwrap();
-        assert!(matches!(review(&db, &runs, parent.id, "changes", Some(" ")), Err(ControlError::Conflict(_))));
-        review(&db, &runs, parent.id, "changes", Some("shorter")).unwrap();
+        assert!(matches!(review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "changes", Some(" ")), Err(ControlError::Conflict(_))));
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "changes", Some("shorter")).unwrap();
         assert_eq!(db.get_task(parent.id).unwrap().unwrap().status, TaskStatus::New);
         assert_eq!(db.pending_instructions(parent.id).unwrap().len(), 1);
         db.set_task_status(parent.id, TaskStatus::Done).unwrap();
-        review(&db, &runs, parent.id, "ok", None).unwrap();
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), parent.id, "ok", None).unwrap();
         assert_eq!(db.events_of_kinds(&["reviewed"]).unwrap().len(), 2);
         let ids = drop_task(&db, &runs, subs[0].id).unwrap();
         assert_eq!(ids, [subs[0].id]);
         assert_eq!(db.events_of_kinds(&["dropped"]).unwrap().len(), 1);
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn approving_lands_task_branch_in_local_repo() {
+        let (db, runs) = (Db::open_test(), Runs::default());
+        let repo = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        git_ok(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"]);
+        let c = db.create_client("c", &repo.path().to_string_lossy(), None, &[]).unwrap();
+        let t = task(&db, c.id, None, Role::Lead, TaskStatus::Done);
+        let (wt, branch) = crate::worktree::ensure_task_worktree(repo.path(), wts.path(), t.id, "main").unwrap();
+        std::fs::write(wt.join("feature.txt"), "f").unwrap();
+        assert!(crate::worktree::commit_all(&wt, "work").unwrap());
+        db.set_task_branch(t.id, &branch).unwrap();
+        assert!(!repo.path().join("feature.txt").exists());
+        review(&db, &runs, std::path::Path::new("/nonexistent-data"), t.id, "ok", None).unwrap();
+        assert!(repo.path().join("feature.txt").exists());
+        assert_eq!(db.events_of_kinds(&["landed"]).unwrap().len(), 1);
     }
 }

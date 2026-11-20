@@ -1,9 +1,13 @@
 //! Threads: the board of agent threads, with a full task page for the open one.
 
+mod flow;
+mod inspector;
 mod task_page;
 mod team_view;
 mod teams;
 mod timeline;
+
+pub use timeline::local_offset;
 
 use super::live::live_action;
 use super::trace::{DiffKind, DiffLine, Detail, Kind, TraceRow, parse_diff, touched_files};
@@ -14,10 +18,11 @@ use team_view::Phase;
 use timeline::ROWS;
 use teams::can_stop;
 use super::section::{Sec, section_top};
-use super::status::{self, Word, word_of};
+use super::status::{self, Word, thread_word, word_of};
 use super::{chip, markdown, primary_button, tag};
+use super::decision::{self, CardEvent, Cards};
 use super::results::row_meta;
-use crate::api::{Change, LiveSnapshot, LiveState, ResultFile};
+use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
 use crate::store::{self, Store};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Status, Theme, theme};
@@ -48,6 +53,12 @@ fn tool_use_part(block: &Value) -> String {
     let name = name.strip_prefix("mcp__rui__").unwrap_or(name);
     let input = if block["input"].is_null() { String::new() } else { block["input"].to_string() };
     format!("→ {name}({})", truncate(&input, 80))
+}
+
+/// True for an assistant turn with no text and no tool use (for example only thinking):
+/// it has nothing to show.
+pub fn is_empty_turn(e: &Event) -> bool {
+    e.kind == "assistant" && !content_blocks(&e.payload).iter().any(|b| b["type"] == "text" || b["type"] == "tool_use")
 }
 
 fn summarize_assistant(payload: &Value) -> String {
@@ -203,8 +214,10 @@ struct Thread {
     pod_line: Option<String>,
     /// The task's status word, from the daemon.
     word: Word,
-    /// The daemon's one-line reason for the word.
+    /// The daemon's one-line reason for the word (the thread's story on a board card).
     reason: String,
+    /// Open needs-you items in the thread; set only on board cards.
+    needs: usize,
 }
 
 fn threads_of(s: &Store) -> Vec<Thread> {
@@ -225,12 +238,36 @@ fn thread_of(s: &Store, t: &Task, question: Option<(i64, String)>) -> Thread {
         pod_line: pod_line(t, &s.roles),
         word: word_of(&s.states, t.id),
         reason: s.states.get(&t.id).map_or(String::new(), |o| o.reason.clone()),
+        needs: 0,
     }
+}
+
+/// Board cards, one per thread from `GET /threads`, in the daemon's order.
+fn board_threads(s: &Store) -> Vec<Thread> {
+    s.threads.iter().filter_map(|sum| board_thread(s, sum)).collect()
+}
+
+/// A thread summary as a card; skipped until its task has loaded too (the page needs it).
+fn board_thread(s: &Store, sum: &ThreadSummary) -> Option<Thread> {
+    let task = s.tasks.iter().find(|t| t.id == sum.id)?;
+    let mut t = thread_of(s, task, None);
+    t.client = sum.client.name.clone();
+    t.word = board_word(word_of(&s.states, sum.id), &sum.state);
+    t.reason = sum.story.clone().unwrap_or_default();
+    t.needs = sum.needs_you_count;
+    Some(t)
+}
+
+/// The thread's word, except a task the app already shows as Stopped stays Stopped
+/// (the daemon reports a stopped thread as done).
+fn board_word(task_word: Word, state: &str) -> Word {
+    if task_word == Word::Stopped { Word::Stopped } else { thread_word(state) }
 }
 
 /// Tab of the task page.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
+    Flow,
     Trace,
     Changes,
     Files,
@@ -285,6 +322,12 @@ pub struct ThreadsView {
     stopping: HashMap<i64, Instant>,
     /// The "Stop every running team?" confirm is open.
     confirm_all: bool,
+    /// The Flow node open in the inspector.
+    inspect: Option<inspector::Inspect>,
+    /// Note sent with "Hand back".
+    note: Entity<TextInput>,
+    /// Decision cards for the Home strip and the inspector.
+    cards: Cards,
 }
 
 impl ThreadsView {
@@ -298,7 +341,9 @@ impl ThreadsView {
         let scroll = ScrollHandle::new();
         let (bands, moves, seen) = (HashMap::new(), HashMap::new(), HashSet::new());
         let expanded = HashSet::new();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false }
+        let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
+        cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default() }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -312,13 +357,57 @@ impl ThreadsView {
         self.stop_open = false;
         self.abandon_armed = false;
         self.why.update(cx, |i, cx| i.clear(cx));
-        self.set_tab(Tab::Trace);
+        let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
+        self.set_tab(if top { Tab::Flow } else { Tab::Trace });
         self.file = None;
+        self.inspect = None;
         self.auto_results = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.status == TaskStatus::Done);
         self.expanded.clear();
         self.input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.load_changes(Some(id), cx));
+        self.store.update(cx, |s, cx| {
+            s.load_changes(Some(id), cx);
+            s.watch_thread(top.then_some(id), cx);
+        });
         cx.notify();
+    }
+
+    /// A decision card asked to open its thread, on its node or on the Changes tab.
+    fn on_card(&mut self, ev: &CardEvent, cx: &mut Context<Self>) {
+        match ev {
+            CardEvent::Open { thread_id, node_id } => {
+                self.open_thread(*thread_id, cx);
+                self.inspect(*thread_id, node_id.clone(), cx);
+            }
+            CardEvent::Review { thread_id } => self.show_changes(*thread_id, cx),
+        }
+    }
+
+    /// Open a task page on its Changes tab.
+    pub fn show_changes(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.open_thread(id, cx);
+        self.set_tab(Tab::Changes);
+    }
+
+    /// Every needs-you decision across threads, highest risk first, plus answers still being sent.
+    fn needs_cards(&self, cx: &Context<Self>) -> Vec<decision::CardData> {
+        let s = self.store.read(cx);
+        let ids: Vec<i64> = s.threads.iter().filter(|t| t.needs_you_count > 0).map(|t| t.id).collect();
+        let cards = ids.iter().filter_map(|id| s.thread_cache.get(id)).flat_map(decision::decisions_of).collect();
+        let mut cards = decision::with_sending(cards, s, |_| true);
+        decision::sort_cards(&mut cards);
+        cards
+    }
+
+    /// The Home strip above the board: one compact card per decision.
+    fn needs_strip(&mut self, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let data = self.needs_cards(cx);
+        if data.is_empty() {
+            return None;
+        }
+        let cards: Vec<AnyElement> = data.iter().map(|d| self.cards.get(d, true, &self.store, Self::on_card, cx).into_any_element()).collect();
+        let head = div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child("Needs you");
+        let row = div().flex().flex_wrap().gap(px(10.)).children(cards);
+        Some(div().id("needs-strip").flex().flex_col().gap(px(8.)).pt(px(16.)).mr(px(40.)).child(head).child(row).into_any_element())
     }
 
     fn toggle_row(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -360,7 +449,11 @@ impl ThreadsView {
         self.open = None;
         self.stop_open = false;
         self.abandon_armed = false;
-        self.store.update(cx, |s, cx| s.load_changes(None, cx));
+        self.inspect = None;
+        self.store.update(cx, |s, cx| {
+            s.load_changes(None, cx);
+            s.watch_thread(None, cx);
+        });
         cx.notify();
     }
 
@@ -419,20 +512,16 @@ impl ThreadsView {
         (events, s.changes.get(&id).cloned().unwrap_or_default())
     }
 
-    /// One agent card: avatar, "Agent · task", "Client · reason · elapsed", and the seat mark when running.
+    /// One thread card: avatar, title with its needs-you count, then "● Client · word · story · elapsed".
     fn row(&self, t: &Thread, now: i64, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let id = t.task.id;
         let color = th.client_color(t.task.client_id);
         let ring = if self.open == Some(id) { th.accent_text } else { gpui::transparent_black() };
         let live = self.store.read(cx).live.task(id).cloned();
         let state = if live.is_some() { char_state(&t.task.status, live.as_ref()) } else { status::char_state(t.word) };
-        let reason = live.as_ref().map_or_else(|| t.reason.clone(), live_sub);
-        let parts = [t.client.clone(), reason, elapsed(&t.task.updated_at, now)];
-        let sub = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
-        let title = format!("{} \u{b7} {}", t.name, t.task.title);
-        let name = div().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
-        let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(title);
-        let text = div().flex().flex_col().flex_1().min_w_0().child(name).child(muted_line(sub, th).mt(px(2.)));
+        let story = live.as_ref().map_or_else(|| t.reason.clone(), live_sub);
+        let sub = card_sub(t, story, now, color, th);
+        let text = div().flex().flex_col().flex_1().min_w_0().child(card_title(t, th)).child(sub.mt(px(2.)));
         let group = SharedString::from(format!("thread-card-{id}"));
         let hover = th.surface_2;
         let row = div()
@@ -490,8 +579,9 @@ impl ThreadsView {
         ghosts.into_iter().map(|t| leave(self.row(t, now, th, cx), ("thread-out", t.task.id as usize))).collect()
     }
 
-    fn tabs(&self, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut tabs = vec![(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")];
+    fn tabs(&self, has_flow: bool, has_results: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut tabs = if has_flow { vec![(Tab::Flow, "Flow")] } else { vec![] };
+        tabs.extend([(Tab::Trace, "Trace"), (Tab::Changes, "Changes"), (Tab::Files, "Files")]);
         if has_results {
             tabs.push((Tab::Results, "Results"));
         }
@@ -913,6 +1003,22 @@ fn pulse_dot(id: impl Into<gpui::ElementId>, th: &Theme) -> impl IntoElement {
     dot.with_animation(id, anim, move |el, delta| el.opacity(wave(delta)))
 }
 
+/// Card title, with a "N need you" tag when the thread has open items.
+fn card_title(t: &Thread, th: &Theme) -> Div {
+    let name = div().flex_1().min_w_0().text_ellipsis().overflow_hidden().whitespace_nowrap().text_size(px(12.5));
+    let name = name.font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(t.task.title.clone());
+    let needs = (t.needs > 0).then(|| tag(&th.block, &format!("{} need you", t.needs)).flex_none());
+    div().flex().items_center().gap(px(6.)).child(name).children(needs)
+}
+
+/// Card sub line: client dot and name, status word, story, time since the last update.
+fn card_sub(t: &Thread, story: String, now: i64, color: Hsla, th: &Theme) -> Div {
+    let parts = [t.client.clone(), t.word.label().to_string(), story, elapsed(&t.task.updated_at, now)];
+    let text = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
+    let dot = div().flex_none().size(px(7.)).rounded_full().bg(color);
+    div().flex().items_center().gap(px(5.)).min_w_0().child(dot).child(muted_line(text, th).flex_1().min_w_0())
+}
+
 fn muted_line(text: String, th: &Theme) -> Div {
     div().truncate().text_size(px(11.)).text_color(th.muted).child(text)
 }
@@ -1059,21 +1165,25 @@ fn lead_line(working: usize, needs: usize, th: &Theme) -> AnyElement {
 impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let th = theme(cx).clone();
+        // Cards come from /threads; the task page, chart and lead line still read every task.
         let threads = threads_of(self.store.read(cx));
-        self.track_moves(&threads);
+        let cards = board_threads(self.store.read(cx));
+        self.track_moves(&cards);
         self.prune_stopping(cx);
         let now = now_secs();
         let (running, needs) = lead_counts(self.store.read(cx), &threads);
-        let bands = self.bands(&threads);
-        let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &threads, now, &th, cx)).into();
-        self.seen.extend(threads.iter().map(|t| t.task.id));
-        let chart = self.chart(&threads, now, &th, cx);
+        let bands = self.bands(&cards);
+        let columns: Vec<AnyElement> = ROWS.map(|(c, _)| self.column(c, &bands[&c], &cards, now, &th, cx)).into();
+        self.seen.extend(cards.iter().map(|t| t.task.id));
+        let mut chart = self.chart(&threads, now, &th, cx);
+        chart.counts = ROWS.map(|(c, _)| bands[&c].len());
         let open = self.open.and_then(|id| threads.iter().find(|t| t.task.id == id).cloned());
         if let Some(t) = open {
             return self.task_page(&t, &threads, now, &th, cx);
         }
         let board = div().id("threads-board").flex().gap(px(12.)).mr(px(40.)).pt(px(16.)).pb(px(28.)).children(columns);
-        let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll();
+        let strip = self.needs_strip(&th, cx);
+        let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll().children(strip);
         // Tasks first; the four-hour chart sits below them.
         let body = body.child(board).child(timeline::view(chart, &th));
         let confirm = self.confirm_view(&th, cx);
@@ -1193,6 +1303,13 @@ mod tests {
         let s = LiveState { tool: Some("Bash".into()), tool_input: r#"{"command":"cargo te"#.into(), ..Default::default() };
         assert_eq!(live_sub(&s), "Running cargo te\u{2026}");
         assert_eq!(live_sub(&LiveState { thinking: true, ..Default::default() }), "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn board_word_keeps_stopped() {
+        assert_eq!(board_word(Word::Stopped, "done"), Word::Stopped);
+        assert_eq!(board_word(Word::Working, "needs_you"), Word::NeedsYou);
+        assert_eq!(board_word(Word::Waiting, "stalled"), Word::Waiting);
     }
 
     #[test]

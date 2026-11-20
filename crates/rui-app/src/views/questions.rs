@@ -1,23 +1,25 @@
 //! Inbox: a compact list of what needs the owner; a row opens a drawer to read it and answer.
 
 use super::asks::AskInputs;
+use super::decision::{self, CardEvent, Cards, first_line};
 use super::character::{CharState, character};
 use super::library::{after_slide, close_button, drawer_shell, scroll_body, scrim, slide_overlay};
 use super::motion::rise;
 use super::status::{Word, char_state, style};
+use super::inbox::{is_snoozed, item_key};
+use super::inbox_kinds as kinds;
 use super::{chip, markdown, page_head, primary_button, tag};
 use crate::api::InboxItem;
-use crate::store::{self, Store};
+use crate::store::{self, ItemKey, Store, now_secs};
 use crate::text_input::{Submit, TextInput};
 use crate::theme::{Theme, theme};
 use gpui::{
     AnyElement, Context, Div, Entity, FocusHandle, FontWeight, Hsla, KeyDownEvent, Stateful, Window, div,
     prelude::*, px,
 };
-use rui_core::{ChatAsk, Question, QuestionStatus, Rung, Task};
+use rui_core::{ChatAsk, Question, QuestionStatus, Task};
 use std::collections::HashMap;
 
-const WHY_HINT: &str = "Why \u{2014} this becomes a lesson in the Playbook, so the team doesn\u{2019}t ask again";
 const ASK_SUB: &str = "Rui \u{b7} asked in chat";
 const NONE_TEXT: &str = "Nothing needs you right now.";
 
@@ -36,8 +38,8 @@ type InputKey = (&'static str, i64);
 /// Open questions and asks as rows; the open one slides in as a drawer.
 pub struct QuestionsView {
     store: Entity<Store>,
-    inputs: HashMap<i64, Entity<TextInput>>,
-    whys: HashMap<i64, Entity<TextInput>>,
+    /// Decision cards for question drawers.
+    cards: Cards,
     ask_inputs: AskInputs,
     /// Inputs of the stuck, review and fallback-question drawers.
     notes: HashMap<InputKey, Entity<TextInput>>,
@@ -54,34 +56,12 @@ pub struct QuestionsView {
     want_focus: bool,
 }
 
-/// The ladder as (who, why) rungs, ending with "You" and no reason.
-pub fn ladder_parts(ladder: &[Rung]) -> Vec<(String, Option<String>)> {
-    let rungs = ladder.iter().map(|r| (r.who.clone(), Some(r.why.clone())));
-    rungs.chain([("You".to_string(), None)]).collect()
-}
-
-/// "Backend Engineer 7 · which db? → Lead · unsure → You".
-#[cfg(test)]
-pub fn ladder_text(ladder: &[Rung]) -> String {
-    let rung = |(who, why): (String, Option<String>)| match why {
-        Some(w) => format!("{who} \u{b7} {w}"),
-        None => who,
-    };
-    ladder_parts(ladder).into_iter().map(rung).collect::<Vec<_>>().join(" \u{2192} ")
-}
-
 /// Text after the bold count in the lead line.
 fn lead_tail(n: usize) -> &'static str {
     match n {
         1 => " item needs you.",
         _ => " items need you.",
     }
-}
-
-/// First non-empty line of a question, without markdown marks.
-fn first_line(text: &str) -> String {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    line.chars().filter(|c| !"#*_".contains(*c)).collect::<String>().trim().to_string()
 }
 
 fn lead_line(n: usize, th: &Theme) -> Stateful<Div> {
@@ -93,41 +73,17 @@ fn lead_line(n: usize, th: &Theme) -> Stateful<Div> {
     base.child(bold).child(lead_tail(n))
 }
 
-/// One rung: bold who, then the reason.
-fn rung_chip(who: String, why: Option<String>, th: &Theme) -> Div {
-    let who = div().font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(who);
-    let chip = div().flex().gap(px(5.)).px(px(9.)).py(px(4.)).rounded(px(7.)).max_w(px(560.));
-    let chip = chip.bg(th.fg.opacity(0.08)).text_size(px(11.)).text_color(th.muted).child(who);
-    chip.children(why.map(|w| format!("\u{b7} {w}")))
-}
-
-fn ladder_row(q: &Question, th: &Theme) -> Div {
-    let parts = ladder_parts(&q.ladder);
-    let last = parts.len() - 1;
-    let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
-    for (i, (who, why)) in parts.into_iter().enumerate() {
-        row = row.child(rung_chip(who, why, th));
-        if i != last {
-            row = row.child(div().text_size(px(11.)).text_color(th.muted.opacity(0.6)).child("\u{2192}"));
-        }
-    }
-    row
-}
-
-/// Where a question came from: its task, client name and the agent that asked.
+/// Where a question came from: its task and the agent that asked.
 struct Origin {
     task: Option<Task>,
-    client: Option<String>,
     agent: String,
 }
 
 impl Origin {
     fn new(q: &Question, s: &Store) -> Self {
         let task = s.tasks.iter().find(|t| t.id == q.task_id).cloned();
-        let client = task.as_ref().and_then(|t| s.clients.iter().find(|c| c.id == t.client_id));
-        let client = client.map(|c| c.name.clone());
         let agent = task.as_ref().and_then(|t| t.agent.clone()).unwrap_or_else(|| "Pod Lead".to_string());
-        Self { task, client, agent }
+        Self { task, agent }
     }
 
     fn color(&self, th: &Theme) -> Hsla {
@@ -147,16 +103,26 @@ impl QuestionsView {
     /// Build the questions view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let (inputs, whys) = (HashMap::new(), HashMap::new());
         let focus = cx.focus_handle();
         Self {
-            store, inputs, whys, ask_inputs: AskInputs::default(), notes: HashMap::new(), reveal: false, confirm_drop: false, open: None, closing: false, pick: None, focus, want_focus: false,
+            store, cards: Cards::default(), ask_inputs: AskInputs::default(), notes: HashMap::new(), reveal: false, confirm_drop: false, open: None, closing: false, pick: None, focus, want_focus: false,
         }
     }
 
     // ---- opening and closing ----
 
+    /// Open the drawer for an inbox item by kind and id (from the Inbox slide-over).
+    pub fn open_kind(&mut self, kind: &str, id: i64, cx: &mut Context<Self>) {
+        if let Some((open, ..)) = kind_parts(kind, id) {
+            self.open_item(open, cx);
+        }
+    }
+
     fn open_item(&mut self, item: Open, cx: &mut Context<Self>) {
+        if let Open::Question(qid) = item {
+            let top = decision::question_thread(self.store.read(cx), qid);
+            self.store.update(cx, |s, cx| top.into_iter().for_each(|id| s.load_thread(id, cx)));
+        }
         (self.open, self.closing, self.pick, self.want_focus) = (Some(item), false, None, true);
         (self.reveal, self.confirm_drop) = (false, false);
         cx.notify();
@@ -194,45 +160,6 @@ impl QuestionsView {
         }
     }
 
-    // ---- answering ----
-
-    fn sync_inputs(&mut self, open: &[&Question], cx: &mut Context<Self>) {
-        self.inputs.retain(|id, _| open.iter().any(|q| q.id == *id));
-        self.whys.retain(|id, _| open.iter().any(|q| q.id == *id));
-        for q in open {
-            if !self.inputs.contains_key(&q.id) {
-                let input = self.new_input("Your answer...", q.id, cx);
-                self.inputs.insert(q.id, input);
-            }
-            if !self.whys.contains_key(&q.id) {
-                let why = self.new_input(WHY_HINT, q.id, cx);
-                self.whys.insert(q.id, why);
-            }
-        }
-    }
-
-    fn new_input(&self, hint: &'static str, id: i64, cx: &mut Context<Self>) -> Entity<TextInput> {
-        let input = cx.new(|cx| TextInput::new(hint, cx));
-        cx.subscribe(&input, move |this, _, _: &Submit, cx| this.answer(id, cx)).detach();
-        input
-    }
-
-    fn answer(&mut self, id: i64, cx: &mut Context<Self>) {
-        let (Some(input), Some(why)) = (self.inputs.get(&id).cloned(), self.whys.get(&id).cloned()) else { return };
-        let (text, reason) = (input.read(cx).content(), why.read(cx).content());
-        if text.trim().is_empty() {
-            return;
-        }
-        if reason.trim().is_empty() {
-            self.store.update(cx, |s, cx| s.show_toast("Add your reason first", vec![], cx));
-            return;
-        }
-        input.update(cx, |i, cx| i.clear(cx));
-        why.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.answer(id, text, Some(reason), cx));
-        self.close(cx);
-    }
-
     /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
     fn answer_ask(&mut self, id: i64, text: Option<String>, cx: &mut Context<Self>) {
         let typed = || self.ask_inputs.take(id, cx);
@@ -258,10 +185,32 @@ impl QuestionsView {
         rise(row, (r.rise, n), i).into_any_element()
     }
 
+    /// Drawer rows for kinds that open a drawer; the rest are acted on right in their card.
     fn rows(&self, items: &[InboxItem], cx: &mut Context<Self>) -> Vec<AnyElement> {
         let th = theme(cx).clone();
-        let rows: Vec<Row> = items.iter().filter_map(|it| self.item_row(it, &th, cx)).collect();
-        rows.into_iter().enumerate().map(|(i, r)| self.row(i, r, cx)).collect()
+        let mut out = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            let el = match self.item_row(it, &th, cx) {
+                Some(r) => self.row(i, r, cx),
+                None => self.inline_card(i, it, &th, cx),
+            };
+            out.push(el);
+        }
+        out
+    }
+
+    /// An item with its buttons in the row: undo, checkpoint, seats, Coach, Scout, inputs and unknown kinds.
+    fn inline_card(&self, i: usize, it: &InboxItem, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (word, st) = kinds::tag_of(kinds::kind_of(&it.kind), th);
+        let title = div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis();
+        let title = title.text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child(first_line(&it.title));
+        let top = div().flex().items_center().gap(px(8.)).child(title).child(tag(st, word));
+        let reason = kinds::reason(it).map(|r| div().text_size(px(11.5)).text_color(th.muted).child(r));
+        let buttons = kinds::act_buttons("inbox", i, it, &self.store, cx);
+        let buttons = (!buttons.is_empty()).then(|| div().flex().flex_wrap().gap(px(8.)).children(buttons));
+        let card = div().id(("inbox-item", i)).flex().flex_col().gap(px(8.)).px(px(14.)).py(px(11.)).mb(px(6.));
+        let card = card.rounded(px(10.)).bg(th.surface).child(top).children(reason).children(kinds::body(it, th)).children(buttons);
+        rise(card, ("inbox-item-rise", i), i).into_any_element()
     }
 
     fn item_row(&self, it: &InboxItem, th: &Theme, cx: &Context<Self>) -> Option<Row> {
@@ -283,6 +232,12 @@ fn kind_parts(kind: &str, id: i64) -> Option<(Open, &'static str, &'static str, 
         "review" => (Open::Review(id), "inbox-r", "inbox-r-rise", "Review", Word::Done),
         _ => return None,
     })
+}
+
+/// Items that are not snoozed, as the slide-over shows them.
+fn awake(items: &[InboxItem], snoozed: &HashMap<ItemKey, i64>) -> Vec<InboxItem> {
+    let now = now_secs();
+    items.iter().filter(|it| !is_snoozed(snoozed, &item_key(it), now)).cloned().collect()
 }
 
 /// What one list row shows.
@@ -347,19 +302,25 @@ impl QuestionsView {
     }
 
     fn question_drawer(&mut self, id: i64, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let found = self.store.read(cx).questions.iter().find(|q| q.id == id && q.status == QuestionStatus::Open).cloned();
-        let Some(q) = found else { return self.question_fallback(id, th, cx) };
-        let o = Origin::new(&q, self.store.read(cx));
-        let eyebrow = format!("{} \u{b7} needs a decision", o.client.clone().unwrap_or_else(|| "General".into()));
-        let head = self.drawer_head(eyebrow, first_line(&q.text), th, cx);
-        let text = markdown::render(&q.text, th.fg, 13., th);
-        let body = vec![ladder_row(&q, th).into_any_element(), text, self.thread_section(&o, th, cx)];
+        let Some(data) = decision::question_card(self.store.read(cx), id) else { return self.question_fallback(id, th, cx) };
+        let q = self.store.read(cx).questions.iter().find(|q| q.id == id).cloned();
+        let head = self.drawer_head("Inbox".into(), "Needs a decision".into(), th, cx);
+        let card = self.cards.get(&data, false, &self.store, Self::on_card, cx);
+        let mut body = vec![card.into_any_element()];
+        body.extend(q.map(|q| self.thread_section(&Origin::new(&q, self.store.read(cx)), th, cx)));
         let body = scroll_body("inbox-drawer-scroll", body);
-        let fields = vec![Self::field(self.inputs.get(&id).cloned(), th), Self::field(self.whys.get(&id).cloned(), th)];
-        let send = primary_button("inbox-send", "Send answer", cx).on_click(cx.listener(move |this, _, _, cx| this.answer(id, cx)));
-        let hint = format!("Goes back down to {}.", if o.task.is_some() { o.agent.as_str() } else { "the Pod" });
-        let foot = self.composer(fields, send.into_any_element(), Some(hint), th);
-        Some(drawer_shell("inbox-drawer", th).child(head).child(body).child(foot).into_any_element())
+        Some(drawer_shell("inbox-drawer", th).child(head).child(body).into_any_element())
+    }
+
+    fn on_card(&mut self, ev: &CardEvent, cx: &mut Context<Self>) {
+        match ev {
+            CardEvent::Open { thread_id, .. } => self.open_thread(Some(*thread_id), cx),
+            CardEvent::Review { thread_id } => {
+                (self.open, self.closing) = (None, false);
+                let id = *thread_id;
+                self.store.update(cx, |s, cx| s.open_changes(id, cx));
+            }
+        }
     }
 
     fn thread_section(&self, o: &Origin, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -541,13 +502,11 @@ impl Render for QuestionsView {
         }
         let (questions, asks, inbox) = {
             let s = self.store.read(cx);
-            (s.questions.clone(), s.asks.clone(), s.inbox.clone())
+            (s.questions.clone(), s.asks.clone(), awake(&s.inbox, &s.snoozed))
         };
         let th = theme(cx).clone();
         let open_asks: Vec<&ChatAsk> = asks.iter().filter(|a| a.status == "open").collect();
         self.ask_inputs.sync(&open_asks, Self::answer_ask, cx);
-        let open: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Open).collect();
-        self.sync_inputs(&open, cx);
         let answered: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Answered).rev().take(10).collect();
         let rows = self.rows(&inbox, cx);
         let body = div().id("questions-scroll").flex_1().min_h_0().overflow_y_scroll().flex().flex_col();
@@ -565,28 +524,9 @@ impl Render for QuestionsView {
 mod tests {
     use super::*;
 
-    fn rung(who: &str, why: &str) -> Rung {
-        Rung { who: who.into(), why: why.into() }
-    }
-
-    #[test]
-    fn ladder_ends_with_you() {
-        let ladder = [rung("Backend Engineer 7", "which db?"), rung("Lead", "unsure")];
-        assert_eq!(ladder_text(&ladder), "Backend Engineer 7 \u{b7} which db? \u{2192} Lead \u{b7} unsure \u{2192} You");
-        let parts = ladder_parts(&ladder);
-        assert_eq!((parts.len(), parts[2].clone()), (3, ("You".into(), None)));
-        assert_eq!(ladder_text(&[]), "You");
-    }
-
     #[test]
     fn lead_tail_is_singular_for_one() {
         assert!(lead_tail(1).starts_with(" item needs"));
         assert!(lead_tail(3).starts_with(" items need"));
-    }
-
-    #[test]
-    fn first_line_strips_markdown() {
-        assert_eq!(first_line("\n## **Use** _Postgres_?\nmore"), "Use Postgres?");
-        assert_eq!(first_line(""), "");
     }
 }

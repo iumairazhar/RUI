@@ -4,11 +4,12 @@ use super::status::{Word, word_of};
 use crate::api::OwnerState;
 use std::collections::HashMap;
 use super::card;
+use super::client_knowledge::ClientDrawer;
 use super::character::{CharState, character};
 use super::section::{Sec, section_top};
 use crate::store::StoreHandle;
 use crate::theme::{Theme, theme};
-use gpui::{AnyElement, App, Div, FontWeight, div, prelude::*, px};
+use gpui::{AnyElement, App, Div, Entity, FontWeight, div, prelude::*, px};
 use rui_core::{Client, Task};
 
 /// Top-level tasks of a client.
@@ -59,6 +60,13 @@ fn stats(c: [usize; 4], th: &Theme) -> Div {
     div().flex().flex_col().gap(px(4.)).children(kvs)
 }
 
+/// Clicking a card opens the client's drawer.
+fn clickable(card: AnyElement, c: &Client, drawer: &Entity<ClientDrawer>) -> AnyElement {
+    let (id, name, drawer) = (c.id, c.name.clone(), drawer.clone());
+    let open = move |_: &gpui::ClickEvent, _: &mut gpui::Window, cx: &mut App| drawer.update(cx, |d, cx| d.open(id, name.clone(), cx));
+    div().id(("client-open", c.id as usize)).cursor_pointer().on_click(open).child(card).into_any_element()
+}
+
 fn client_card(c: &Client, tasks: &[Task], states: &HashMap<i64, OwnerState>, cx: &App) -> AnyElement {
     let th = theme(cx);
     let n = counts(c.id, tasks, states);
@@ -82,15 +90,17 @@ pub fn folder_name(path: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The Clients tab of the Clients section; `add` is the "+ Add client" button.
-pub fn page(add: AnyElement, cx: &App) -> AnyElement {
+/// The Clients tab of the Clients section; `add` is the "+ Add client" button, `drawer` opens on a card click.
+pub fn page(add: AnyElement, drawer: &Entity<ClientDrawer>, cx: &App) -> AnyElement {
     let store = cx.global::<StoreHandle>().0.read(cx);
-    let cards: Vec<AnyElement> = store.clients.iter().map(|c| client_card(c, &store.tasks, &store.states, cx)).collect();
+    let card = |c: &Client| clickable(client_card(c, &store.tasks, &store.states, cx), c, drawer);
+    let cards: Vec<AnyElement> = store.clients.iter().map(card).collect();
     let grid = div().id("clients-grid").flex().flex_wrap().gap(px(12.)).pb(px(28.)).children(cards);
     let scroll = div().id("clients-scroll").flex_1().min_h_0().overflow_y_scroll().child(grid);
     let lead = div().id("clients-lead").text_size(px(14.)).text_color(theme(cx).fg_2).child(lead_text(store.clients.len()));
     let top = section_top(Sec::Clients, Some(lead.into_any_element()), Some(add), cx);
-    div().id("clients-page").flex().flex_col().size_full().pr(px(40.)).child(top).child(scroll).into_any_element()
+    let page = div().id("clients-page").flex().flex_col().size_full().pr(px(40.)).child(top).child(scroll);
+    div().relative().size_full().child(page).child(drawer.clone()).into_any_element()
 }
 
 #[cfg(test)]

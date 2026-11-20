@@ -2,14 +2,19 @@
 //!
 //! Tool logic lives in plain functions (`logic` module) so it can be unit
 //! tested without MCP. The rmcp handlers below are thin wrappers.
-//! Agent identity comes from HTTP headers (`X-Rui-Task-Id`, `X-Rui-Source-Ref`)
-//! read from the request parts rmcp injects into the tool call.
+//! Every request must carry a live per-run token (`x-rui-run-token`, see `run_tokens.rs`) issued
+//! for that route's server. Agent identity comes only from that token's grant, which the auth
+//! layer puts into the request parts rmcp injects into the tool call.
 
 use crate::apps::{self, AppSpec, Apps};
 use crate::db::{Db, NewTask};
 use crate::roster;
+use crate::run_tokens::{self, RunGrant, Server};
 use crate::scheduler::{self, Runs};
-use axum::http::request::Parts;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, request::Parts};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
@@ -27,22 +32,52 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-/// Who is calling: read from the agent's HTTP headers.
+/// Who is calling: taken from the run token's grant.
 #[derive(Debug, Clone, Default)]
 pub struct Ctx {
     pub task_id: Option<i64>,
     pub source_ref: Option<String>,
 }
 
-/// Builds the router with `/mcp/rui`, `/mcp/lead` and `/mcp/builder`.
+/// Builds the router with `/mcp/rui`, `/mcp/lead`, `/mcp/builder`, `/mcp/scout` and `/mcp/coach`.
+/// Each route only accepts a run token granted for its own server.
 pub fn mcp_router(db: Arc<Db>, data_dir: PathBuf, apps: Apps, runs: Runs) -> axum::Router {
     axum::Router::new()
-        .nest_service("/mcp/rui", service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs)))
-        .nest_service("/mcp/lead", service(LeadServer::new(db.clone(), data_dir.clone())))
-        .nest_service("/mcp/builder", service(BuilderServer::new(db, data_dir)))
+        .merge(guarded("/mcp/rui", Server::Rui, service(RuiServer::new(db.clone(), data_dir.clone(), apps, runs))))
+        .merge(guarded("/mcp/lead", Server::Lead, service(LeadServer::new(db.clone(), data_dir.clone()))))
+        .merge(guarded("/mcp/builder", Server::Builder, service(BuilderServer::new(db.clone(), data_dir.clone()))))
+        .merge(guarded("/mcp/scout", Server::Scout, service(crate::support_mcp::ScoutServer::new(db.clone()))))
+        .merge(guarded("/mcp/coach", Server::Coach, service(crate::support_mcp::CoachServer::new(db, data_dir))))
 }
 
-fn service<S: ServerHandler + Clone + Send + 'static>(
+/// `svc` at `path`, behind the run token check for `server`.
+fn guarded<S: ServerHandler + Clone + Send + 'static>(
+    path: &str,
+    server: Server,
+    svc: StreamableHttpService<S, LocalSessionManager>,
+) -> axum::Router {
+    axum::Router::new()
+        .nest_service(path, svc)
+        .layer(middleware::from_fn_with_state(server, require_run_token))
+}
+
+/// 401 unless the request carries a live run token granted for `server`. The grant is stored in
+/// the request extensions, where `ctx_from` reads it.
+async fn require_run_token(State(server): State<Server>, mut req: Request, next: Next) -> Response {
+    let Some(grant) = grant_for(req.headers(), server) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    req.extensions_mut().insert(grant);
+    next.run(req).await
+}
+
+fn grant_for(headers: &axum::http::HeaderMap, server: Server) -> Option<RunGrant> {
+    let token = headers.get(run_tokens::HEADER)?.to_str().ok()?;
+    let grant = run_tokens::global().grant(token)?;
+    (grant.server == server).then_some(grant)
+}
+
+pub(crate) fn service<S: ServerHandler + Clone + Send + 'static>(
     server: S,
 ) -> StreamableHttpService<S, LocalSessionManager> {
     let config = StreamableHttpServerConfig::default()
@@ -52,25 +87,28 @@ fn service<S: ServerHandler + Clone + Send + 'static>(
     StreamableHttpService::new(move || Ok(server.clone()), Default::default(), config)
 }
 
-fn ctx_from(parts: &Parts) -> Ctx {
-    let header = |name: &str| {
-        let v = parts.headers.get(name)?.to_str().ok()?.trim();
-        (!v.is_empty()).then(|| v.to_string())
-    };
-    Ctx {
-        task_id: header("x-rui-task-id").and_then(|v| v.parse().ok()),
-        source_ref: header("x-rui-source-ref"),
-    }
+/// The caller's identity from the run token's grant. Request headers are never trusted.
+pub(crate) fn ctx_from(parts: &Parts) -> Ctx {
+    let Some(grant) = parts.extensions.get::<RunGrant>() else { return Ctx::default() };
+    Ctx { task_id: grant.task_id, source_ref: grant.source_ref.clone() }
 }
 
-fn finish(res: anyhow::Result<Value>) -> CallToolResult {
+/// Runs blocking logic (git, a done_command precheck) off the async runtime.
+async fn blocking<F>(f: F) -> anyhow::Result<Value>
+where
+    F: FnOnce() -> anyhow::Result<Value> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| Err(anyhow::anyhow!("task failed: {e}")))
+}
+
+pub(crate) fn finish(res: anyhow::Result<Value>) -> CallToolResult {
     match res {
         Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
         Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
     }
 }
 
-fn info() -> ServerConfig {
+pub(crate) fn info() -> ServerConfig {
     ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
 }
 
@@ -90,32 +128,56 @@ pub struct CreateClientArgs {
     pub allowed_commands: Option<Vec<String>>,
 }
 
+/// Arguments for `create_client`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct NewClientArgs {
+    /// Unique client name.
+    pub name: String,
+    /// Absolute path (or ~/...) of an existing git repo. Omit to start a fresh project.
+    pub repo_path: Option<String>,
+    /// Command that runs the repo's tests.
+    pub test_command: Option<String>,
+    /// Shell commands builders may run in this repo.
+    pub allowed_commands: Option<Vec<String>>,
+}
+
+/// One role in a Pod.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct PodRoleArg {
+    /// Role name, e.g. "backend". Never "lead".
+    pub role: String,
+    /// Extra skills for this role on top of the role's own.
+    pub skills: Option<Vec<String>>,
+}
+
+/// Arguments for `set_up_pod`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SetUpPodArgs {
+    /// Client name.
+    pub client: String,
+    /// The roles of the Pod.
+    pub roles: Vec<PodRoleArg>,
+    /// Paths the Pod must not change; keeps the current list when omitted.
+    pub protected: Option<Vec<String>>,
+}
+
 /// Arguments for the rui `create_task`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateTaskArgs {
-    /// Name of an existing client.
-    pub client_name: String,
+    /// Client name. Omit for general work; it goes to the Internal client.
+    pub client: Option<String>,
     /// Short task title.
     pub title: String,
-    /// Full task description.
-    pub body: String,
-}
-
-/// Arguments for `staff_task`.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct StaffTaskArgs {
-    /// Project name for client work. An existing project is reused; an unknown name creates a new one. Omit for a general task.
-    pub project: Option<String>,
-    /// Short task title.
-    pub title: String,
-    /// What the owner wants, in full. The Lead and every member see it.
+    /// What the owner wants, in full. The Account Lead and every member see it.
     pub brief: String,
-    /// Role names to staff, e.g. ["backend", "tester"]. Do not include "lead"; it is added automatically.
-    pub pod: Vec<String>,
-    /// Apps to run for this project. Always pass these for anything runnable.
+    /// Apps to run for this client. Always pass these for anything runnable.
     pub apps: Option<Vec<AppSpec>>,
+    /// Optional subset of the client's Pod roles for this task (at most 3).
+    pub roles: Option<Vec<String>>,
 }
 
 /// Arguments for `run_apps` and `stop_apps`.
@@ -182,10 +244,13 @@ pub struct CreateSubtaskArgs {
     pub title: String,
     /// Full instructions for the member.
     pub job: String,
-    /// Command that must pass for the subtask to be done; defaults to the client's test command.
-    pub done_command: Option<String>,
+    /// Shell command that exits 0 only when this job is really done. It must fail now.
+    pub done_command: String,
     /// Ids of sibling subtasks that must finish first.
     pub depends_on: Option<Vec<i64>>,
+    /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
+    #[serde(default)]
+    pub allow_paths: Option<Vec<String>>,
 }
 
 /// Arguments for the member's `report_progress`.
@@ -214,6 +279,14 @@ pub struct AskLeadArgs {
     pub question: String,
 }
 
+/// Arguments for `ask_scout`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AskScoutArgs {
+    /// What the Scout should research or diagnose. Be specific.
+    pub question: String,
+}
+
 /// Arguments for `rule`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -227,13 +300,22 @@ pub struct RuleArgs {
 }
 
 /// Arguments for `escalate` and `escalate_to_owner`.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EscalateArgs {
     /// Id of the question to pass up.
     pub question_id: i64,
     /// Why you cannot decide it.
     pub why: String,
+    /// low, medium or high.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// Whether the owner's choice can be undone.
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// 2 to 5 short steps that run after the owner approves.
+    #[serde(default)]
+    pub if_approved: Option<Vec<String>>,
 }
 
 /// Arguments for `set_limit`.
@@ -256,6 +338,58 @@ pub struct SetDoneArgs {
     pub done_command: String,
 }
 
+/// Arguments for `log_decision`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LogDecisionArgs {
+    /// One line: what happened and why.
+    pub line: String,
+}
+
+/// Arguments for the Account Lead's `send_back`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SendBackArgs {
+    /// Your own task id.
+    pub task_id: i64,
+    /// What the Pod must change.
+    pub remarks: String,
+    /// Pod role to do the changes; defaults to whoever did the last subtask.
+    pub agent: Option<String>,
+    /// Command that proves the requested changes. It must fail now.
+    pub done_command: String,
+    /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
+    #[serde(default)]
+    pub allow_paths: Option<Vec<String>>,
+}
+
+/// Arguments for the Account Lead's `forward_pr`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ForwardPrArgs {
+    /// Your own task id.
+    pub task_id: i64,
+    /// Your remarks for the owner: what was done and what to look at.
+    pub remarks: String,
+    /// low, medium or high.
+    #[serde(default)]
+    pub risk: Option<String>,
+    /// Whether the owner's choice can be undone.
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// 2 to 5 short steps that run after the owner approves.
+    #[serde(default)]
+    pub if_approved: Option<Vec<String>>,
+}
+
+/// Arguments for the Account Lead's `set_story`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SetStoryArgs {
+    /// One sentence, under 160 characters: where things stand and what is next.
+    pub line: String,
+}
+
 // ---- plain tool logic ----
 
 /// Tool logic as plain functions: `(&Db, &Ctx, args) -> Result<Value>`.
@@ -269,7 +403,7 @@ pub mod logic {
     }
 
     fn current_task(db: &Db, ctx: &Ctx) -> anyhow::Result<Task> {
-        let id = ctx.task_id.ok_or_else(|| anyhow::anyhow!("missing X-Rui-Task-Id header"))?;
+        let id = ctx.task_id.ok_or_else(|| anyhow::anyhow!("this run has no task"))?;
         db.get_task(id)?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
     }
 
@@ -299,7 +433,7 @@ pub mod logic {
     }
 
     /// Validates and registers a client; no audit record.
-    pub fn register_client(db: &Db, name: &str, repo_path: &str, test_command: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
+    pub fn register_client(db: &Db, data_dir: &Path, name: &str, repo_path: &str, test_command: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
         let name = name.trim();
         if name.is_empty() {
             anyhow::bail!("name must not be empty");
@@ -310,56 +444,120 @@ pub mod logic {
             anyhow::bail!("client '{name}' already exists");
         }
         let repo = path.to_string_lossy().into_owned();
-        Ok(db.create_client(name, &repo, test_command, allowed)?)
+        let client = db.create_client(name, &repo, test_command, allowed)?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, Some(false))?;
+        Ok(client)
     }
 
     /// Registers a client after validating its repo path and name.
-    pub fn create_client(db: &Db, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
+    pub fn create_client(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateClientArgs) -> anyhow::Result<Value> {
         let cmds = a.allowed_commands.clone().unwrap_or_default();
-        let client = register_client(db, &a.name, &a.repo_path, a.test_command.as_deref(), &cmds)?;
+        let client = register_client(db, data_dir, &a.name, &a.repo_path, a.test_command.as_deref(), &cmds)?;
         record(db, ctx, Role::Rui, "use_repo", &a)?;
         Ok(serde_json::to_value(client)?)
     }
 
-    /// Most specialists a pod may have, not counting the Lead.
-    const MAX_SPECIALISTS: usize = 3;
+    /// Existing client by name, or by the slug of the name.
+    fn find_client(db: &Db, name: &str) -> anyhow::Result<Option<rui_core::Client>> {
+        let name = name.trim();
+        let slug = crate::projects::slug(name);
+        for n in [name, slug.as_str()] {
+            if let Some(c) = db.get_client_by_name(n)? {
+                return Ok(Some(c));
+            }
+        }
+        Ok(None)
+    }
 
-    /// Checks the pod and returns it without duplicates.
-    fn validate_pod(data_dir: &Path, pod: &[String]) -> anyhow::Result<Vec<String>> {
-        if pod.is_empty() {
-            anyhow::bail!("pod must not be empty");
-        }
-        let mut clean: Vec<String> = Vec::new();
-        for name in pod.iter().map(|n| n.trim()) {
-            if name == "lead" {
-                anyhow::bail!("do not put 'lead' in the pod; it is added automatically");
-            }
-            if roster::load(data_dir, name).is_none() {
-                anyhow::bail!("unknown role '{name}'");
-            }
-            if !crate::library::is_on(data_dir, crate::library::Kind::Role, name) {
-                anyhow::bail!("role '{name}' is turned off");
-            }
-            if !clean.iter().any(|c| c == name) {
-                clean.push(name.to_string());
+    /// The client flagged internal in its client.json; created on first use. Never decided by name alone.
+    fn internal_client(db: &Db, data_dir: &Path) -> anyhow::Result<rui_core::Client> {
+        for c in db.list_clients()? {
+            if crate::client_state::read_client(data_dir, &c.name)?.is_some_and(|f| f.internal) {
+                return Ok(c);
             }
         }
-        if clean.len() > MAX_SPECIALISTS {
-            anyhow::bail!("Pods are capped at 3 specialists plus the Lead. Pick the smallest team; the owner can ask for more.");
+        let path = crate::projects::new_project(data_dir, "Internal")?;
+        let client = db.create_client("Internal", &path.to_string_lossy(), None, &[])?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, Some(true))?;
+        Ok(client)
+    }
+
+    /// Creates a client: registers an existing repo, or starts a fresh project when no repo_path is given.
+    pub fn new_client(db: &Db, data_dir: &Path, ctx: &Ctx, a: NewClientArgs) -> anyhow::Result<Value> {
+        let cmds = a.allowed_commands.clone().unwrap_or_default();
+        let test = a.test_command.as_deref();
+        let client = match a.repo_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(path) => register_client(db, data_dir, &a.name, path, test, &cmds)?,
+            None => fresh_client(db, data_dir, &a.name, test, &cmds)?,
+        };
+        record(db, ctx, Role::Rui, "create_client", &a)?;
+        Ok(serde_json::to_value(client)?)
+    }
+
+    fn fresh_client(db: &Db, data_dir: &Path, name: &str, test: Option<&str>, allowed: &[String]) -> anyhow::Result<rui_core::Client> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("name must not be empty");
+        }
+        if db.get_client_by_name(name)?.is_some() {
+            anyhow::bail!("client '{name}' already exists");
+        }
+        let path = crate::projects::new_project(data_dir, name)?;
+        let client = db.create_client(name, &path.to_string_lossy(), test, allowed)?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, Some(false))?;
+        Ok(client)
+    }
+
+    /// Checks one Pod role: not the lead, known, turned on, with known extra skills.
+    fn check_pod_role(data_dir: &Path, r: &PodRoleArg) -> anyhow::Result<crate::client_state::PodRole> {
+        let name = r.role.trim();
+        if name == "lead" {
+            anyhow::bail!("do not put 'lead' in the Pod; the Account Lead is always there");
+        }
+        if roster::load(data_dir, name).is_none() {
+            anyhow::bail!("unknown role '{name}'");
+        }
+        if !crate::library::is_on(data_dir, crate::library::Kind::Role, name) {
+            anyhow::bail!("role '{name}' is turned off");
+        }
+        let skills: Vec<String> = r.skills.clone().unwrap_or_default().iter().map(|s| s.trim().to_string()).collect();
+        if let Some(s) = skills.iter().find(|s| crate::skills::load(data_dir, s).is_none()) {
+            anyhow::bail!("unknown skill '{s}'");
+        }
+        Ok(crate::client_state::PodRole { role: name.to_string(), skills })
+    }
+
+    /// Checks all Pod roles and drops repeated roles.
+    fn check_pod_roles(data_dir: &Path, roles: &[PodRoleArg]) -> anyhow::Result<Vec<crate::client_state::PodRole>> {
+        if roles.is_empty() {
+            anyhow::bail!("roles must not be empty");
+        }
+        let mut clean: Vec<crate::client_state::PodRole> = Vec::new();
+        for r in roles {
+            let checked = check_pod_role(data_dir, r)?;
+            if !clean.iter().any(|c| c.role == checked.role) {
+                clean.push(checked);
+            }
         }
         Ok(clean)
     }
 
-    /// Existing client by name (or by the slug of the name), else a fresh git project.
-    fn project_client(db: &Db, data_dir: &Path, name: &str) -> anyhow::Result<rui_core::Client> {
-        let slug = crate::projects::slug(name);
-        for n in [name, slug.as_str()] {
-            if let Some(c) = db.get_client_by_name(n)? {
-                return Ok(c);
-            }
-        }
-        let path = crate::projects::new_project(data_dir, name)?;
-        db.create_client(&slug, &path.to_string_lossy(), None, &[])
+    /// Sets up (or replaces) a client's Pod.
+    pub fn set_up_pod(db: &Db, data_dir: &Path, ctx: &Ctx, a: SetUpPodArgs) -> anyhow::Result<Value> {
+        let client = match find_client(db, &a.client)? {
+            Some(c) => c,
+            None if a.client.trim().eq_ignore_ascii_case("internal") => internal_client(db, data_dir)?,
+            None => anyhow::bail!("client '{}' not found; create it first", a.client),
+        };
+        let roles = check_pod_roles(data_dir, &a.roles)?;
+        crate::client_state::ensure(data_dir, &client.name, &client.repo_path, None)?;
+        let kept = crate::client_state::read_pod(data_dir, &client.name)?;
+        let pod = crate::client_state::Pod { roles, protected: a.protected.clone().unwrap_or(kept.protected), cli: kept.cli };
+        crate::client_state::write_pod(data_dir, &client.name, &pod)?;
+        let names: Vec<&str> = pod.roles.iter().map(|r| r.role.as_str()).collect();
+        crate::client_state::append_decision(data_dir, &client.name, &format!("Pod set up: {} (by Rui)", names.join(", ")))?;
+        record(db, ctx, Role::Rui, "set_up_pod", &a)?;
+        Ok(serde_json::to_value(&pod)?)
     }
 
     fn write_apps(repo: &Path, apps: &[AppSpec]) -> anyhow::Result<()> {
@@ -369,16 +567,48 @@ pub mod logic {
         Ok(())
     }
 
-    /// Staffs a pod: creates the project if needed and a Lead parent task that the scheduler starts.
-    pub fn staff_task(db: &Db, data_dir: &Path, ctx: &Ctx, a: StaffTaskArgs) -> anyhow::Result<Value> {
+    /// The named client, or the Internal client when no name is given.
+    fn task_client(db: &Db, data_dir: &Path, name: Option<&str>) -> anyhow::Result<rui_core::Client> {
+        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+            return internal_client(db, data_dir);
+        };
+        find_client(db, name)?.ok_or_else(|| anyhow::anyhow!("client '{name}' not found; create it first"))
+    }
+
+    /// The Pod roles that work on one task: the requested subset, else the whole Pod (at most 3).
+    fn pick_roles(data_dir: &Path, client: &rui_core::Client, wanted: Option<&[String]>) -> anyhow::Result<Vec<String>> {
+        let pod: Vec<String> = crate::client_state::read_pod(data_dir, &client.name)?.roles.into_iter().map(|r| r.role).collect();
+        if pod.is_empty() {
+            let internal = crate::client_state::read_client(data_dir, &client.name)?.is_some_and(|f| f.internal);
+            if internal {
+                anyhow::bail!("the Internal client has no Pod; call set_up_pod(client=\"Internal\", ...)");
+            }
+            anyhow::bail!("client '{}' has no Pod; call set_up_pod first", client.name);
+        }
+        let mut chosen: Vec<String> = Vec::new();
+        for r in wanted.map(|w| w.iter().map(|r| r.trim().to_string()).collect()).unwrap_or_else(|| pod.clone()) {
+            if !pod.contains(&r) {
+                anyhow::bail!("role '{r}' is not in client {}'s Pod ({})", client.name, pod.join(", "));
+            }
+            if !chosen.contains(&r) {
+                chosen.push(r);
+            }
+        }
+        if chosen.len() > 3 {
+            anyhow::bail!("At most 3 Pod roles work on one task; pass roles to narrow it.");
+        }
+        Ok(chosen)
+    }
+
+    /// Creates a Lead parent task for a client (Internal when none is named) that the scheduler starts.
+    pub fn create_task(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateTaskArgs) -> anyhow::Result<Value> {
         if a.title.trim().is_empty() {
             anyhow::bail!("title must not be empty");
         }
-        let pod = validate_pod(data_dir, &a.pod)?;
-        let project = a.project.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("general");
-        let client = project_client(db, data_dir, project)?;
-        let mut full_pod = vec!["lead".to_string()];
-        full_pod.extend(pod);
+        let client = task_client(db, data_dir, a.client.as_deref())?;
+        let chosen = pick_roles(data_dir, &client, a.roles.as_deref())?;
+        let mut pod = vec!["lead".to_string()];
+        pod.extend(chosen.clone());
         let parent = db.create_task(&NewTask {
             client_id: client.id,
             parent_id: None,
@@ -391,13 +621,16 @@ pub mod logic {
             source_kind: SourceKind::Chat,
             source_ref: ctx.source_ref.clone(),
             agent: Some("lead".into()),
-            pod: full_pod.clone(),
+            pod: pod.clone(),
         })?;
         if let Some(apps) = a.apps.as_ref().filter(|x| !x.is_empty()) {
             write_apps(&expand_home(&client.repo_path), apps)?;
         }
-        record(db, ctx, Role::Rui, "staff_task", &a)?;
-        Ok(json!({"project": client.name, "repo_path": client.repo_path, "task_id": parent.id, "pod": full_pod}))
+        crate::client_state::append_brief(data_dir, &client.name, parent.id, &a.title, &a.brief)?;
+        let line = format!("Task {} created: {} (roles: {})", parent.id, a.title.trim(), chosen.join(", "));
+        crate::client_state::append_decision(data_dir, &client.name, &line)?;
+        record(db, ctx, Role::Rui, "create_task", &a)?;
+        Ok(json!({"client": client.name, "repo_path": client.repo_path, "task_id": parent.id, "pod": pod}))
     }
 
     /// Creates an open chat ask for the chat in `ctx`, enforcing the per-turn limit.
@@ -447,7 +680,9 @@ pub mod logic {
             return Ok(allow(&a.input));
         }
         let Some(command) = a.input["command"].as_str() else { return Ok(deny("no command")) };
-        let Some(reason) = crate::shell::danger(command) else { return Ok(allow(&a.input)) };
+        let Some(reason) = crate::shell::danger(command).or_else(|| owner_api_risk(data_dir, command)) else {
+            return Ok(allow(&a.input));
+        };
         let source = ctx.source_ref.as_deref().ok_or_else(|| anyhow::anyhow!("approve works only in a chat"))?;
         let chat_id = db.chat_id_for_source_ref(source)?.ok_or_else(|| anyhow::anyhow!("chat not found"))?;
         if let Some(path) = crate::shell::find_approval(data_dir, db, chat_id, command) {
@@ -455,6 +690,12 @@ pub mod logic {
             return Ok(allow(&a.input));
         }
         hold(db, data_dir, ctx, chat_id, command, reason)
+    }
+
+    /// Risk text when a command could read the owner token or call the owner API.
+    fn owner_api_risk(data_dir: &Path, command: &str) -> Option<&'static str> {
+        crate::owner_auth::touches_owner_api(command, data_dir, crate::owner_auth::port())
+            .then_some("touches the owner token, the data folder or the owner API")
     }
 
     /// Asks the owner about a dangerous command and denies it for now.
@@ -485,32 +726,6 @@ pub mod logic {
         Ok(json!({"task_id": t.id, "status": t.status, "note": note}))
     }
 
-    /// Creates a top-level lead task for an existing client.
-    pub fn create_task(db: &Db, ctx: &Ctx, a: CreateTaskArgs) -> anyhow::Result<Value> {
-        if a.title.trim().is_empty() {
-            anyhow::bail!("title must not be empty");
-        }
-        let client = db
-            .get_client_by_name(&a.client_name)?
-            .ok_or_else(|| anyhow::anyhow!("client '{}' not found", a.client_name))?;
-        let task = db.create_task(&NewTask {
-            client_id: client.id,
-            parent_id: None,
-            title: a.title.clone(),
-            body: a.body.clone(),
-            status: TaskStatus::New,
-            done_command: None,
-            max_loops: 5,
-            role: Role::Lead,
-            source_kind: SourceKind::Chat,
-            source_ref: ctx.source_ref.clone(),
-            agent: None,
-            pod: vec![],
-        })?;
-        record(db, ctx, Role::Rui, "create_task", &a)?;
-        Ok(serde_json::to_value(task)?)
-    }
-
     /// Latest done-check result for a task, or null if it never ran.
     fn last_check(db: &Db, task_id: i64) -> Value {
         let events = db.list_events(Some(task_id), 1000).unwrap_or_default();
@@ -522,7 +737,7 @@ pub mod logic {
     }
 
     /// Summarises clients with their tasks, plus open questions that wait for the owner.
-    pub fn report_status(db: &Db, apps: &Apps, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
+    pub fn report_status(db: &Db, data_dir: &Path, apps: &Apps, ctx: &Ctx, a: NoArgs) -> anyhow::Result<Value> {
         let tasks = db.list_tasks()?;
         let clients: Vec<Value> = db
             .list_clients()?
@@ -542,7 +757,9 @@ pub mod logic {
                     .filter(|x| x.project == c.name)
                     .map(|x| json!({"name": x.name, "url": x.url, "status": x.status}))
                     .collect();
-                json!({"id": c.id, "name": c.name, "tasks": ts, "apps": running})
+                let internal = crate::client_state::read_client(data_dir, &c.name).ok().flatten().is_some_and(|f| f.internal);
+                let pod: Vec<String> = crate::client_state::read_pod(data_dir, &c.name).unwrap_or_default().roles.into_iter().map(|r| r.role).collect();
+                json!({"id": c.id, "name": c.name, "internal": internal, "pod": pod, "tasks": ts, "apps": running})
             })
             .collect();
         let open: Vec<Value> = db
@@ -580,37 +797,173 @@ pub mod logic {
     /// Lead creates a member subtask under its own task.
     pub fn create_subtask(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateSubtaskArgs) -> anyhow::Result<Value> {
         let parent = current_task(db, ctx)?;
-        check_agent(data_dir, &parent, &a.agent)?;
-        let client = db
-            .get_client(parent.client_id)?
-            .ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
-        let done = a.done_command.clone().or(client.test_command);
-        let Some(done) = done.filter(|d| !d.trim().is_empty()) else {
-            anyhow::bail!("no done_command given and the client has no test_command");
-        };
         let deps = a.depends_on.clone().unwrap_or_default();
-        check_depends(db, parent.id, &deps)?;
-        let max_loops = roster::load(data_dir, &a.agent).map(|r| r.max_loops).unwrap_or(5);
+        let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, &a.done_command, &deps, &a.allow_paths.clone().unwrap_or_default())?;
+        record(db, ctx, Role::Lead, "create_subtask", &a)?;
+        let fresh = db.get_task(task.id)?.unwrap_or(task);
+        Ok(serde_json::to_value(fresh)?)
+    }
+
+    /// Validates and inserts an Open subtask of `parent` for pod member `agent`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_subtask(db: &Db, data_dir: &Path, parent: &Task, agent: &str, title: &str, job: &str, done: &str, deps: &[i64], allow: &[String]) -> anyhow::Result<Task> {
+        check_agent(data_dir, parent, agent)?;
+        check_allow(allow)?;
+        let done = done.trim();
+        if done.is_empty() {
+            anyhow::bail!("done_command must not be empty");
+        }
+        check_depends(db, parent.id, deps)?;
+        precheck_done(db, data_dir, parent, done)?;
+        let max_loops = roster::load(data_dir, agent).map(|r| r.max_loops).unwrap_or(5);
         let task = db.create_task(&NewTask {
             client_id: parent.client_id,
             parent_id: Some(parent.id),
-            title: a.title.clone(),
-            body: a.job.clone(),
+            title: title.to_string(),
+            body: job.to_string(),
             status: TaskStatus::Open,
-            done_command: Some(done),
+            done_command: Some(done.to_string()),
             max_loops,
             role: Role::Builder,
             source_kind: parent.source_kind,
             source_ref: Some(format!("task:{}", parent.id)),
-            agent: Some(a.agent.clone()),
+            agent: Some(agent.to_string()),
             pod: vec![],
         })?;
-        for d in &deps {
+        for d in deps {
             db.add_task_dep(task.id, *d)?;
         }
-        record(db, ctx, Role::Lead, "create_subtask", &a)?;
-        let fresh = db.get_task(task.id)?.unwrap_or(task);
-        Ok(serde_json::to_value(fresh)?)
+        record_grant(db, data_dir, parent, &task, allow)?;
+        Ok(task)
+    }
+
+    /// Each granted path must be a non-empty relative path with no `..` segment.
+    fn check_allow(allow: &[String]) -> anyhow::Result<()> {
+        for e in allow {
+            let e = e.trim();
+            if e.is_empty() || e.starts_with('/') || e.split('/').any(|s| s == "..") {
+                anyhow::bail!("allow_paths entry '{e}' must be a relative path inside the repo");
+            }
+            if e.chars().all(|c| matches!(c, '*' | '/')) {
+                anyhow::bail!("allow_paths entry '{e}' grants everything; name the specific paths");
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs a protected-path grant on the new subtask and in the client's decisions log.
+    fn record_grant(db: &Db, data_dir: &Path, parent: &Task, task: &Task, allow: &[String]) -> anyhow::Result<()> {
+        if allow.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<&str> = allow.iter().map(|e| e.trim()).collect();
+        db.add_event(Some(task.id), "lead", "paths_granted", &json!({"paths": paths}))?;
+        let line = format!("Task {} subtask {} ({}) may change protected paths: {}", parent.id, task.id, task.title, paths.join(", "));
+        log_client_decision(db, data_dir, parent, &line)
+    }
+
+    /// The Account Lead's own task, checked against `task_id`, with non-empty remarks.
+    fn own_task_for_review(db: &Db, ctx: &Ctx, task_id: i64, remarks: &str) -> anyhow::Result<Task> {
+        let task = current_task(db, ctx)?;
+        if task.id != task_id {
+            anyhow::bail!("you can only send back your own task {}", task.id);
+        }
+        if remarks.trim().is_empty() {
+            anyhow::bail!("remarks must not be empty");
+        }
+        Ok(task)
+    }
+
+    /// The done_command must fail on the task branch now, or it proves nothing.
+    fn precheck_done(db: &Db, data_dir: &Path, parent: &Task, cmd: &str) -> anyhow::Result<()> {
+        let client = db.get_client(parent.client_id)?.ok_or_else(|| anyhow::anyhow!("client of task {} not found", parent.id))?;
+        let repo = expand_home(&client.repo_path);
+        let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+        let (wt, _) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), parent.id, &base)?;
+        let sb = crate::sandbox::for_client(data_dir, &client.name, &repo);
+        let checked = crate::worktree::precheck_and_reset(&sb, &wt, cmd);
+        if let Err(e) = &checked
+            && crate::srt::is_unavailable(e)
+        {
+            crate::scheduler::stop_for_sandbox(db, parent.id, &format!("{e:#}"), crate::sandbox::UNAVAILABLE)?;
+        }
+        checked
+    }
+
+    /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
+    pub fn send_back(db: &Db, data_dir: &Path, ctx: &Ctx, a: SendBackArgs) -> anyhow::Result<Value> {
+        let parent = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let mut subs = db.subtasks(parent.id)?;
+        subs.sort_by_key(|s| s.id);
+        if subs.iter().any(|s| matches!(s.status, TaskStatus::Open | TaskStatus::InProgress | TaskStatus::WaitingAnswer)) {
+            anyhow::bail!("subtasks are still running");
+        }
+        let agent = match a.agent.clone().or_else(|| subs.last().and_then(|s| s.agent.clone())) {
+            Some(agent) => agent,
+            None => anyhow::bail!("task {} has no subtasks to send back", parent.id),
+        };
+        let first: String = a.remarks.lines().next().unwrap_or_default().chars().take(60).collect();
+        let job = format!(
+            "{}\n\nThis follows the Account Lead's review of \"{}\". The earlier work is already on this branch; change only what the remarks ask.",
+            a.remarks, parent.title
+        );
+        let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, &a.done_command, &[], &a.allow_paths.clone().unwrap_or_default())?;
+        db.set_task_status(parent.id, TaskStatus::Split)?;
+        db.add_event(Some(parent.id), "lead", "sent_back", &json!({"subtask_id": sub.id, "remarks": a.remarks}))?;
+        log_client_decision(db, data_dir, &parent, &format!("Task {} sent back: {first}", parent.id))?;
+        record(db, ctx, Role::Lead, "send_back", &a)?;
+        Ok(json!({"subtask_id": sub.id}))
+    }
+
+    fn log_client_decision(db: &Db, data_dir: &Path, task: &Task, line: &str) -> anyhow::Result<()> {
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        crate::client_state::append_decision(data_dir, &client.name, line)
+    }
+
+    /// Account Lead forwards reviewed work: opens a PR when the repo has a remote, then hands it to the owner.
+    pub fn forward_pr(db: &Db, data_dir: &Path, ctx: &Ctx, a: ForwardPrArgs) -> anyhow::Result<Value> {
+        let task = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
+        let subs = db.subtasks(task.id)?;
+        if subs.is_empty() || subs.iter().any(|s| s.status != TaskStatus::Done) {
+            anyhow::bail!("all subtasks must be done before forwarding");
+        }
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        let repo = expand_home(&client.repo_path);
+        let base = crate::client_state::base_for(data_dir, &client.name, &repo)?;
+        let (wt, branch) = crate::worktree::ensure_task_worktree(&repo, &data_dir.join("worktrees"), task.id, &base)?;
+        let pr_url = match crate::worktree::has_remote(&repo) {
+            true => Some(crate::worktree::open_pr(&wt, &base, &branch, &task.title, &a.remarks)?),
+            false => None,
+        };
+        let mut payload = json!({"remarks": a.remarks, "pr_url": pr_url});
+        payload.as_object_mut().expect("object").extend(meta.as_object().cloned().unwrap_or_default());
+        db.add_event(Some(task.id), "lead", "forwarded", &payload)?;
+        db.set_task_status(task.id, TaskStatus::Split)?;
+        let suffix = pr_url.as_deref().map(|u| format!(": {u}")).unwrap_or_default();
+        log_client_decision(db, data_dir, &task, &format!("Task {} forwarded to the owner{suffix}", task.id))?;
+        record(db, ctx, Role::Lead, "forward_pr", &a)?;
+        Ok(json!({"pr_url": pr_url}))
+    }
+
+    /// The optional risk fields of an escalation or forward, as an object holding only what was given.
+    fn decision_meta(risk: &Option<String>, reversible: &Option<bool>, if_approved: &Option<Vec<String>>) -> anyhow::Result<Value> {
+        let mut meta = serde_json::Map::new();
+        if let Some(r) = risk {
+            let r = r.trim().to_lowercase();
+            if !["low", "medium", "high"].contains(&r.as_str()) {
+                anyhow::bail!("risk must be low, medium or high");
+            }
+            meta.insert("risk".into(), json!(r));
+        }
+        if let Some(b) = reversible {
+            meta.insert("reversible".into(), json!(b));
+        }
+        let steps: Vec<String> = if_approved.iter().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(5).collect();
+        if !steps.is_empty() {
+            meta.insert("if_approved".into(), json!(steps));
+        }
+        Ok(Value::Object(meta))
     }
 
     /// Lead declares the task split into its subtasks.
@@ -637,23 +990,49 @@ pub mod logic {
     /// Lead changes a subtask's loop limit.
     pub fn set_limit(db: &Db, ctx: &Ctx, a: SetLimitArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
-        if !(1..=20).contains(&a.max_loops) {
-            anyhow::bail!("max_loops must be between 1 and 20");
-        }
-        db.set_max_loops(task.id, a.max_loops)?;
+        crate::control::apply_limit(db, task.id, a.max_loops)?;
         record(db, ctx, Role::Lead, "set_limit", &a)?;
         Ok(json!({"ok": true, "task_id": task.id, "max_loops": a.max_loops}))
     }
 
     /// Lead narrows or changes a subtask's done command.
-    pub fn set_done_command(db: &Db, ctx: &Ctx, a: SetDoneArgs) -> anyhow::Result<Value> {
+    pub fn set_done_command(db: &Db, data_dir: &Path, ctx: &Ctx, a: SetDoneArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
         if a.done_command.trim().is_empty() {
             anyhow::bail!("done_command must not be empty");
         }
+        let parent = current_task(db, ctx)?;
+        precheck_done(db, data_dir, &parent, a.done_command.trim())?;
         db.set_done_command(task.id, a.done_command.trim())?;
         record(db, ctx, Role::Lead, "set_done_command", &a)?;
         Ok(json!({"ok": true, "task_id": task.id}))
+    }
+
+    /// Account Lead appends one line to its client's decisions log.
+    pub fn log_decision(db: &Db, data_dir: &Path, ctx: &Ctx, a: LogDecisionArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if a.line.trim().is_empty() {
+            anyhow::bail!("line must not be empty");
+        }
+        let client = db.get_client(task.client_id)?.ok_or_else(|| anyhow::anyhow!("client not found"))?;
+        crate::client_state::append_decision(data_dir, &client.name, &a.line)?;
+        record(db, ctx, Role::Lead, "log_decision", &a)?;
+        Ok(json!({"ok": true}))
+    }
+
+    /// Account Lead records one sentence on where things stand.
+    pub fn set_story(db: &Db, ctx: &Ctx, a: SetStoryArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        let line = a.line.trim();
+        if line.is_empty() {
+            anyhow::bail!("line must not be empty");
+        }
+        if line.chars().count() > 160 {
+            anyhow::bail!("line must be under 160 characters");
+        }
+        db.add_event(Some(task.id), "lead", "story", &json!({"line": line}))?;
+        record(db, ctx, Role::Lead, "set_story", &a)?;
+        Ok(json!({"ok": true}))
     }
 
     /// The open question a Lead or Rui is allowed to decide: right level, and for a Lead, its own member's.
@@ -690,7 +1069,8 @@ pub mod logic {
     pub fn escalate(db: &Db, ctx: &Ctx, level: &str, a: EscalateArgs) -> anyhow::Result<Value> {
         let q = decidable(db, ctx, level, a.question_id)?;
         let who = if level == "lead" { "Lead" } else { "Rui" };
-        let up = scheduler::escalate_question(db, q.id, who, a.why.trim())?;
+        let meta = decision_meta(&a.risk, &a.reversible, &a.if_approved)?;
+        let up = scheduler::escalate_question_with(db, q.id, who, a.why.trim(), &meta)?;
         record(db, ctx, role_of(level), "escalate", &a)?;
         Ok(json!({"ok": true, "level": up.level}))
     }
@@ -718,6 +1098,18 @@ pub mod logic {
         db.add_event(Some(task.id), "builder", "status", &json!({"status": a.status, "note": a.note}))?;
         record(db, ctx, Role::Builder, "report_status", &a)?;
         Ok(json!({"ok": true}))
+    }
+
+    /// The Account Lead asks the Scout. It never blocks: the report arrives as an instruction later.
+    pub fn ask_scout(db: &Db, ctx: &Ctx, a: AskScoutArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if task.parent_id.is_some() {
+            anyhow::bail!("only the Account Lead can ask the Scout");
+        }
+        let id = crate::scout::request(db, task.id, &a.question, "lead")?;
+        record(db, ctx, Role::Lead, "ask_scout", &a)?;
+        let note = "The Scout works in the background. Keep going; its report arrives as an instruction on a later turn.";
+        Ok(json!({"ok": true, "request_event_id": id, "note": note}))
     }
 
     /// Member asks the Lead; the member waits until the question is ruled.
@@ -763,16 +1155,34 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<CreateClientArgs>,
     ) -> CallToolResult {
-        finish(logic::create_client(&self.db, &ctx_from(&parts), a))
+        finish(logic::create_client(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
-    #[tool(description = "Staff a task: pick the roles for the pod. A Lead is added automatically and splits the work among them. Omit project for a general task; a known project name reuses it, a new name creates it.")]
-    async fn staff_task(
+    #[tool(description = "Create a client. With repo_path, register an existing git repo; without, start a fresh project.")]
+    async fn create_client(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(a): Parameters<StaffTaskArgs>,
+        Parameters(a): Parameters<NewClientArgs>,
     ) -> CallToolResult {
-        finish(logic::staff_task(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        finish(logic::new_client(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Set up (or replace) a client's Pod: the roles and extra skills reused for all its tasks.")]
+    async fn set_up_pod(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetUpPodArgs>,
+    ) -> CallToolResult {
+        finish(logic::set_up_pod(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Create a task for a client's Account Lead, who runs the client's Pod. Omit client for general work; it goes to the Internal client.")]
+    async fn create_task(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<CreateTaskArgs>,
+    ) -> CallToolResult {
+        finish(logic::create_task(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Get all clients with their tasks and statuses, plus open questions for the owner.")]
@@ -781,7 +1191,7 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<NoArgs>,
     ) -> CallToolResult {
-        finish(logic::report_status(&self.db, &self.apps, &ctx_from(&parts), a))
+        finish(logic::report_status(&self.db, &self.data_dir, &self.apps, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Start (or restart) a project's apps and wait until they answer. Returns each app's url and status.")]
@@ -816,7 +1226,8 @@ impl RuiServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<ApproveArgs>,
     ) -> CallToolResult {
-        finish(logic::approve(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::approve(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "Stop a task and all its unfinished subtasks, for example when the owner cancels or changes course. Give the reason. Returns the stopped task ids.")]
@@ -863,7 +1274,8 @@ impl RuiServer {
             .get_client_by_name(project)?
             .ok_or_else(|| anyhow::anyhow!("project '{project}' not found"))?;
         let repo = crate::scheduler::expand_home(&client.repo_path);
-        let infos = apps::start_project(&self.apps, &client.name, &repo).await;
+        let sb = crate::sandbox::for_client(&self.data_dir, &client.name, &repo);
+        let infos = apps::start_project(&self.apps, &sb, &client.name, &repo).await;
         Ok(serde_json::to_value(infos)?)
     }
 }
@@ -893,13 +1305,14 @@ impl LeadServer {
 
 #[tool_router]
 impl LeadServer {
-    #[tool(description = "Create a subtask of this task for one pod member; done_command defaults to the client's test command.")]
+    #[tool(description = "Create a subtask of this task for one pod member; done_command is required and must fail now.")]
     async fn create_subtask(
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<CreateSubtaskArgs>,
     ) -> CallToolResult {
-        finish(logic::create_subtask(&self.db, &self.data_dir, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::create_subtask(&db, &dir, &ctx, a)).await)
     }
 
     #[tool(description = "Call once all subtasks are created to mark this task as split into them.")]
@@ -944,7 +1357,55 @@ impl LeadServer {
         Extension(parts): Extension<Parts>,
         Parameters(a): Parameters<SetDoneArgs>,
     ) -> CallToolResult {
-        finish(logic::set_done_command(&self.db, &ctx_from(&parts), a))
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::set_done_command(&db, &dir, &ctx, a)).await)
+    }
+
+    #[tool(description = "After review: send the work back. The remarks become a new subtask for the Pod.")]
+    async fn send_back(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SendBackArgs>,
+    ) -> CallToolResult {
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::send_back(&db, &dir, &ctx, a)).await)
+    }
+
+    #[tool(description = "After review: the work is good. Opens a PR (or, for local-only repos, an Inbox review item) with your remarks for the owner.")]
+    async fn forward_pr(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<ForwardPrArgs>,
+    ) -> CallToolResult {
+        let (db, dir, ctx) = (self.db.clone(), self.data_dir.clone(), ctx_from(&parts));
+        finish(blocking(move || logic::forward_pr(&db, &dir, &ctx, a)).await)
+    }
+
+    #[tool(description = "Record one sentence, under 160 characters, on where things stand and what is next. Call it after each turn that changes the state.")]
+    async fn set_story(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetStoryArgs>,
+    ) -> CallToolResult {
+        finish(logic::set_story(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Ask the Scout to research a question or diagnose a failure. Does not wait: keep working; the report arrives as an instruction on a later turn.")]
+    async fn ask_scout(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AskScoutArgs>,
+    ) -> CallToolResult {
+        finish(logic::ask_scout(&self.db, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Append one line to this client's decisions log: what happened and why.")]
+    async fn log_decision(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<LogDecisionArgs>,
+    ) -> CallToolResult {
+        finish(logic::log_decision(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 }
 
@@ -1015,8 +1476,9 @@ mod tests {
 
     fn git_dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        let ok = Command::new("git").arg("init").arg(d.path()).output().unwrap().status.success();
-        assert!(ok);
+        let git = |args: &[&str]| Command::new("git").arg("-C").arg(d.path()).args(args).output().unwrap().status.success();
+        assert!(git(&["init", "-b", "main"]));
+        assert!(git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"]));
         d
     }
 
@@ -1041,19 +1503,36 @@ mod tests {
         d
     }
 
+    /// A data dir of its own for each test, removed when dropped.
+    fn unique_data_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     /// Db with one client and one top-level task; returns (db, ctx for that task).
     fn setup(test_command: Option<&str>) -> (Db, Ctx, tempfile::TempDir) {
         let db = Db::open_test();
         let dir = git_dir();
         let ctx = Ctx { task_id: None, source_ref: Some("chat:12".into()) };
-        logic::create_client(&db, &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
-        let t = logic::create_task(
-            &db,
-            &ctx,
-            CreateTaskArgs { client_name: "Acme".into(), title: "T".into(), body: "B".into() },
-        )
-        .unwrap();
-        let ctx = Ctx { task_id: t["id"].as_i64(), source_ref: None };
+        let data = unique_data_dir();
+        logic::create_client(&db, data.path(), &ctx, client_args("Acme", dir.path(), test_command)).unwrap();
+        let client = db.get_client_by_name("Acme").unwrap().unwrap();
+        let t = db
+            .create_task(&NewTask {
+                client_id: client.id,
+                parent_id: None,
+                title: "T".into(),
+                body: "B".into(),
+                status: TaskStatus::New,
+                done_command: None,
+                max_loops: 5,
+                role: Role::Lead,
+                source_kind: SourceKind::Chat,
+                source_ref: Some("chat:12".into()),
+                agent: None,
+                pod: vec![],
+            })
+            .unwrap();
+        let ctx = Ctx { task_id: Some(t.id), source_ref: None };
         (db, ctx, dir)
     }
 
@@ -1062,27 +1541,44 @@ mod tests {
             agent: agent.into(),
             title: title.into(),
             job: "b".into(),
-            done_command: Some("true".into()),
+            done_command: "test -f done.txt".into(),
             depends_on: None,
+            allow_paths: None,
         }
     }
 
-    fn staff_args(project: Option<&str>, pod: &[&str]) -> StaffTaskArgs {
+    fn new_args(name: &str, repo: Option<&std::path::Path>) -> NewClientArgs {
+        NewClientArgs { name: name.into(), repo_path: repo.map(|r| r.to_string_lossy().into_owned()), test_command: None, allowed_commands: None }
+    }
+
+    fn pod_args(client: &str, roles: &[&str]) -> SetUpPodArgs {
+        let roles = roles.iter().map(|r| PodRoleArg { role: r.to_string(), skills: None }).collect();
+        SetUpPodArgs { client: client.into(), roles, protected: None }
+    }
+
+    fn task_args(client: Option<&str>, roles: Option<&[&str]>) -> CreateTaskArgs {
         let app = AppSpec { name: "api".into(), dir: ".".into(), command: "run $PORT".into() };
-        StaffTaskArgs {
-            project: project.map(Into::into),
+        CreateTaskArgs {
+            client: client.map(Into::into),
             title: "T".into(),
             brief: "B".into(),
-            pod: pod.iter().map(|p| p.to_string()).collect(),
             apps: Some(vec![app]),
+            roles: roles.map(|r| r.iter().map(|x| x.to_string()).collect()),
         }
+    }
+
+    /// A fresh client "Acme" with a Pod of the given roles.
+    fn client_with_pod(db: &Db, data: &Path, roles: &[&str]) {
+        logic::new_client(db, data, &Ctx::default(), new_args("Acme", None)).unwrap();
+        logic::set_up_pod(db, data, &Ctx::default(), pod_args("Acme", roles)).unwrap();
     }
 
     /// A staffed pod: returns (db, data dir, ctx of the parent, ctx of its first member).
     fn staffed() -> (Db, tempfile::TempDir, Ctx, Ctx) {
         let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
+        client_with_pod(&db, data.path(), &["backend", "tester"]);
         let ctx = Ctx { task_id: None, source_ref: Some("chat:3".into()) };
-        let r = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend", "tester"])).unwrap();
+        let r = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), None)).unwrap();
         let lead = Ctx { task_id: r["task_id"].as_i64(), source_ref: None };
         let child = logic::create_subtask(&db, data.path(), &lead, sub_args("backend", "api")).unwrap();
         let member = Ctx { task_id: child["id"].as_i64(), source_ref: None };
@@ -1103,78 +1599,154 @@ mod tests {
         let db = Db::open_test();
         let dir = git_dir();
         let ctx = Ctx::default();
-        let c = logic::create_client(&db, &ctx, client_args("A", dir.path(), Some("cargo test"))).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let c = logic::create_client(&db, data.path(), &ctx, client_args("A", dir.path(), Some("cargo test"))).unwrap();
         assert_eq!(c["name"], "A");
+        assert!(data.path().join("clients/a/client.json").exists());
         assert_eq!(c["test_command"], "cargo test");
-        assert!(logic::create_client(&db, &ctx, client_args("A", dir.path(), None)).is_err());
+        assert!(logic::create_client(&db, data.path(), &ctx, client_args("A", dir.path(), None)).is_err());
     }
 
     #[test]
     fn create_client_rejects_non_git_dir() {
         let db = Db::open_test();
         let dir = tempfile::tempdir().unwrap();
-        let err = logic::create_client(&db, &Ctx::default(), client_args("A", dir.path(), None));
+        let err = logic::create_client(&db, dir.path(), &Ctx::default(), client_args("A", dir.path(), None));
         assert!(err.unwrap_err().to_string().contains("not a git repository"));
         assert!(db.list_clients().unwrap().is_empty());
     }
 
     #[test]
-    fn create_task_sets_defaults_and_source_ref() {
-        let (db, _, _d) = setup(None);
-        let t = &db.list_tasks().unwrap()[0];
-        assert_eq!(t.status, TaskStatus::New);
-        assert_eq!(t.role, Role::Lead);
-        assert_eq!(t.source_kind, SourceKind::Chat);
-        assert_eq!(t.max_loops, 5);
-        assert_eq!(t.source_ref.as_deref(), Some("chat:12"));
+    fn create_client_without_repo_starts_a_fresh_project() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        let c = logic::new_client(&db, data.path(), &Ctx::default(), new_args("Todo App", None)).unwrap();
+        assert_eq!(c["name"], "Todo App");
+        assert!(data.path().join("projects/todo-app/.git").exists());
+        let f = crate::client_state::read_client(data.path(), "Todo App").unwrap().unwrap();
+        assert!(!f.internal);
+        assert!(logic::new_client(&db, data.path(), &Ctx::default(), new_args("Todo App", None)).is_err());
     }
 
     #[test]
-    fn create_task_unknown_client_and_empty_title() {
-        let db = Db::open_test();
+    fn create_client_with_repo_registers_it() {
+        let (db, data, dir) = (Db::open_test(), tempfile::tempdir().unwrap(), git_dir());
+        let c = logic::new_client(&db, data.path(), &Ctx::default(), new_args("Acme", Some(dir.path()))).unwrap();
+        assert_eq!(c["repo_path"], dir.path().to_string_lossy().as_ref());
+        assert!(data.path().join("clients/acme/client.json").exists());
+        assert!(logic::new_client(&db, data.path(), &Ctx::default(), new_args("Acme", Some(dir.path()))).is_err());
+    }
+
+    #[test]
+    fn set_up_pod_rejects_bad_input() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
+        logic::new_client(&db, data.path(), &Ctx::default(), new_args("Acme", None)).unwrap();
         let ctx = Ctx::default();
-        let a = CreateTaskArgs { client_name: "Nope".into(), title: "T".into(), body: "".into() };
-        assert!(logic::create_task(&db, &ctx, a).is_err());
-        let (db, ctx, _d) = setup(None);
-        let a = CreateTaskArgs { client_name: "Acme".into(), title: " ".into(), body: "".into() };
-        assert!(logic::create_task(&db, &ctx, a).is_err());
+        let err = |a: SetUpPodArgs| logic::set_up_pod(&db, data.path(), &ctx, a).unwrap_err().to_string();
+        assert!(err(pod_args("Acme", &["nope"])).contains("unknown role"));
+        assert!(err(pod_args("Acme", &["lead"])).contains("lead"));
+        assert!(err(pod_args("Acme", &[])).contains("empty"));
+        assert!(err(pod_args("Missing", &["backend"])).contains("not found"));
+        let mut a = pod_args("Acme", &["backend"]);
+        a.roles[0].skills = Some(vec!["ghost".into()]);
+        assert_eq!(err(a), "unknown skill 'ghost'");
+        crate::library::set_status(data.path(), crate::library::Kind::Role, "backend", "off").unwrap();
+        assert!(err(pod_args("Acme", &["backend"])).contains("turned off"));
     }
 
     #[test]
-    fn staff_task_rejects_pods_over_three_specialists() {
+    fn set_up_pod_writes_pod_and_logs_it() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
+        let skill = data.path().join("skills/rust");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: rust\ndescription: d\nbash: []\n---\nHi\n").unwrap();
+        logic::new_client(&db, data.path(), &Ctx::default(), new_args("Acme", None)).unwrap();
+        let mut a = pod_args("Acme", &["backend", "tester", "backend"]);
+        a.roles[0].skills = Some(vec!["rust".into()]);
+        a.protected = Some(vec!["src/db.rs".into()]);
+        let r = logic::set_up_pod(&db, data.path(), &Ctx::default(), a).unwrap();
+        assert_eq!(r["roles"].as_array().unwrap().len(), 2);
+        let pod = crate::client_state::read_pod(data.path(), "Acme").unwrap();
+        assert_eq!((pod.roles[0].skills.clone(), pod.protected.clone()), (vec!["rust".to_string()], vec!["src/db.rs".to_string()]));
+        let log = crate::client_state::read_log(data.path(), "Acme", 10).unwrap();
+        assert!(log.contains("Pod set up: backend, tester (by Rui)"), "{log}");
+        logic::set_up_pod(&db, data.path(), &Ctx::default(), pod_args("Acme", &["tester"])).unwrap();
+        let pod = crate::client_state::read_pod(data.path(), "Acme").unwrap();
+        assert_eq!((pod.roles.len(), pod.protected), (1, vec!["src/db.rs".to_string()]));
+    }
+
+    #[test]
+    fn create_task_routes_to_the_client_and_records_state() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
+        client_with_pod(&db, data.path(), &["backend", "tester"]);
+        let ctx = Ctx { task_id: None, source_ref: Some("chat:3".into()) };
+        let r = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), None)).unwrap();
+        assert_eq!(r["client"], "Acme");
+        assert_eq!(r["pod"], json!(["lead", "backend", "tester"]));
+        let id = r["task_id"].as_i64().unwrap();
+        let t = db.get_task(id).unwrap().unwrap();
+        assert_eq!(t.client_id, db.get_client_by_name("Acme").unwrap().unwrap().id);
+        assert_eq!((t.role, t.status, t.agent.as_deref(), t.max_loops), (Role::Lead, TaskStatus::New, Some("lead"), 5));
+        assert_eq!((t.body.as_str(), t.source_ref.as_deref()), ("B", Some("chat:3")));
+        assert_eq!(t.pod, ["lead", "backend", "tester"]);
+        assert!(crate::client_state::read_briefs(data.path(), "Acme").unwrap().contains(&format!("task {id}: T")));
+        let log = crate::client_state::read_log(data.path(), "Acme", 10).unwrap();
+        assert!(log.contains(&format!("Task {id} created: T (roles: backend, tester)")), "{log}");
+        let apps = std::fs::read_to_string(data.path().join("projects/acme/.rui/apps.json")).unwrap();
+        assert!(apps.contains("run $PORT"));
+    }
+
+    #[test]
+    fn create_task_reuses_the_pod_and_rejects_bad_input() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
+        client_with_pod(&db, data.path(), &["backend"]);
+        let ctx = Ctx::default();
+        for _ in 0..2 {
+            let r = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), None)).unwrap();
+            assert_eq!(r["pod"], json!(["lead", "backend"]));
+        }
+        let mut a = task_args(Some("Acme"), None);
+        a.title = " ".into();
+        assert!(logic::create_task(&db, data.path(), &ctx, a).is_err());
+        let err = logic::create_task(&db, data.path(), &ctx, task_args(Some("Nope"), None)).unwrap_err();
+        assert!(err.to_string().contains("not found; create it first"));
+    }
+
+    #[test]
+    fn create_task_narrows_to_a_subset_of_at_most_three() {
         let names = ["a", "b", "c", "d"];
         let (db, data) = (Db::open_test(), data_with_roles(&names));
+        client_with_pod(&db, data.path(), &names);
         let ctx = Ctx::default();
-        assert!(logic::staff_task(&db, data.path(), &ctx, staff_args(None, &names[..3])).is_ok());
-        let err = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &names)).unwrap_err();
-        assert!(err.to_string().contains("capped at 3 specialists"));
+        let r = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), Some(&["b", "c"]))).unwrap();
+        assert_eq!(r["pod"], json!(["lead", "b", "c"]));
+        let err = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), Some(&["b", "z"]))).unwrap_err();
+        assert!(err.to_string().contains("role 'z' is not in client Acme's Pod (a, b, c, d)"), "{err}");
+        let err = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), None)).unwrap_err();
+        assert!(err.to_string().contains("At most 3 Pod roles"));
+        assert!(logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), Some(&["a", "b", "c"]))).is_ok());
     }
 
     #[test]
-    fn staff_task_without_project_uses_general_and_adds_lead() {
-        let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
-        let ctx = Ctx { task_id: None, source_ref: Some("chat:3".into()) };
-        let r = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend", "tester"])).unwrap();
-        assert_eq!(r["project"], "general");
-        assert_eq!(r["pod"], json!(["lead", "backend", "tester"]));
-        assert!(data.path().join("projects/general/.git").exists());
-        let apps = std::fs::read_to_string(data.path().join("projects/general/.rui/apps.json")).unwrap();
-        assert!(apps.contains("run $PORT"));
-        let t = db.get_task(r["task_id"].as_i64().unwrap()).unwrap().unwrap();
-        assert_eq!((t.role, t.status, t.agent.as_deref()), (Role::Lead, TaskStatus::New, Some("lead")));
-        assert_eq!(t.pod, ["lead", "backend", "tester"]);
-        assert_eq!((t.body.as_str(), t.source_ref.as_deref()), ("B", Some("chat:3")));
-        logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend"])).unwrap();
-        assert_eq!(db.list_clients().unwrap().len(), 1);
+    fn create_task_needs_a_pod() {
+        let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
+        logic::new_client(&db, data.path(), &Ctx::default(), new_args("Acme", None)).unwrap();
+        let err = logic::create_task(&db, data.path(), &Ctx::default(), task_args(Some("Acme"), None)).unwrap_err();
+        assert!(err.to_string().contains("client 'Acme' has no Pod; call set_up_pod first"));
+        assert!(db.list_tasks().unwrap().is_empty());
     }
 
     #[test]
-    fn staff_task_with_project_creates_then_reuses_it() {
+    fn create_task_without_client_uses_the_internal_client() {
         let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
         let ctx = Ctx::default();
-        let r = logic::staff_task(&db, data.path(), &ctx, staff_args(Some("Todo App"), &["backend"])).unwrap();
-        assert_eq!(r["project"], "todo-app");
-        logic::staff_task(&db, data.path(), &ctx, staff_args(Some("todo-app"), &["backend"])).unwrap();
+        let err = logic::create_task(&db, data.path(), &ctx, task_args(None, None)).unwrap_err();
+        assert!(err.to_string().contains("the Internal client has no Pod; call set_up_pod(client=\"Internal\""), "{err}");
+        let f = crate::client_state::read_client(data.path(), "Internal").unwrap().unwrap();
+        assert!(f.internal);
+        logic::set_up_pod(&db, data.path(), &ctx, pod_args("Internal", &["backend"])).unwrap();
+        let r = logic::create_task(&db, data.path(), &ctx, task_args(None, None)).unwrap();
+        assert_eq!((r["client"].as_str(), &r["pod"]), (Some("Internal"), &json!(["lead", "backend"])));
+        logic::create_task(&db, data.path(), &ctx, task_args(None, None)).unwrap();
         assert_eq!(db.list_clients().unwrap().len(), 1);
     }
 
@@ -1241,10 +1813,23 @@ mod tests {
     }
 
     #[test]
+    fn approve_holds_commands_that_reach_the_owner_api() {
+        let (db, data) = (Db::open_test(), tempfile::tempdir().unwrap());
+        let ctx = chat_ctx(&db);
+        let port = crate::owner_auth::port();
+        let call = |cmd: String| logic::approve(&db, data.path(), &ctx, approve_args("Bash", json!({"command": cmd}))).unwrap();
+        assert_eq!(call("cat ~/x/owner.token".into())["behavior"], "deny");
+        assert_eq!(call(format!("ls {}", data.path().display()))["behavior"], "deny");
+        assert_eq!(call(format!("curl -X POST http://127.0.0.1:{port}/stop-all"))["behavior"], "deny");
+        assert_eq!(call(format!("curl http://localhost:{port}/mcp/rui"))["behavior"], "allow");
+    }
+
+    #[test]
     fn rui_stop_and_instruct_tools() {
         let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
         let (ctx, runs) = (Ctx::default(), Runs::default());
-        let r = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend"])).unwrap();
+        client_with_pod(&db, data.path(), &["backend"]);
+        let r = logic::create_task(&db, data.path(), &ctx, task_args(Some("Acme"), None)).unwrap();
         let id = r["task_id"].as_i64().unwrap();
         db.set_task_status(id, TaskStatus::Split).unwrap();
         let out = logic::instruct_task(&db, &runs, &ctx, InstructTaskArgs { task_id: id, text: "  shorter ".into() }).unwrap();
@@ -1256,45 +1841,21 @@ mod tests {
     }
 
     #[test]
-    fn staff_task_rejects_an_off_role() {
-        let (db, data) = (Db::open_test(), data_with_roles(&["backend", "tester"]));
-        crate::library::set_status(data.path(), crate::library::Kind::Role, "tester", "off").unwrap();
-        let err = logic::staff_task(&db, data.path(), &Ctx::default(), staff_args(None, &["backend", "tester"])).unwrap_err();
-        assert!(err.to_string().contains("turned off"), "{err}");
-        assert!(db.list_tasks().unwrap().is_empty());
-    }
-
-    #[test]
-    fn staff_task_rejects_bad_pods() {
-        let (db, data) = (Db::open_test(), data_with_roles(&["backend"]));
-        let ctx = Ctx::default();
-        let err = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["nope"])).unwrap_err();
-        assert!(err.to_string().contains("unknown role"));
-        let err = logic::staff_task(&db, data.path(), &ctx, staff_args(None, &["backend", "lead"])).unwrap_err();
-        assert!(err.to_string().contains("lead"));
-        assert!(logic::staff_task(&db, data.path(), &ctx, staff_args(None, &[])).is_err());
-        let mut a = staff_args(None, &["backend"]);
-        a.title = " ".into();
-        assert!(logic::staff_task(&db, data.path(), &ctx, a).is_err());
-        assert!(db.list_clients().unwrap().is_empty());
-        assert!(!data.path().join("projects").exists());
-    }
-
-    #[test]
     fn report_status_lists_tasks_and_owner_questions() {
         let (db, data, lead, member) = staffed();
         let qid = ask(&db, data.path(), &member);
-        let s = logic::report_status(&db, &Apps::default(), &lead, NoArgs {}).unwrap();
-        assert_eq!(s["clients"][0]["name"], "general");
+        let s = logic::report_status(&db, data.path(), &Apps::default(), &lead, NoArgs {}).unwrap();
+        assert_eq!(s["clients"][0]["name"], "Acme");
+        assert_eq!((&s["clients"][0]["internal"], &s["clients"][0]["pod"]), (&json!(false), &json!(["backend", "tester"])));
         assert_eq!(s["clients"][0]["tasks"][1]["status"], "waiting_answer");
         assert_eq!(s["clients"][0]["tasks"][1]["agent"], "backend");
         assert_eq!(s["open_questions"], json!([]));
         db.set_question_level(qid, "owner", &[]).unwrap();
-        let s = logic::report_status(&db, &Apps::default(), &lead, NoArgs {}).unwrap();
+        let s = logic::report_status(&db, data.path(), &Apps::default(), &lead, NoArgs {}).unwrap();
         assert_eq!(s["open_questions"][0]["text"], "which db?");
         let id = member.task_id.unwrap();
         db.add_event(Some(id), "scheduler", "done_check", &json!({"passed": true, "output_tail": "ok"})).unwrap();
-        let s = logic::report_status(&db, &Apps::default(), &lead, NoArgs {}).unwrap();
+        let s = logic::report_status(&db, data.path(), &Apps::default(), &lead, NoArgs {}).unwrap();
         assert_eq!(s["clients"][0]["tasks"][1]["last_check"]["output_tail"], "ok");
     }
 
@@ -1304,7 +1865,7 @@ mod tests {
         let t = db.get_task(member.task_id.unwrap()).unwrap().unwrap();
         let pid = lead.task_id.unwrap();
         assert_eq!((t.agent.as_deref(), t.role, t.status), (Some("backend"), Role::Builder, TaskStatus::Open));
-        assert_eq!((t.parent_id, t.max_loops, t.done_command.as_deref()), (Some(pid), 6, Some("true")));
+        assert_eq!((t.parent_id, t.max_loops, t.done_command.as_deref()), (Some(pid), 6, Some("test -f done.txt")));
         assert_eq!(t.source_ref, Some(format!("task:{pid}")));
     }
 
@@ -1322,7 +1883,7 @@ mod tests {
         let (db, ctx, _d) = setup(None);
         let data = data_with_roles(&["backend"]);
         let mut a = sub_args("backend", "s");
-        a.done_command = None;
+        a.done_command = "  ".into();
         assert!(logic::create_subtask(&db, data.path(), &ctx, a).is_err());
         let first = logic::create_subtask(&db, data.path(), &ctx, sub_args("backend", "a")).unwrap();
         let mut b = sub_args("backend", "b");
@@ -1332,6 +1893,60 @@ mod tests {
         let mut bad = sub_args("backend", "c");
         bad.depends_on = Some(vec![9999]);
         assert!(logic::create_subtask(&db, data.path(), &ctx, bad).is_err());
+    }
+
+    #[test]
+    fn create_subtask_precheck_leaves_no_side_files() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "touch side.txt; false".into();
+        logic::create_subtask(&db, data.path(), &ctx, a).unwrap();
+        let wt = data.path().join("worktrees").join(format!("task-{}", ctx.task_id.unwrap()));
+        assert!(wt.exists());
+        assert!(!wt.join("side.txt").exists());
+    }
+
+    #[test]
+    fn create_subtask_rejects_a_passing_done_command() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "true".into();
+        let err = logic::create_subtask(&db, data.path(), &ctx, a).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
+        let mut ok = sub_args("backend", "s");
+        ok.done_command = "test -f nope.txt".into();
+        assert!(logic::create_subtask(&db, data.path(), &ctx, ok).is_ok());
+    }
+
+    #[test]
+    fn missing_srt_refuses_the_precheck_and_stops_the_task() {
+        let (db, ctx, _d) = setup(None);
+        let data = data_with_roles(&["backend"]);
+        crate::srt::tests::set_override(data.path(), None);
+        let mut a = sub_args("backend", "s");
+        a.done_command = "touch ran.txt; false".into();
+        let err = logic::create_subtask(&db, data.path(), &ctx, a).unwrap_err();
+        assert!(crate::srt::is_unavailable(&err), "{err:#}");
+        let parent = db.get_task(ctx.task_id.unwrap()).unwrap().unwrap();
+        assert_eq!(parent.status, TaskStatus::Stuck);
+        let wt = data.path().join("worktrees").join(format!("task-{}", parent.id));
+        assert!(!wt.join("ran.txt").exists());
+    }
+
+    #[test]
+    fn create_subtask_has_no_test_command_fallback() {
+        let v = json!({"agent": "backend", "title": "t", "job": "j"});
+        assert!(serde_json::from_value::<CreateSubtaskArgs>(v).is_err());
+    }
+
+    #[test]
+    fn set_done_command_rejects_a_passing_command() {
+        let (db, data, lead, member) = staffed();
+        let a = SetDoneArgs { task_id: member.task_id.unwrap(), done_command: "true".into() };
+        let err = logic::set_done_command(&db, data.path(), &lead, a).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
     }
 
     #[test]
@@ -1346,19 +1961,19 @@ mod tests {
 
     #[test]
     fn set_limit_and_done_command_edit_own_subtasks() {
-        let (db, _data, lead, member) = staffed();
+        let (db, data, lead, member) = staffed();
         let id = member.task_id.unwrap();
         logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 9 }).unwrap();
-        let a = SetDoneArgs { task_id: id, done_command: " make t ".into() };
-        logic::set_done_command(&db, &lead, a).unwrap();
+        let a = SetDoneArgs { task_id: id, done_command: " test -f t.txt ".into() };
+        logic::set_done_command(&db, data.path(), &lead, a).unwrap();
         let t = db.get_task(id).unwrap().unwrap();
-        assert_eq!((t.max_loops, t.done_command.as_deref()), (9, Some("make t")));
+        assert_eq!((t.max_loops, t.done_command.as_deref()), (9, Some("test -f t.txt")));
         for n in [0, 21] {
             assert!(logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: n }).is_err());
         }
         assert!(logic::set_limit(&db, &lead, SetLimitArgs { task_id: lead.task_id.unwrap(), max_loops: 3 }).is_err());
         let a = SetDoneArgs { task_id: id, done_command: " ".into() };
-        assert!(logic::set_done_command(&db, &lead, a).is_err());
+        assert!(logic::set_done_command(&db, data.path(), &lead, a).is_err());
     }
 
     #[test]
@@ -1385,7 +2000,7 @@ mod tests {
         assert_eq!(q.ladder.len(), 1);
         assert_eq!((q.ladder[0].who.as_str(), q.ladder[0].why.as_str()), ("backend 2", "which db?"));
         assert_eq!(status_of(&db, &member), TaskStatus::WaitingAnswer);
-        let esc = |why: &str| EscalateArgs { question_id: qid, why: why.into() };
+        let esc = |why: &str| EscalateArgs { question_id: qid, why: why.into(), ..Default::default() };
         assert!(logic::escalate(&db, &lead, "rui", esc("x")).is_err());
         logic::escalate(&db, &lead, "lead", esc("not sure")).unwrap();
         let q = db.get_question(qid).unwrap().unwrap();
@@ -1398,6 +2013,57 @@ mod tests {
         assert_eq!(q.status, QuestionStatus::Open);
         assert!(logic::escalate(&db, &none, "rui", esc("again")).is_err());
         assert_eq!(status_of(&db, &member), TaskStatus::WaitingAnswer);
+    }
+
+    #[test]
+    fn escalate_saves_risk_meta_and_rejects_bad_risk() {
+        let (db, data, lead, member) = staffed();
+        let qid = ask(&db, data.path(), &member);
+        let args = |risk: &str| EscalateArgs {
+            question_id: qid, why: "w".into(), risk: Some(risk.into()), reversible: Some(false),
+            if_approved: Some(["a", " b ", "", "c", "d", "e", "f", "g"].map(String::from).to_vec()),
+        };
+        assert!(logic::escalate(&db, &lead, "lead", args("extreme")).is_err());
+        logic::escalate(&db, &lead, "lead", args(" HIGH ")).unwrap();
+        let events = db.list_events(member.task_id, 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "escalated").unwrap();
+        assert_eq!((e.payload["risk"].as_str(), e.payload["reversible"].as_bool()), (Some("high"), Some(false)));
+        assert_eq!(e.payload["if_approved"], json!(["a", "b", "c", "d", "e"]));
+    }
+
+    #[test]
+    fn forward_pr_saves_risk_meta() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let a = ForwardPrArgs { task_id: lead_id, remarks: "ok".into(), risk: Some("low".into()), reversible: Some(true), if_approved: Some(vec!["merge".into()]) };
+        logic::forward_pr(&db, data.path(), &lead, a).unwrap();
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        let f = events.iter().find(|e| e.kind == "forwarded").unwrap();
+        assert_eq!((f.payload["risk"].as_str(), f.payload["reversible"].as_bool(), &f.payload["if_approved"]), (Some("low"), Some(true), &json!(["merge"])));
+    }
+
+    #[test]
+    fn set_story_writes_an_event_and_validates() {
+        let (db, _data, lead, _) = staffed();
+        let story = |l: &str| logic::set_story(&db, &lead, SetStoryArgs { line: l.into() });
+        story(" Tests pass, review is next. ").unwrap();
+        assert!(story("  ").is_err());
+        assert!(story(&"x".repeat(161)).is_err());
+        story(&"x".repeat(160)).unwrap();
+        let events = db.list_events(lead.task_id, 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "story").unwrap();
+        assert!(e.payload["line"].as_str().is_some());
+        assert_eq!(events.iter().filter(|e| e.kind == "story").count(), 2);
+    }
+
+    #[test]
+    fn log_decision_appends_to_the_clients_log() {
+        let (db, data, lead, _) = staffed();
+        logic::log_decision(&db, data.path(), &lead, LogDecisionArgs { line: "chose sqlite".into() }).unwrap();
+        let log = crate::client_state::read_log(data.path(), "Acme", 10).unwrap();
+        assert!(log.contains("chose sqlite"), "{log}");
+        assert!(logic::log_decision(&db, data.path(), &lead, LogDecisionArgs { line: "  ".into() }).is_err());
     }
 
     #[test]
@@ -1451,38 +2117,229 @@ mod tests {
         let (db, _, _d) = setup(None);
         let none = Ctx::default();
         let err = logic::mark_split(&db, &none, NoArgs {}).unwrap_err();
-        assert!(err.to_string().contains("X-Rui-Task-Id"));
+        assert!(err.to_string().contains("no task"));
         let bogus = Ctx { task_id: Some(9999), source_ref: None };
         let a = StatusArgs { status: "DONE".into(), note: "r".into() };
         assert!(logic::member_status(&db, &bogus, a).is_err());
     }
 
-    async fn post(app: &axum::Router, path: &str, body: Value) -> Value {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-        let req = Request::post(path)
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn set_status(db: &Db, id: i64, status: TaskStatus) {
+        db.set_task_status(id, status).unwrap();
+    }
+
+    fn repo_of(db: &Db, lead: &Ctx) -> PathBuf {
+        let t = db.get_task(lead.task_id.unwrap()).unwrap().unwrap();
+        PathBuf::from(db.get_client(t.client_id).unwrap().unwrap().repo_path)
+    }
+
+    fn send_args(task_id: i64, remarks: &str) -> SendBackArgs {
+        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into(), allow_paths: None }
+    }
+
+    #[test]
+    fn send_back_creates_a_subtask_and_splits_the_parent() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        logic::create_subtask(&db, data.path(), &lead, CreateSubtaskArgs { done_command: "make test".into(), ..sub_args("tester", "t") }).unwrap();
+        let second = db.subtasks(lead_id).unwrap().pop().unwrap();
+        assert!(logic::send_back(&db, data.path(), &lead, send_args(lead_id, "x")).is_err(), "subtasks still running");
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        set_status(&db, second.id, TaskStatus::Done);
+        set_status(&db, lead_id, TaskStatus::Clarifying);
+        let r = logic::send_back(&db, data.path(), &lead, send_args(lead_id, "Fix the tests\nand the docs")).unwrap();
+        let sub = db.get_task(r["subtask_id"].as_i64().unwrap()).unwrap().unwrap();
+        assert_eq!((sub.status, sub.agent.as_deref()), (TaskStatus::Open, Some("tester")));
+        assert_eq!(sub.done_command.as_deref(), Some("test -f changes.txt"));
+        assert_eq!(sub.title, "Changes: Fix the tests");
+        assert!(sub.body.starts_with("Fix the tests\nand the docs") && sub.body.contains("change only what the remarks ask"));
+        assert_eq!(status_of(&db, &lead), TaskStatus::Split);
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        assert!(events.iter().any(|e| e.kind == "sent_back" && e.payload["subtask_id"] == sub.id));
+        let client = db.get_client(sub.client_id).unwrap().unwrap();
+        let log = crate::client_state::read_log(data.path(), &client.name, 10).unwrap();
+        assert!(log.contains(&format!("Task {lead_id} sent back: Fix the tests")));
+    }
+
+    fn grant_log(db: &Db, data: &Path, id: i64) -> String {
+        let client = db.get_client(db.get_task(id).unwrap().unwrap().client_id).unwrap().unwrap();
+        crate::client_state::read_log(data, &client.name, 20).unwrap()
+    }
+
+    #[test]
+    fn create_subtask_records_granted_paths() {
+        let (db, data, lead, _m) = staffed();
+        let args = CreateSubtaskArgs { allow_paths: Some(vec![" package.json ".into()]), ..sub_args("backend", "dep") };
+        let sub = logic::create_subtask(&db, data.path(), &lead, args).unwrap();
+        let id = sub["id"].as_i64().unwrap();
+        let events = db.list_events(Some(id), 50).unwrap();
+        let ev = events.iter().find(|e| e.kind == "paths_granted").unwrap();
+        assert_eq!(ev.payload["paths"], json!(["package.json"]));
+        assert!(grant_log(&db, data.path(), id).contains("may change protected paths: package.json"));
+    }
+
+    #[test]
+    fn create_subtask_rejects_bad_allow_paths() {
+        let (db, data, lead, _m) = staffed();
+        let before = db.subtasks(lead.task_id.unwrap()).unwrap().len();
+        for bad in ["/etc/passwd", "../x", "a/../x", " "] {
+            let args = CreateSubtaskArgs { allow_paths: Some(vec![bad.into()]), ..sub_args("backend", "x") };
+            let err = logic::create_subtask(&db, data.path(), &lead, args).unwrap_err().to_string();
+            assert!(err.contains("must be a relative path inside the repo"), "{bad}: {err}");
+        }
+        for wide in ["*", "**", "**/"] {
+            let args = CreateSubtaskArgs { allow_paths: Some(vec![wide.into()]), ..sub_args("backend", "x") };
+            let err = logic::create_subtask(&db, data.path(), &lead, args).unwrap_err().to_string();
+            assert!(err.contains("grants everything"), "{wide}: {err}");
+        }
+        assert_eq!(db.subtasks(lead.task_id.unwrap()).unwrap().len(), before);
+    }
+
+    #[test]
+    fn send_back_records_granted_paths() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        set_status(&db, lead_id, TaskStatus::Clarifying);
+        let args = SendBackArgs { allow_paths: Some(vec!["package.json".into()]), ..send_args(lead_id, "Add a dep") };
+        let r = logic::send_back(&db, data.path(), &lead, args).unwrap();
+        let id = r["subtask_id"].as_i64().unwrap();
+        assert!(db.list_events(Some(id), 50).unwrap().iter().any(|e| e.kind == "paths_granted"));
+        assert!(grant_log(&db, data.path(), id).contains("may change protected paths: package.json"));
+    }
+
+    #[test]
+    fn send_back_requires_a_done_command() {
+        assert!(serde_json::from_value::<SendBackArgs>(json!({"task_id": 1, "remarks": "x"})).is_err());
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let args = SendBackArgs { done_command: "true".into(), ..send_args(lead_id, "x") };
+        let err = logic::send_back(&db, data.path(), &lead, args).unwrap_err();
+        assert!(err.to_string().contains("already passes"));
+    }
+
+    #[test]
+    fn send_back_rejects_another_task_and_empty_remarks() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let other = member.task_id.unwrap();
+        let err = logic::send_back(&db, data.path(), &lead, send_args(other, "x")).unwrap_err();
+        assert!(err.to_string().contains("your own task"));
+        assert!(logic::send_back(&db, data.path(), &lead, send_args(lead_id, "  ")).is_err());
+    }
+
+    #[test]
+    fn forward_pr_without_a_remote_forwards_locally() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        let args = || ForwardPrArgs { task_id: lead_id, remarks: "Looks right".into(), risk: None, reversible: None, if_approved: None };
+        assert!(logic::forward_pr(&db, data.path(), &lead, args()).is_err(), "subtask not done");
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let r = logic::forward_pr(&db, data.path(), &lead, args()).unwrap();
+        assert!(r["pr_url"].is_null());
+        assert_eq!(status_of(&db, &lead), TaskStatus::Split);
+        let events = db.list_events(Some(lead_id), 50).unwrap();
+        let f = events.iter().find(|e| e.kind == "forwarded").unwrap();
+        assert_eq!((f.payload["remarks"].as_str(), f.payload["pr_url"].is_null()), (Some("Looks right"), true));
+        let client = db.get_client(db.get_task(lead_id).unwrap().unwrap().client_id).unwrap().unwrap();
+        assert!(crate::client_state::read_log(data.path(), &client.name, 10).unwrap().contains("forwarded to the owner"));
+    }
+
+    /// A fake `gh`: `pr view` fails until `pr create` ran; `pr comment` logs its arguments.
+    fn fake_gh(dir: &Path) -> PathBuf {
+        let gh = dir.join("fake-gh.sh");
+        let script = format!(
+            "#!/bin/sh\ncase \"$2\" in\n  view) test -f {d}/marker && echo https://example.test/pr/1 || exit 1 ;;\n  create) touch {d}/marker; echo creating; echo https://example.test/pr/1 ;;\n  comment) echo \"$@\" >> {d}/comments.log ;;\nesac\n",
+            d = dir.display()
+        );
+        std::fs::write(&gh, script).unwrap();
+        let mut perms = std::fs::metadata(&gh).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&gh, perms).unwrap();
+        gh
+    }
+
+    #[test]
+    fn forward_pr_twice_on_a_remote_repo() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        let repo = repo_of(&db, &lead);
+        let bare = tempfile::tempdir().unwrap();
+        sh(bare.path(), &["init", "--bare"]);
+        sh(&repo, &["remote", "add", "origin", &bare.path().to_string_lossy()]);
+        let base = crate::worktree::base_branch(&repo).unwrap();
+        sh(&repo, &["push", "origin", &base]);
+        let base_ref = sh(bare.path(), &["rev-parse", &base]);
+        unsafe { std::env::set_var("RUI_GH", fake_gh(bare.path())) };
+        let forward = |remarks: &str| logic::forward_pr(&db, data.path(), &lead, ForwardPrArgs { task_id: lead_id, remarks: remarks.into(), risk: None, reversible: None, if_approved: None });
+        let first = forward("first remarks");
+        let second = forward("second remarks");
+        unsafe { std::env::remove_var("RUI_GH") };
+        assert_eq!(first.unwrap()["pr_url"], "https://example.test/pr/1");
+        assert_eq!(second.unwrap()["pr_url"], "https://example.test/pr/1");
+        let branch = format!("rui/task-{lead_id}");
+        assert!(!sh(bare.path(), &["rev-parse", "--verify", &branch]).is_empty());
+        assert_eq!(sh(bare.path(), &["rev-parse", &base]), base_ref);
+        let log = std::fs::read_to_string(bare.path().join("comments.log")).unwrap();
+        assert!(log.contains("second remarks") && !log.contains("first remarks"), "{log}");
+    }
+
+    fn token(server: Server, task_id: Option<i64>) -> run_tokens::RunToken {
+        run_tokens::global().issue(RunGrant::new(server, task_id)).unwrap()
+    }
+
+    /// A JSON-RPC POST to `path` with `headers` added (the run token among them).
+    fn mcp_request(path: &str, headers: &[(&str, &str)], body: &Value) -> axum::http::Request<axum::body::Body> {
+        let mut req = axum::http::Request::post(path)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("host", "localhost")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
+            .header("host", "localhost");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.body(axum::body::Body::from(body.to_string())).unwrap()
+    }
+
+    fn init_body() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},
+            "clientInfo":{"name":"t","version":"1"}}})
+    }
+
+    async fn status(app: &axum::Router, path: &str, token: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+        let headers: Vec<(&str, &str)> = token.map(|t| (run_tokens::HEADER, t)).into_iter().collect();
+        app.clone().oneshot(mcp_request(path, &headers, &init_body())).await.unwrap().status()
+    }
+
+    async fn post(app: &axum::Router, path: &str, token: &str, body: Value) -> Value {
+        post_with(app, path, &[(run_tokens::HEADER, token)], body).await
+    }
+
+    async fn post_with(app: &axum::Router, path: &str, headers: &[(&str, &str)], body: Value) -> Value {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let resp = app.clone().oneshot(mcp_request(path, headers, &body)).await.unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let data = text.lines().find_map(|l| l.strip_prefix("data:")).unwrap_or(&text);
         serde_json::from_str(data.trim()).unwrap_or_else(|e| panic!("bad body {text:?}: {e}"))
     }
 
-    async fn tool_names(app: &axum::Router, path: &str) -> Vec<String> {
-        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":"2025-03-26","capabilities":{},
-            "clientInfo":{"name":"t","version":"1"}}});
-        let r = post(app, path, init).await;
+    async fn tool_names(app: &axum::Router, path: &str, server: Server) -> Vec<String> {
+        let t = token(server, None);
+        let r = post(app, path, t.value(), init_body()).await;
         assert!(r["result"].is_object(), "initialize failed: {r}");
         let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
-        let r = post(app, path, list).await;
+        let r = post(app, path, t.value(), list).await;
         let mut names: Vec<String> = r["result"]["tools"]
             .as_array()
             .unwrap_or_else(|| panic!("no tools: {r}"))
@@ -1496,12 +2353,56 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["create_subtask", "escalate", "mark_split", "rule", "set_done_command", "set_limit"];
-        assert_eq!(tool_names(&app, "/mcp/lead").await, lead);
+        let lead = ["ask_scout", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
+        assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
-        assert_eq!(tool_names(&app, "/mcp/builder").await, builder);
-        let rui = ["approve", "ask_owner", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "staff_task", "stop_apps", "stop_task", "use_repo"];
-        assert_eq!(tool_names(&app, "/mcp/rui").await, rui);
+        assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
+        let rui = ["approve", "ask_owner", "create_client", "create_task", "escalate_to_owner", "instruct_task", "report_status", "rule", "run_apps", "set_up_pod", "stop_apps", "stop_task", "use_repo"];
+        assert_eq!(tool_names(&app, "/mcp/rui", Server::Rui).await, rui);
+        assert_eq!(tool_names(&app, "/mcp/scout", Server::Scout).await, ["report"]);
+        assert_eq!(tool_names(&app, "/mcp/coach", Server::Coach).await, ["done", "propose"]);
+    }
+
+    fn test_router(db: Arc<Db>) -> axum::Router {
+        mcp_router(db, std::env::temp_dir(), Apps::default(), Runs::default())
+    }
+
+    #[tokio::test]
+    async fn mcp_needs_a_live_token_for_its_own_server() {
+        let app = test_router(Arc::new(Db::open_test()));
+        assert_eq!(status(&app, "/mcp/lead", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/lead", Some("not-a-token")).await, StatusCode::UNAUTHORIZED);
+        let builder = token(Server::Builder, Some(1));
+        assert_eq!(status(&app, "/mcp/lead", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/rui", Some(builder.value())).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&app, "/mcp/builder", Some(builder.value())).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_stops_working_once_the_run_guard_drops() {
+        let app = test_router(Arc::new(Db::open_test()));
+        let lead = token(Server::Lead, Some(1));
+        let value = lead.value().to_string();
+        assert_eq!(status(&app, "/mcp/lead", Some(&value)).await, StatusCode::OK);
+        drop(lead);
+        assert_eq!(status(&app, "/mcp/lead", Some(&value)).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn forged_task_header_cannot_redirect_a_builder() {
+        let (db, _data, lead, member) = staffed();
+        let db = Arc::new(db);
+        let app = test_router(db.clone());
+        let t = token(Server::Builder, member.task_id);
+        let other = lead.task_id.unwrap().to_string();
+        let forged = [(run_tokens::HEADER, t.value()), ("x-rui-task-id", other.as_str()), ("x-rui-source-ref", "chat:1")];
+        let call = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"report_progress","arguments":{"note":"forged"}}});
+        let r = post_with(&app, "/mcp/builder", &forged, call).await;
+        assert!(r["result"].is_object() && r["result"]["isError"] != true, "call failed: {r}");
+        let progress = |id: Option<i64>| db.list_events(id, 50).unwrap().into_iter().filter(|e| e.kind == "progress").count();
+        assert_eq!(progress(member.task_id), 1, "the note lands on the builder's own task");
+        assert_eq!(progress(lead.task_id), 0, "the forged header is ignored");
     }
 
     #[tokio::test]
@@ -1527,8 +2428,11 @@ mod tests {
             permission_mode: None,
             permission_prompt_tool: None,
             mcp_url: format!("http://127.0.0.1:{port}/mcp/rui"),
-            mcp_headers: vec![],
+            grant: crate::run_tokens::RunGrant::new(crate::run_tokens::Server::Rui, None),
             resume: None,
+            seat: None,
+            sandbox: None,
+            deny_secrets: None,
             partial: false,
         };
         let out = run_agent(&run, |l| {

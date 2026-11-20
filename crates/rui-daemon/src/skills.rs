@@ -122,19 +122,25 @@ fn git_common_dir(wt: &Path) -> Result<PathBuf> {
     Ok(if dir.is_absolute() { dir } else { wt.join(dir) })
 }
 
-const EXCLUDE_LINE: &str = ".claude/skills/";
+const SKILL_DIRS: [&str; 2] = [".claude/skills", ".agents/skills"];
 
-/// Adds `.claude/skills/` to the repo's `info/exclude` unless it is already there.
+/// Adds both installed-skill folders to the repo's `info/exclude`, each only once.
 fn exclude_installed_skills(wt: &Path) -> Result<()> {
     let info = git_common_dir(wt)?.join("info");
     std::fs::create_dir_all(&info)?;
     let file = info.join("exclude");
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
-    if text.lines().any(|l| l.trim() == EXCLUDE_LINE) {
-        return Ok(());
+    let mut text = std::fs::read_to_string(&file).unwrap_or_default();
+    for dir in SKILL_DIRS {
+        let line = format!("{dir}/");
+        if text.lines().any(|l| l.trim() == line) {
+            continue;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("{line}\n"));
     }
-    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-    std::fs::write(&file, format!("{text}{sep}{EXCLUDE_LINE}\n"))?;
+    std::fs::write(&file, text)?;
     Ok(())
 }
 
@@ -156,17 +162,18 @@ pub fn client_skills(data_dir: &Path, client: &str) -> Vec<String> {
     installable(data_dir, &names)
 }
 
-/// Copies the named skills into `<wt>/.claude/skills/`, replacing what is there, and keeps them out of git.
-/// Skills that are missing or switched off are skipped.
+/// Copies the named skills into `<wt>/.claude/skills/` and `<wt>/.agents/skills/`, replacing what is there,
+/// and keeps both folders out of git. Skills that are missing or switched off are skipped.
 pub fn install_skills(wt: &Path, data_dir: &Path, names: &[String]) -> Result<()> {
-    let target = wt.join(".claude/skills");
     for name in installable(data_dir, names) {
         let src = skills_dir(data_dir).join(&name);
-        let dst = target.join(&name);
-        if dst.exists() {
-            std::fs::remove_dir_all(&dst)?;
+        for dir in SKILL_DIRS {
+            let dst = wt.join(dir).join(&name);
+            if dst.exists() {
+                std::fs::remove_dir_all(&dst)?;
+            }
+            copy_dir(&src, &dst)?;
         }
-        copy_dir(&src, &dst)?;
     }
     exclude_installed_skills(wt)
 }
@@ -311,5 +318,17 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&files.stdout).trim(), "code.txt");
         let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.matches(".claude/skills/").count(), 1);
+        assert_eq!(exclude.matches(".agents/skills/").count(), 1);
+        assert!(repo.path().join(".agents/skills/s1/SKILL.md").exists());
+        assert!(repo.path().join(".claude/skills/s1/SKILL.md").exists());
+    }
+
+    #[test]
+    fn installed_skills_do_not_show_in_git_status() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), git_repo());
+        write(&data.path().join("skills/s1/SKILL.md"), "v1");
+        install_skills(repo.path(), data.path(), &["s1".to_string()]).unwrap();
+        let out = std::process::Command::new("git").arg("-C").arg(repo.path()).args(["status", "--porcelain"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
     }
 }

@@ -8,13 +8,16 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Landed work finished before this moment counts as already reviewed.
-const REVIEW_SINCE: &str = "2026-11-18 00:00:00";
 /// The reason line of a finished task that waits for the owner's review.
 pub const REVIEW_REASON: &str = "Finished, review the result";
-const CAUSES: [&str; 6] = ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup"];
-const KINDS: [&str; 9] =
-    ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "resumed", "dropped", "reviewed"];
+/// The reason line of a task whose PR was closed on GitHub without a merge.
+pub const PR_CLOSED_REASON: &str = "PR closed without merge";
+const CAUSES: [&str; 8] =
+    ["stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "pr_closed"];
+const KINDS: [&str; 13] = [
+    "stopped", "scheduler_error", "agent_error", "land_failed", "lead_no_outcome", "rollup", "loop_limit", "resumed", "dropped",
+    "reviewed", "pr_closed", "pr_merged", "forwarded",
+];
 
 /// What the owner sees for one task.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -178,6 +181,8 @@ fn cause_reason(e: &Event) -> String {
         "land_failed" => format!("Couldn't merge: conflicts in {} files", file_count(&e.payload["files"])),
         "lead_no_outcome" => "The Lead stopped without a plan".into(),
         "rollup" => "A teammate is stuck".into(),
+        "loop_limit" => "Hit its loop limit".into(),
+        "pr_closed" => PR_CLOSED_REASON.into(),
         _ => "Stuck".into(),
     }
 }
@@ -186,21 +191,20 @@ fn file_count(files: &Value) -> usize {
     files.as_array().map(Vec::len).or_else(|| files.as_u64().map(|n| n as usize)).unwrap_or(0)
 }
 
-/// Time as "YYYY-MM-DD HH:MM:SS..." so stored ISO times compare with `REVIEW_SINCE`.
-fn normalized(ts: &str) -> String {
-    ts.replacen('T', " ", 1)
-}
-
 fn done_state(t: &Task, ev: &[Event]) -> (&'static str, String) {
     if latest_id(ev, "dropped") > 0 {
         return ("Done", "Dropped by you".into());
     }
-    let reviewed = ev.iter().any(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok");
-    if reviewed {
-        return ("Done", "Reviewed by you".into());
+    let approved = ev.iter().filter(|e| e.kind == "reviewed" && e.payload["verdict"] == "ok").map(|e| e.id).max().unwrap_or(0);
+    let forwarded = latest_id(ev, "forwarded");
+    if t.parent_id.is_none() && latest_id(ev, "pr_merged") > forwarded && forwarded > 0 {
+        return ("Done", "Merged on GitHub".into());
     }
-    if t.parent_id.is_none() && normalized(&t.updated_at).as_str() >= REVIEW_SINCE {
+    if t.parent_id.is_none() && forwarded > approved {
         return ("Needs you", REVIEW_REASON.into());
+    }
+    if approved > 0 {
+        return ("Done", "Reviewed by you".into());
     }
     ("Done", "Finished".into())
 }
@@ -278,7 +282,6 @@ mod tests {
     }
 
     const NEW: &str = "2026-11-19T10:00:00.000Z";
-    const OLD: &str = "2026-11-10T10:00:00.000Z";
 
     fn word(t: &Task, events: &[Event], all: &[Task]) -> (&'static str, String) {
         let s = state(t, events, all, None);
@@ -337,17 +340,20 @@ mod tests {
     }
 
     #[test]
-    fn finished_work_needs_review_only_when_recent() {
-        let recent = task(1, None, TaskStatus::Done, NEW);
-        let old = task(2, None, TaskStatus::Done, OLD);
+    fn finished_work_needs_review_only_when_forwarded() {
+        let top = task(1, None, TaskStatus::Done, NEW);
         let member = task(3, Some(1), TaskStatus::Done, NEW);
-        assert_eq!(word(&recent, &[], &[]), ("Needs you", REVIEW_REASON.into()));
-        assert_eq!(word(&old, &[], &[]), ("Done", "Finished".into()));
-        assert_eq!(word(&member, &[], &[]), ("Done", "Finished".into()));
-        let ok = [ev(1, 1, "reviewed", json!({"verdict": "ok"}))];
-        assert_eq!(word(&recent, &ok, &[]), ("Done", "Reviewed by you".into()));
-        let changes = [ev(1, 1, "reviewed", json!({"verdict": "changes"}))];
-        assert_eq!(word(&recent, &changes, &[]).0, "Needs you");
+        let fwd = ev(1, 1, "forwarded", json!({"remarks": "ok"}));
+        assert_eq!(word(&top, &[], &[]), ("Done", "Finished".into()));
+        assert_eq!(word(&top, std::slice::from_ref(&fwd), &[]), ("Needs you", REVIEW_REASON.into()));
+        let member_fwd = [ev(1, 3, "forwarded", json!({}))];
+        assert_eq!(word(&member, &member_fwd, &[]), ("Done", "Finished".into()));
+        let ok = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "ok"}))];
+        assert_eq!(word(&top, &ok, &[]), ("Done", "Reviewed by you".into()));
+        let changes = [fwd.clone(), ev(2, 1, "reviewed", json!({"verdict": "changes"}))];
+        assert_eq!(word(&top, &changes, &[]).0, "Needs you");
+        let again = [fwd, ev(2, 1, "reviewed", json!({"verdict": "ok"})), ev(3, 1, "forwarded", json!({}))];
+        assert_eq!(word(&top, &again, &[]), ("Needs you", REVIEW_REASON.into()));
     }
 
     #[test]
@@ -433,5 +439,19 @@ mod tests {
         let states = all_states(&db).unwrap();
         assert_eq!((states[0].word, states[0].reason.as_str()), ("Stopped", "Stopped by you from Task page"));
         assert_eq!((states[1].word, states[1].reason.as_str()), ("Needs you", "Pick one"));
+    }
+
+    #[test]
+    fn loop_limit_on_a_subtask_needs_you() {
+        let parent = task(1, None, TaskStatus::Stuck, NEW);
+        let sub = task(2, Some(1), TaskStatus::Stuck, NEW);
+        let events = [ev(1, 1, "rollup", json!({"status": "stuck"})), ev(2, 2, "loop_limit", json!({"loops_used": 5, "max_loops": 5}))];
+        let mut facts = Facts::default();
+        for e in &events {
+            facts.events.entry(e.task_id.unwrap()).or_default().push(e.clone());
+        }
+        let s = state_in(&parent, &facts, &[parent.clone(), sub]);
+        assert_eq!(s.word, "Needs you");
+        assert!(s.reason.contains("loop limit"), "{}", s.reason);
     }
 }

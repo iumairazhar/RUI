@@ -30,7 +30,7 @@ mod tests {
     use super::*;
 
     fn item(kind: &str, id: i64) -> InboxItem {
-        InboxItem { kind: kind.into(), id, task_id: None, title: "t".into(), reason: "r".into(), actions: vec![], created_at: "a".into() }
+        InboxItem { kind: kind.into(), id, task_id: None, title: "t".into(), reason: "r".into(), actions: vec![], created_at: "a".into(), detail: None, link: None }
     }
 
     #[test]
