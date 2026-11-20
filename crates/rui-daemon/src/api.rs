@@ -331,9 +331,17 @@ async fn list_chats(State(s): State<ApiState>) -> ApiResult<Json<Vec<Chat>>> {
 }
 
 /// Creates a chat that opens with a Rui greeting.
-async fn create_chat(State(s): State<ApiState>) -> ApiResult<(StatusCode, Json<Chat>)> {
+/// Optional body of `POST /chats`. The app sends the Inbox count it shows, because only the
+/// app knows which items the owner snoozed or dismissed.
+#[derive(Deserialize, Default)]
+struct NewChat {
+    needs_you: Option<usize>,
+}
+
+async fn create_chat(State(s): State<ApiState>, body: Option<Json<NewChat>>) -> ApiResult<(StatusCode, Json<Chat>)> {
     let chat = s.db.create_chat()?;
-    let (in_loop, needs_you, open) = greeting_counts(&s.db)?;
+    let (in_loop, counted, open) = greeting_counts(&s.db)?;
+    let needs_you = body.and_then(|b| b.0.needs_you).unwrap_or(counted);
     let hour = chrono::Timelike::hour(&chrono::Local::now());
     s.db.add_chat_message(chat.id, ChatRole::Rui, &greeting(hour, in_loop, needs_you, open))?;
     let chat = s.db.get_chat(chat.id)?.ok_or_else(|| not_found("chat not found"))?;
@@ -1282,6 +1290,17 @@ mod tests {
         let (_, msgs) = call(&app, "GET", &format!("/chat?chat_id={cid}"), None).await;
         assert_eq!(msgs.as_array().unwrap().len(), 2);
         assert_eq!(msgs[0]["role"].as_str(), Some("rui"));
+    }
+
+    #[tokio::test]
+    async fn chat_greeting_uses_the_inbox_count_the_app_sends() {
+        let (app, db, _rx) = setup();
+        let (_, tid) = seed_task(&db);
+        db.create_ladder_question(tid, Role::Lead, "owner", &[], "Which provider?").unwrap();
+        let (_, c) = call(&app, "POST", "/chats", Some(json!({"needs_you": 0}))).await;
+        assert!(!c["last"].as_str().unwrap().contains("Inbox"), "{}", c["last"]);
+        let (_, c) = call(&app, "POST", "/chats", None).await;
+        assert!(c["last"].as_str().unwrap().contains("1 thing waits for you in the Inbox"), "{}", c["last"]);
     }
 
     #[tokio::test]

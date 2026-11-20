@@ -211,10 +211,10 @@ fn put<T: PartialEq>(slot: &mut T, new: T) -> bool {
 }
 
 /// Create the chat first when there is none, then post; returns the chat id.
-fn send_to(current: Option<i64>, text: &str, client: Option<&str>) -> anyhow::Result<i64> {
+fn send_to(current: Option<i64>, text: &str, client: Option<&str>, needs_you: usize) -> anyhow::Result<i64> {
     let id = match current {
         Some(id) => id,
-        None => api::create_chat()?.id,
+        None => api::create_chat(needs_you)?.id,
     };
     api::post_chat(id, text, client)?;
     Ok(id)
@@ -695,8 +695,9 @@ impl Store {
     pub fn send_chat(&mut self, text: String, cx: &mut Context<Self>) {
         let current = self.current_chat;
         let client = self.picked_client().map(|c| c.name.clone());
+        let needs = self.awake_inbox();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref()) }).await;
+            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref(), needs) }).await;
             this.update(cx, |s, cx| {
                 match res {
                     Ok(id) => {
@@ -751,11 +752,17 @@ impl Store {
         self.refresh(cx);
     }
 
+    /// Inbox items that are not snoozed or dismissed: the one "needs you" count every screen shows.
+    pub fn awake_inbox(&self) -> usize {
+        crate::views::inbox::awake_count(&self.inbox, &self.snoozed, now_secs())
+    }
+
     /// Create a chat in the background, select it, then refresh.
     pub fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.show_toast("New chat started", vec![], cx);
+        let needs = self.awake_inbox();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { api::create_chat() }).await;
+            let res = cx.background_executor().spawn(async move { api::create_chat(needs) }).await;
             this.update(cx, |s, cx| {
                 if let Ok(chat) = res {
                     s.select_chat(chat.id, cx);

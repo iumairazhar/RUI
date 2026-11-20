@@ -78,10 +78,12 @@ pub fn get_chats() -> Result<Vec<Chat>> {
     Ok(serde_json::from_value(get("/chats")?)?)
 }
 
-/// Create a chat; the daemon seeds it with Rui's first message.
-pub fn create_chat() -> Result<Chat> {
+/// Create a chat; the daemon seeds it with Rui's first message. `needs_you` is the Inbox count
+/// the app shows (snoozed items left out), so the greeting matches the Inbox.
+pub fn create_chat(needs_you: usize) -> Result<Chat> {
     let url = format!("{}/chats", base_url());
-    let body = agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(serde_json::json!({}))?.body_mut().read_json()?;
+    let req = serde_json::json!({ "needs_you": needs_you });
+    let body = agent().post(&url).header(OWNER_HEADER, owner_token()).send_json(req)?.body_mut().read_json()?;
     Ok(serde_json::from_value(body)?)
 }
 

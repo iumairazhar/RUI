@@ -255,8 +255,24 @@ fn board_thread(s: &Store, sum: &ThreadSummary) -> Option<Thread> {
     t.client = sum.client.name.clone();
     t.word = board_word(word_of(&s.states, sum.id), &sum.state);
     t.reason = sum.story.clone().unwrap_or_default();
-    t.needs = sum.needs_you_count;
+    t.needs = awake_for_thread(s, sum.id);
     Some(t)
+}
+
+/// Inbox items of one thread that are not snoozed or dismissed, so the card tag matches the Inbox.
+fn awake_for_thread(s: &Store, thread_id: i64) -> usize {
+    let now = crate::store::now_secs();
+    let mine = |i: &crate::api::InboxItem| i.task_id.is_some_and(|id| top_id(&s.tasks, id) == thread_id);
+    let awake = |i: &crate::api::InboxItem| !super::inbox::is_snoozed(&s.snoozed, &super::inbox::item_key(i), now);
+    s.inbox.iter().filter(|i| mine(i) && awake(i)).count()
+}
+
+/// The top-level task a task belongs to.
+fn top_id(tasks: &[Task], mut id: i64) -> i64 {
+    while let Some(parent) = tasks.iter().find(|t| t.id == id).and_then(|t| t.parent_id) {
+        id = parent;
+    }
+    id
 }
 
 /// The thread's word, except a task the app already shows as Stopped stays Stopped
@@ -1189,8 +1205,7 @@ fn seat_mark(status: &TaskStatus) -> Option<Div> {
 /// Counts for the lead line: agents holding a seat and threads that need the owner.
 fn lead_counts(s: &Store, threads: &[Thread]) -> (usize, usize) {
     let doing: Vec<i64> = threads.iter().filter(|t| t.word == Word::Working).map(|t| t.task.id).collect();
-    let needs = threads.iter().filter(|t| t.word == Word::NeedsYou).count();
-    (busy_count(&doing, &s.live), needs)
+    (busy_count(&doing, &s.live), s.awake_inbox())
 }
 
 /// "**4** working \u{b7} **1** need you"
@@ -1352,6 +1367,19 @@ mod tests {
         let s = LiveState { tool: Some("Bash".into()), tool_input: r#"{"command":"cargo te"#.into(), ..Default::default() };
         assert_eq!(live_sub(&s), "Running cargo te\u{2026}");
         assert_eq!(live_sub(&LiveState { thinking: true, ..Default::default() }), "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn top_id_walks_up_to_the_top_task() {
+        let task = |id: i64, parent: Option<i64>| -> Task {
+            serde_json::from_value(serde_json::json!({"id":id,"client_id":1,"parent_id":parent,"title":"t","body":"",
+                "status":"open","done_command":null,"max_loops":5,"loops_used":0,"role":"lead",
+                "branch":null,"source_kind":"user","source_ref":null,"depends_on":[],"agent":null,
+                "pod":[],"created_at":"a","updated_at":"b"}))
+            .unwrap()
+        };
+        let tasks = [task(1, None), task(2, Some(1)), task(3, Some(2))];
+        assert_eq!((top_id(&tasks, 3), top_id(&tasks, 1), top_id(&tasks, 9)), (1, 1, 9));
     }
 
     #[test]

@@ -334,8 +334,7 @@ impl Root {
 
     /// Inbox items that are not snoozed.
     fn open_questions(&self, cx: &Context<Self>) -> usize {
-        let s = self.store.read(cx);
-        views::inbox::awake_count(&s.inbox, &s.snoozed, store::now_secs())
+        self.store.read(cx).awake_inbox()
     }
 
     /// Switch to Cost → Seats.
