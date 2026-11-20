@@ -332,7 +332,8 @@ pub struct ThreadsView {
     /// The task page's Details section (model, team, effort) is open.
     details: bool,
     /// The thread and picked node the map was last scrolled for.
-    flow_key: Option<(i64, Option<String>)>,
+    /// Thread, picked node and viewport width the map was last scrolled for.
+    flow_key: Option<(i64, Option<String>, i32)>,
     /// Horizontal scroll of the map track.
     flow_scroll: ScrollHandle,
     /// The board's "Every thread" chart is shown.

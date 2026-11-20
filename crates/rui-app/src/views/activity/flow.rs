@@ -5,7 +5,7 @@ use super::{ThreadsView, mono, parse_secs};
 use crate::api::{Node, Thread};
 use crate::theme::{Status, Theme};
 use gpui::{
-    AnyElement, BoxShadow, Bounds, Context, FontWeight, Hsla, PathBuilder, Pixels, Rgba, Window, canvas, div, linear_color_stop,
+    AnyElement, BoxShadow, Bounds, Context, FontWeight, Hsla, PathBuilder, Pixels, Rgba, ScrollWheelEvent, Window, canvas, div, linear_color_stop,
     linear_gradient, point, prelude::*, px, svg,
 };
 
@@ -14,13 +14,21 @@ pub const LANES: [(&str, &str); 3] = [("in", "Came in"), ("work", "Agent work"),
 /// Width of the lane-label column left of the scrolling track.
 const GUTTER_W: f32 = 128.;
 /// The spine's y on the track, and the track's height.
-const SPINE_Y: f32 = 236.;
-const WORLD_H: f32 = 470.;
+const SPINE_Y: f32 = 196.;
+const WORLD_H: f32 = 390.;
+/// How far above or below the spine the first and second attached node sit.
+const NEAR: f32 = 108.;
+const FAR: f32 = 162.;
 /// Where the first spine node sits, from the track's left edge.
 const FIRST_X: f32 = 70.;
 const DOT: f32 = 34.;
 const DOT_SIDE: f32 = 28.;
 const LABEL_W: f32 = 200.;
+/// How far right of a dot its card ends (half dot, gap, card).
+const CARD_RIGHT: f32 = DOT / 2. + 10. + LABEL_W;
+/// The Now line sits this far right of the last started step, clear of its card.
+const NOW_AFTER: f32 = CARD_RIGHT + 24.;
+const _: () = assert!(NOW_AFTER > CARD_RIGHT);
 
 /// A point on the track, in pixels from its top-left corner.
 type Point = (f32, f32);
@@ -103,8 +111,8 @@ fn place_spine(nodes: &[Node], order: &[usize]) -> (Vec<Placed>, Option<f32>) {
         if let Some(prev) = out.last() {
             x += match (planned, prev.planned) {
                 (true, false) => {
-                    now_x = Some(x + 140.);
-                    290.
+                    now_x = Some(x + NOW_AFTER);
+                    NOW_AFTER + 50.
                 }
                 (true, true) => 245.,
                 _ => 262. + (16. * (1. + gap_minutes(&nodes[prev.node], &nodes[i])).log2()).min(70.),
@@ -117,7 +125,7 @@ fn place_spine(nodes: &[Node], order: &[usize]) -> (Vec<Placed>, Option<f32>) {
         && let Some(p) = last_started
         && is_active(&nodes[p.node].status)
     {
-        now_x = Some(p.x + 150.);
+        now_x = Some(p.x + NOW_AFTER);
     }
     (out, now_x)
 }
@@ -157,8 +165,8 @@ fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
         let ax = anchor.and_then(|a| spine.iter().find(|p| p.node == a)).map_or(FIRST_X, |p| p.x);
         let slot = (r - 1) as f32 * 24.;
         let (x, y) = match zone {
-            Zone::In => (ax - 40. + slot, SPINE_Y - if r == 1 { 128. } else { 200. }),
-            _ => (ax + 40. + slot, SPINE_Y + if r == 1 { 122. } else { 194. }),
+            Zone::In => (ax - 40. + slot, SPINE_Y - if r == 1 { NEAR } else { FAR }),
+            _ => (ax + 40. + slot, SPINE_Y + if r == 1 { NEAR } else { FAR }),
         };
         out.push(Placed { node: i, zone, planned: false, x, y, anchor });
     }
@@ -396,10 +404,23 @@ fn paint_strokes(b: Bounds<Pixels>, strokes: &[Stroke], window: &mut Window) {
 /// the picked node when that would leave it out of view, and kept inside the world.
 fn scroll_target(focus: f32, picked: Option<f32>, viewport: f32, world: f32) -> f32 {
     let mut left = focus - viewport * 0.6;
-    if let Some(x) = picked.filter(|x| *x < left + 40. || *x > left + viewport - 100.) {
+    if let Some(x) = picked.filter(|x| !card_in_view(*x, left, viewport)) {
         left = x - viewport * 0.5;
     }
     left.clamp(0., (world - viewport).max(0.))
+}
+
+/// Whether the dot at `x` and its whole card fit between `left` and the viewport's right edge.
+fn card_in_view(x: f32, left: f32, viewport: f32) -> bool {
+    x - DOT >= left && x + CARD_RIGHT + 16. <= left + viewport
+}
+
+/// A mostly-vertical wheel or swipe over the map pans it sideways; returns the new left edge.
+fn pan_left(left: f32, dx: f32, dy: f32, max: f32) -> Option<f32> {
+    if max <= 0. || dy.abs() <= dx.abs() {
+        return None;
+    }
+    Some((left - dy).clamp(0., max))
 }
 
 /// The highlighted node: the one the side panel shows for this thread, else its default node.
@@ -417,27 +438,49 @@ impl ThreadsView {
         self.sync_flow_scroll(t, cx);
         let track = div().id("flow-track").flex_1().min_w_0().h_full().overflow_x_scroll().track_scroll(&self.flow_scroll);
         let track = track.child(self.track(t, th, cx));
-        div().id("flow").flex().w_full().h(px(WORLD_H)).child(gutter(th)).child(track).into_any_element()
+        let pan = div().id("flow-pan").flex_1().min_w_0().h_full().flex().child(track);
+        let pan = pan.on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| this.pan_flow(ev, window, cx)));
+        div().id("flow").flex().w_full().h(px(WORLD_H)).child(gutter(th)).child(pan).into_any_element()
+    }
+
+    /// Vertical wheel or swipe over the map moves it sideways, and the page under it stays put.
+    /// A plain mouse wheel (no sideways part) is already moved by the track itself.
+    fn pan_flow(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let d = ev.delta.pixel_delta(window.line_height());
+        let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+        let max = f32::from(self.flow_scroll.max_offset().width);
+        let left = -f32::from(self.flow_scroll.offset().x);
+        if max <= 0. || dy.abs() <= dx.abs() {
+            return;
+        }
+        cx.stop_propagation();
+        if dx == 0. {
+            return;
+        }
+        if let Some(x) = pan_left(left, dx, dy, max) {
+            self.flow_scroll.set_offset(point(px(-x), px(0.)));
+            cx.notify();
+        }
     }
 
     /// Scroll the map so the Now line (and the picked node) is in view: when a thread opens, and
     /// when the picked node changes to one that is off screen.
     fn sync_flow_scroll(&mut self, t: &Thread, cx: &mut Context<Self>) {
         let picked = selected_id(self, t);
-        let key = (t.id, picked.clone());
-        if self.flow_key.as_ref() == Some(&key) {
-            return;
-        }
         let viewport = f32::from(self.flow_scroll.bounds().size.width);
         if viewport <= 0. {
             cx.notify();
             return;
         }
+        let key = (t.id, picked.clone(), viewport.round() as i32);
+        if self.flow_key.as_ref() == Some(&key) {
+            return;
+        }
         let l = layout(&t.nodes);
         let picked_x = picked.and_then(|id| l.placed.iter().find(|p| t.nodes[p.node].id == id).map(|p| p.x));
         let left = -f32::from(self.flow_scroll.offset().x);
-        let in_view = picked_x.is_some_and(|x| x >= left && x <= left + viewport);
-        let same_thread = self.flow_key.as_ref().is_some_and(|k| k.0 == t.id);
+        let in_view = picked_x.is_some_and(|x| card_in_view(x, left, viewport));
+        let same_thread = self.flow_key.as_ref().is_some_and(|k| k.0 == t.id && k.2 == key.2);
         self.flow_key = Some(key);
         if same_thread && in_view {
             return;
@@ -476,7 +519,7 @@ impl ThreadsView {
 
 /// The three lane names at the canvas's left edge, each with a coloured bar and a sub-line.
 fn gutter(th: &Theme) -> AnyElement {
-    let label = |row: usize| lane_label(row, th).absolute().left(px(18.)).top(px(SPINE_Y + (row as f32 - 1.) * 150. - 24.));
+    let label = |row: usize| lane_label(row, th).absolute().left(px(18.)).top(px(SPINE_Y + (row as f32 - 1.) * NEAR - 24.));
     let col = div().relative().flex_none().w(px(GUTTER_W)).h_full();
     col.child(label(0)).child(label(1)).child(label(2)).into_any_element()
 }
@@ -683,6 +726,15 @@ mod tests {
     }
 
     #[test]
+    fn vertical_wheel_pans_sideways_within_the_map() {
+        assert_eq!(pan_left(100., 0.5, -40., 500.), Some(140.));
+        assert_eq!(pan_left(10., 0., 40., 500.), Some(0.));
+        assert_eq!(pan_left(490., 0., -40., 500.), Some(500.));
+        assert_eq!(pan_left(100., 30., 5., 500.), None);
+        assert_eq!(pan_left(100., 0., -40., 0.), None);
+    }
+
+    #[test]
     fn hhmm_wraps_the_day() {
         assert_eq!(hhmm(0), "00:00");
         assert_eq!(hhmm(23 * 3600 + 5 * 60 + 59), "23:05");
@@ -725,8 +777,8 @@ mod tests {
         let xs: Vec<f32> = l.placed.iter().map(|p| p.x).collect();
         let first_gap = 262. + 16. * 6f32.log2();
         assert!(close(xs[0], 70.) && close(xs[1], 70. + first_gap));
-        assert!(close(xs[2], xs[1] + 290.) && close(xs[3], xs[2] + 245.));
-        assert!(close(l.now_x.unwrap(), xs[1] + 140.));
+        assert!(close(xs[2], xs[1] + NOW_AFTER + 50.) && close(xs[3], xs[2] + 245.));
+        assert!(close(l.now_x.unwrap(), xs[1] + NOW_AFTER));
         assert!(l.placed.iter().all(|p| close(p.y, SPINE_Y)));
         assert_eq!(l.placed.iter().map(|p| p.planned).collect::<Vec<_>>(), [false, false, true, true]);
     }
@@ -741,7 +793,7 @@ mod tests {
     #[test]
     fn now_follows_an_active_last_step_only() {
         let a = node("a", "work", "running", "2026-11-18 10:00:00");
-        assert!(close(layout(std::slice::from_ref(&a)).now_x.unwrap(), 70. + 150.));
+        assert!(close(layout(std::slice::from_ref(&a)).now_x.unwrap(), 70. + NOW_AFTER));
         let done = node("a", "work", "done", "2026-11-18 10:00:00");
         assert_eq!(layout(&[done]).now_x, None);
         assert_eq!(layout(&[]).now_x, None);
@@ -759,10 +811,10 @@ mod tests {
         let ax = at(&l, &nodes, "a").x;
         let i = at(&l, &nodes, "i");
         assert_eq!((i.zone, i.anchor.map(|n| nodes[n].id.as_str())), (Zone::In, Some("a")));
-        assert!(close(i.x, ax - 40.) && close(i.y, SPINE_Y - 128.));
+        assert!(close(i.x, ax - 40.) && close(i.y, SPINE_Y - NEAR));
         let (o1, o2) = (at(&l, &nodes, "o1"), at(&l, &nodes, "o2"));
-        assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + 122.));
-        assert!(close(o2.x, ax + 40. + 24.) && close(o2.y, SPINE_Y + 194.));
+        assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + NEAR));
+        assert!(close(o2.x, ax + 40. + 24.) && close(o2.y, SPINE_Y + FAR));
     }
 
     #[test]
@@ -784,7 +836,7 @@ mod tests {
         assert_eq!(e[2], Edge::Seg { kind: EdgeKind::Plan, x0: nx, x1: p });
         let Edge::Link { from, to, hue } = e[3] else { panic!("{e:?}") };
         assert_eq!((from, hue), ((b, SPINE_Y + 18.), Hue::Done));
-        assert!(close(to.0, b + 40.) && close(to.1, SPINE_Y + 122. - 14.));
+        assert!(close(to.0, b + 40.) && close(to.1, SPINE_Y + NEAR - 14.));
         assert_eq!(e.len(), 4);
     }
 
