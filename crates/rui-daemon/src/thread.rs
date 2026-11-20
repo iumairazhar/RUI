@@ -113,6 +113,7 @@ pub struct ThreadSummary {
     pub story: Option<String>,
     pub needs_you_count: usize,
     pub updated_at: String,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,7 +299,9 @@ fn instruction_nodes(ctx: &Ctx) -> Vec<Node> {
 }
 
 fn answer_nodes(ctx: &Ctx) -> Vec<Node> {
-    let answered = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Answered && q.level == "owner");
+    // Questions closed by dropping the task weren't answered by the owner: leave them off the map.
+    let dropped = |q: &&Question| q.answer.as_deref() == Some(crate::control::DROPPED_ANSWER);
+    let answered = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Answered && q.level == "owner").filter(|q| !dropped(q));
     let title = |q: &Question| format!("You answered: {}", q.answer.as_deref().unwrap_or_default());
     answered.map(|q| node(format!("q:{}", q.id), "in", "answer", "done", title(q), &q.created_at)).collect()
 }
@@ -671,20 +674,41 @@ pub const DONE_KEEP_SECS: i64 = 7 * 24 * 3600;
 
 /// Every thread, optionally narrowed to one client and one state. Threads that need you come
 /// first, then the most recently active. Old done threads are skipped unless `all` is set.
-pub fn summaries(db: &Db, client_id: Option<i64>, state: Option<&str>, all: bool, now: i64, stall: i64) -> Result<Vec<ThreadSummary>> {
+/// Which threads a listing shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Show {
+    /// Visible threads, without old done ones.
+    Recent,
+    /// Every thread, hidden ones too.
+    All,
+    /// Only hidden threads that were not removed.
+    Hidden,
+}
+
+/// True when the thread belongs in a listing of `show`, by its hidden state alone.
+fn shown(h: &crate::hide::Hidden, id: i64, show: Show) -> bool {
+    match show {
+        Show::Recent => !h.is_hidden(id),
+        Show::All => true,
+        Show::Hidden => h.is_hidden(id) && !h.is_removed(id),
+    }
+}
+
+pub fn summaries(db: &Db, client_id: Option<i64>, state: Option<&str>, show: Show, now: i64, stall: i64) -> Result<Vec<ThreadSummary>> {
+    let hidden = crate::hide::hidden(db)?;
     let mut built = vec![];
     for t in db.list_tasks()?.into_iter().filter(|t| t.parent_id.is_none()) {
-        if client_id.is_some_and(|c| c != t.client_id) {
+        if client_id.is_some_and(|c| c != t.client_id) || !shown(&hidden, t.id, show) {
             continue;
         }
         let th = build(db, &t, now, stall)?;
-        if state.is_some_and(|s| s != th.state) || (!all && is_old_done(db, &th, now)?) {
+        if state.is_some_and(|s| s != th.state) || (show == Show::Recent && is_old_done(db, &th, now)?) {
             continue;
         }
         built.push((th, t.updated_at));
     }
     built.sort_by_key(|(th, _)| (th.state != "needs_you", std::cmp::Reverse(th.last_event_id)));
-    Ok(built.into_iter().map(|(th, updated_at)| summary(th, updated_at)).collect())
+    Ok(built.into_iter().map(|(th, updated_at)| summary(th, updated_at, &hidden)).collect())
 }
 
 /// True when the thread is done and nothing in it has happened for DONE_KEEP_SECS.
@@ -697,9 +721,9 @@ fn is_old_done(db: &Db, th: &Thread, now: i64) -> Result<bool> {
     Ok(now - last > DONE_KEEP_SECS)
 }
 
-fn summary(th: Thread, updated_at: String) -> ThreadSummary {
-    let count = th.needs_you.len();
-    ThreadSummary { id: th.id, client: th.client, title: th.title, state: th.state, story: th.story, needs_you_count: count, updated_at }
+fn summary(th: Thread, updated_at: String, h: &crate::hide::Hidden) -> ThreadSummary {
+    let (count, hidden) = (th.needs_you.len(), h.is_hidden(th.id));
+    ThreadSummary { id: th.id, client: th.client, title: th.title, state: th.state, story: th.story, needs_you_count: count, updated_at, hidden }
 }
 
 /// One node with its events, oldest first, one page at a time. A subtask also shows its tool calls.
@@ -1077,6 +1101,15 @@ mod tests {
     }
 
     #[test]
+    fn questions_closed_by_a_drop_are_not_shown_as_answers() {
+        let (db, _top, sub) = setup(TaskStatus::InProgress);
+        let q = db.create_ladder_question(sub, Role::Builder, "owner", &[], "Pick").unwrap();
+        db.answer_question(q.id, crate::control::DROPPED_ANSWER, None).unwrap();
+        let th = get(&db, _top, real_now());
+        assert!(!kinds(&th).contains(&"answer"));
+    }
+
+    #[test]
     fn plan_node_shows_the_planning_turn_steps_and_cost() {
         let (db, top, _sub) = setup(TaskStatus::InProgress);
         let think = db.add_event(Some(top), "lead", "assistant", &json!({"text": "two parts"})).unwrap();
@@ -1154,7 +1187,8 @@ mod tests {
     }
 
     fn listed(db: &Db, all: bool, now: i64) -> usize {
-        summaries(db, None, None, all, now, STALL_SECS).unwrap().len()
+        let show = if all { Show::All } else { Show::Recent };
+        summaries(db, None, None, show, now, STALL_SECS).unwrap().len()
     }
 
     /// A done thread and the epoch second of its last activity.

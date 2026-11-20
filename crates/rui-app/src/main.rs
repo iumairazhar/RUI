@@ -498,7 +498,7 @@ impl Render for Root {
             .child(self.header(&th, cx))
             .child(self.rail(&th, cx))
             .children(self.limit_notice(&th, cx))
-            .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
+            .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &self.store, &th)))
             .children(self.results.read(cx).is_open().then(|| self.results.clone()))
     }
 }

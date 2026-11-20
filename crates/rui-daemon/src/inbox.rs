@@ -185,6 +185,14 @@ fn seat_items(db: &Db) -> Result<Vec<InboxItem>> {
     }])
 }
 
+/// Leaves out items that belong to a hidden thread.
+fn drop_hidden(db: &Db, tasks: &[Task], items: &mut Vec<InboxItem>) -> Result<()> {
+    let hidden = crate::hide::hidden(db)?;
+    let top = |id: i64| tasks.iter().find(|t| t.id == id).map_or(id, top_of);
+    items.retain(|i| i.task_id.is_none_or(|id| !hidden.is_hidden(top(id))));
+    Ok(())
+}
+
 /// All inbox items, newest first.
 pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     let mut items = question_items(db)?;
@@ -204,6 +212,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     items.extend(crate::coach::inbox_items(db)?);
     items.extend(crate::email::inbox_items(db)?);
     items.extend(crate::deploy::inbox_items(db)?);
+    drop_hidden(db, &tasks, &mut items)?;
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)
 }

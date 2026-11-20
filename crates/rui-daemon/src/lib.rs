@@ -13,6 +13,7 @@ pub mod deploy;
 pub mod drop;
 pub mod email;
 pub mod heartbeat;
+pub mod hide;
 pub mod inbox;
 pub mod inputs_api;
 pub mod library;
