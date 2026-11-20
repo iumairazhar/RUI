@@ -22,8 +22,8 @@ use views::motion::{self, spring};
 use views::section::{Sec, active_tab, empty_page};
 use views::{
     activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, client_knowledge::ClientDrawer, clients,
-    inbox::{InboxPanel, PanelEvent},
-    library::Tooltip, playbook, questions::QuestionsView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
+    inbox::InboxPanel,
+    library::Tooltip, playbook, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
     spend::{Mode as SpendMode, SpendView},
 };
 
@@ -140,7 +140,7 @@ struct Root {
     /// Bumped on every selection so the pill animation restarts.
     pill_seq: usize,
     chat: Entity<ChatView>,
-    questions: Entity<QuestionsView>,
+    inbox: Entity<InboxPanel>,
     activity: Entity<ThreadsView>,
     agents: Entity<AgentsView>,
     apps: Entity<AppsView>,
@@ -151,9 +151,6 @@ struct Root {
     results: Entity<ResultsView>,
     /// Drawer of the client opened from the Clients page.
     client_drawer: Entity<ClientDrawer>,
-    /// The Inbox slide-over, shown over the current page while `inbox_open`.
-    inbox: Entity<InboxPanel>,
-    inbox_open: bool,
 }
 
 impl Root {
@@ -190,16 +187,12 @@ impl Root {
             cx.notify();
         })
         .detach();
-        let inbox = cx.new(|cx| InboxPanel::new(store.clone(), cx));
-        cx.subscribe(&inbox, |this, _, ev: &PanelEvent, cx| this.panel_event(ev, cx)).detach();
         Self {
-            inbox,
-            inbox_open: false,
             nav: Nav::from_env(),
             pill_from: Nav::from_env(),
             pill_seq: 0,
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
-            questions: cx.new(|cx| QuestionsView::new(store.clone(), cx)),
+            inbox: cx.new(|cx| InboxPanel::new(store.clone(), cx)),
             activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
             agents: cx.new(|cx| AgentsView::new(store.clone(), cx)),
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
@@ -218,7 +211,7 @@ impl Root {
         let tab = |sec| active_tab(sec, cx);
         match self.nav {
             Nav::Rui => self.chat.clone().into_any_element(),
-            Nav::Inbox => self.questions.clone().into_any_element(),
+            Nav::Inbox => self.inbox.clone().into_any_element(),
             Nav::Work => match tab(Sec::Work) {
                 0 => self.activity.clone().into_any_element(),
                 _ => self.apps.clone().into_any_element(),
@@ -312,34 +305,16 @@ impl Root {
         views::inbox::awake_count(&s.inbox, &s.snoozed, store::now_secs())
     }
 
-    /// Switch to Cost → Seats, closing the Inbox slide-over if it is open.
+    /// Switch to Cost → Seats.
     fn go_to_seats(&mut self, cx: &mut Context<Self>) {
         self.store.update(cx, |s, _| s.tabs.insert(Sec::Cost.key(), 1));
-        if self.inbox_open {
-            self.inbox.update(cx, |p, cx| p.close(cx));
-        }
         self.select(Nav::Cost, cx);
     }
 
-    /// Open the Inbox slide-over on the Decisions tab with one question's row expanded.
-    /// Switch to the Inbox page with one question open, closing the slide-over if it is up.
+    /// Switch to the Inbox page with one question's card open.
     fn open_in_inbox(&mut self, qid: i64, cx: &mut Context<Self>) {
-        if self.inbox_open {
-            self.inbox.update(cx, |p, cx| p.close(cx));
-        }
         self.select(Nav::Inbox, cx);
-        self.questions.update(cx, |q, cx| q.open_kind("question", qid, cx));
-    }
-
-    fn panel_event(&mut self, ev: &PanelEvent, cx: &mut Context<Self>) {
-        self.inbox_open = false;
-        if let PanelEvent::OpenFull(item) = ev {
-            self.select(Nav::Inbox, cx);
-            if let Some((kind, id)) = item.clone() {
-                self.questions.update(cx, |q, cx| q.open_kind(&kind, id, cx));
-            }
-        }
-        cx.notify();
+        self.inbox.update(cx, |p, cx| p.open_item("question", qid, cx));
     }
 
     fn badge(&self, th: &Theme, count: usize) -> impl IntoElement + use<> {
@@ -492,7 +467,6 @@ impl Render for Root {
             .child(self.rail(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
             .children(self.results.read(cx).is_open().then(|| self.results.clone()))
-            .children(self.inbox_open.then(|| self.inbox.clone()))
     }
 }
 

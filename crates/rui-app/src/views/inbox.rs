@@ -1,32 +1,22 @@
-//! The Inbox slide-over: what needs the owner, over the current page. Items can be snoozed.
+//! The Inbox page: Suite-style cards for what needs the owner. Items can be snoozed.
 
 use super::activity::{icon, local_offset};
 use super::decision::{self, CardEvent, Cards};
-use super::library::{after_slide, close_button, scrim, slide_overlay};
 use super::asks::{self, AskInputs};
 use super::inbox_kinds::{self as kinds, Kind};
-use super::{chip, primary_button};
+use super::{chip, page_head, primary_button};
 use crate::api::InboxItem;
 use crate::text_input::{Submit, TextInput};
 use crate::store::{self, ItemKey, Store, now_secs};
 use crate::theme::{Status, Theme, theme};
-use gpui::{AnyElement, Context, Div, Entity, EventEmitter, FontWeight, ScrollHandle, Stateful, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Entity, FontWeight, ScrollHandle, Stateful, Window, div, prelude::*, px};
 use decision::{Act, CardData};
 use rui_core::ChatAsk;
 use std::collections::HashMap;
 
-const PANEL_W: f32 = 440.;
+const PAGE_W: f32 = 760.;
 const EMPTY_TEXT: &str = "Nothing is waiting on you. Every thread settled below you.";
 const NONE_SNOOZED: &str = "Nothing is snoozed.";
-
-/// What the panel asks the root to do.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelEvent {
-    /// The slide-out finished; remove the panel.
-    Close,
-    /// Go to the full Inbox page, opening this item's drawer when given.
-    OpenFull(Option<ItemKey>),
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -107,7 +97,7 @@ enum TaskAct {
     Approve,
 }
 
-/// The slide-over panel with its tabs, rows and snooze menus.
+/// The Inbox page with its tabs, cards and snooze menus.
 pub struct InboxPanel {
     store: Entity<Store>,
     tab: Tab,
@@ -124,32 +114,23 @@ pub struct InboxPanel {
     scroll: ScrollHandle,
     /// Row to scroll into view on the next render.
     scroll_to: Option<ItemKey>,
-    closing: bool,
 }
-
-impl EventEmitter<PanelEvent> for InboxPanel {}
 
 impl InboxPanel {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
         Self {
             store, tab: Tab::All, menu: None, expanded: None, cards: Cards::default(), ask_inputs: AskInputs::default(),
-            notes: HashMap::new(), reveal: false, scroll: ScrollHandle::new(), scroll_to: None, closing: false,
+            notes: HashMap::new(), reveal: false, scroll: ScrollHandle::new(), scroll_to: None,
         }
     }
 
-    /// Slide out, then tell the root to remove the panel.
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.closing {
-            return;
-        }
-        self.closing = true;
-        cx.notify();
-        after_slide(cx, |v, cx| {
-            if v.closing {
-                cx.emit(PanelEvent::Close);
-            }
-        });
+    /// Show the All tab with one item's card open, scrolled into view.
+    pub fn open_item(&mut self, kind: &str, id: i64, cx: &mut Context<Self>) {
+        (self.menu, self.tab, self.expanded) = (None, Tab::All, None);
+        let key = (kind.to_string(), id);
+        self.scroll_to = Some(key.clone());
+        self.expand(key, cx);
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -183,13 +164,11 @@ impl InboxPanel {
             CardEvent::Open { thread_id, .. } => s.open_thread(*thread_id, cx),
             CardEvent::Review { thread_id } => s.open_changes(*thread_id, cx),
         });
-        cx.emit(PanelEvent::Close);
     }
 
-    /// Open a task's thread and leave the panel.
+    /// Open a task's thread.
     fn open_task(&mut self, task_id: i64, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| s.open_thread(task_id, cx));
-        cx.emit(PanelEvent::Close);
     }
 
     /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
@@ -460,17 +439,9 @@ fn sheet_acts(d: &crate::api::Decision) -> Vec<Act> {
     decision::acts(d).into_iter().filter(|a| !matches!(a, Act::RaiseLimit | Act::Stop)).collect()
 }
 
-// ---- panel ----
+// ---- page ----
 
 impl InboxPanel {
-    fn head(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let title = div().flex_1().text_size(px(17.)).font_weight(FontWeight::BOLD).text_color(th.fg).child("Inbox");
-        let full = div().id("inbox-p-full").text_size(px(12.)).text_color(th.run.fg).cursor_pointer().child("Open full Inbox");
-        let full = full.on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::OpenFull(None))));
-        let close = close_button("inbox-p-close", Self::close, th, cx);
-        div().flex().items_center().gap(px(12.)).px(px(20.)).pt(px(18.)).child(title).child(full).child(close).into_any_element()
-    }
-
     /// "All", "Decisions 2" and "Snoozed" as one segmented bar.
     fn tabs(&self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let s = self.store.read(cx);
@@ -479,7 +450,7 @@ impl InboxPanel {
         let tabs = [(Tab::All, "All".to_string()), (Tab::Decisions, decisions), (Tab::Snoozed, "Snoozed".to_string())];
         let items: Vec<AnyElement> = tabs.into_iter().enumerate().map(|(i, (tab, label))| self.tab_button(i, tab, label, th, cx)).collect();
         let bar = div().id("inbox-p-tabs").flex().gap(px(2.)).p(px(3.)).rounded(px(10.)).bg(th.well).border_1().border_color(th.hairline);
-        div().px(px(20.)).pt(px(14.)).pb(px(10.)).child(bar.children(items)).into_any_element()
+        div().pb(px(12.)).child(bar.children(items)).into_any_element()
     }
 
     fn tab_button(&self, i: usize, tab: Tab, label: String, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -503,7 +474,7 @@ impl InboxPanel {
 
     fn list(&mut self, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let items = self.items(cx);
-        let body = div().id("inbox-p-list").track_scroll(&self.scroll).flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(10.)).px(px(20.)).pb(px(20.));
+        let body = div().id("inbox-p-list").track_scroll(&self.scroll).flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(10.)).pr(px(40.)).pb(px(28.));
         if items.is_empty() {
             let text = if self.tab == Tab::Snoozed { NONE_SNOOZED } else { EMPTY_TEXT };
             return body.child(div().pt(px(12.)).text_size(px(12.5)).text_color(th.muted).child(text)).into_any_element();
@@ -522,11 +493,9 @@ impl Render for InboxPanel {
         let th = theme(cx).clone();
         let asks: Vec<ChatAsk> = self.store.read(cx).asks.iter().filter(|a| a.status == "open").cloned().collect();
         self.ask_inputs.sync(&asks.iter().collect::<Vec<_>>(), Self::answer_ask, cx);
-        let shell = div().id("inbox-p-panel").occlude().absolute().right(px(10.)).top(px(10.)).bottom(px(10.)).w(px(PANEL_W));
-        let shell = shell.flex().flex_col().overflow_hidden().rounded(px(16.)).bg(th.stage).shadow(th.card_shadow());
-        let panel = shell.border_1().border_color(th.glass_rim).child(self.head(&th, cx)).child(self.tabs(&th, cx)).child(self.list(&th, cx));
-        let back = scrim("inbox-p-scrim", Self::close, cx);
-        slide_overlay("inbox-p", back, panel.into_any_element(), self.closing)
+        let top = div().flex().flex_col().w_full().max_w(px(PAGE_W)).child(page_head("NEEDS A DECISION", "Inbox", cx)).child(self.tabs(&th, cx));
+        let col = div().flex().flex_col().flex_1().min_h_0().w_full().max_w(px(PAGE_W)).child(self.list(&th, cx));
+        div().id("inbox-page").flex().flex_col().size_full().child(top).child(col)
     }
 }
 
