@@ -252,6 +252,10 @@ fn queue_instruction(db: &Db, runs: &Runs, task: &Task, text: &str, by: &str) ->
 /// The note says what was resumed, if anything.
 pub fn instruct(db: &Db, runs: &Runs, id: i64, text: &str, by: &str) -> Res<(Task, Option<String>)> {
     let task = load(db, id)?;
+    // A finished top-level task waiting for the owner's review: the message wakes its Lead.
+    if task.status == TaskStatus::Done && task.parent_id.is_none() && task.role == Role::Lead {
+        return Ok((wake_lead(db, runs, id, text, by)?, Some("The Lead will pick this up and continue the work.".into())));
+    }
     let blocked = match task.status {
         TaskStatus::Done | TaskStatus::WaitingAnswer => true,
         TaskStatus::Split => task.role != Role::Lead,
@@ -345,6 +349,19 @@ mod tests {
         let actions = crate::scheduler::plan_tick(&db, &Default::default()).unwrap();
         assert!(actions.iter().any(|a| matches!(a, crate::scheduler::Action::StartLead { task_id, .. } if *task_id == parent.id)));
         assert!(matches!(instruct(&db, &runs, subs[2].id, "x", "rui"), Err(ControlError::Conflict(_))));
+    }
+
+    #[test]
+    fn instruct_on_a_done_parent_wakes_its_lead() {
+        let (db, runs) = (Db::open_test(), Runs::default());
+        let (parent, subs) = pod(&db);
+        db.set_task_status(parent.id, TaskStatus::Done).unwrap();
+        let (t, note) = instruct(&db, &runs, parent.id, "make the header bigger", "owner").unwrap();
+        assert_eq!(t.status, TaskStatus::New);
+        assert!(note.is_some());
+        assert_eq!(db.pending_instructions(parent.id).unwrap().len(), 1);
+        db.set_task_status(subs[0].id, TaskStatus::Done).unwrap();
+        assert!(matches!(instruct(&db, &runs, subs[0].id, "x", "owner"), Err(ControlError::Conflict(_))));
     }
 
     fn titled(db: &Db, client: i64, parent: Option<i64>, role: Role, status: TaskStatus, title: &str) -> Task {
