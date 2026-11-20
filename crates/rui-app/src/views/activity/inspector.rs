@@ -21,6 +21,8 @@ pub(super) struct Inspect {
     take: Option<TakeOver>,
     /// The owner clicked this node; otherwise it is the thread's default node.
     picked: bool,
+    /// The "What happened" text is expanded; it starts as a one-line preview.
+    story_open: bool,
 }
 
 /// Add a newer page to what is loaded; without `append` the new page replaces it.
@@ -150,7 +152,7 @@ impl ThreadsView {
     }
 
     fn show_node(&mut self, thread_id: i64, node_id: String, picked: bool, cx: &mut Context<Self>) {
-        self.inspect = Some(Inspect { thread_id, node_id, page: None, error: None, take: None, picked });
+        self.inspect = Some(Inspect { thread_id, node_id, page: None, error: None, take: None, picked, story_open: false });
         self.note.update(cx, |i, cx| i.clear(cx));
         self.fetch_page(None, cx);
         self.follow(cx);
@@ -296,15 +298,28 @@ impl ThreadsView {
 
     /// A decision: what happened, then the amber "If approved" box with its buttons.
     fn decision_rows(&self, n: &Node, d: &CardData, card: Entity<DecisionCard>, i: &Inspect, th: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let story = happened_text(n, &d.decision).map(|text| {
-            let label = div().text_size(px(11.5)).text_color(th.muted).child("What happened");
-            let text = div().mt(px(6.)).text_size(px(13.5)).text_color(th.fg).child(text);
-            div().child(label).child(text).into_any_element()
-        });
+        let open = self.inspect.as_ref().is_some_and(|i| i.story_open);
+        let story = happened_text(n, &d.decision).map(|text| self.story_row(text, open, th, cx));
         let mut rows: Vec<AnyElement> = story.into_iter().collect();
         rows.push(self.approve_box(n, d, card, th, cx));
         rows.extend(self.controls(n, i, th, cx));
         rows
+    }
+
+    /// "What happened": one line until clicked, the full text with a "Hide" link once open.
+    fn story_row(&self, text: String, open: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let toggle = cx.listener(|this, _, _, cx| {
+            if let Some(i) = this.inspect.as_mut() {
+                i.story_open = !i.story_open;
+            }
+            cx.notify();
+        });
+        let link = div().text_size(px(11.5)).text_color(th.accent_text).child(if open { "Hide" } else { "Show" });
+        let head = div().flex().items_center().justify_between().child(div().text_size(px(11.5)).text_color(th.muted).child("What happened")).child(link);
+        let body = div().mt(px(6.)).text_size(px(13.5)).text_color(th.fg);
+        let body = if open { body.child(text) } else { body.overflow_hidden().whitespace_nowrap().text_ellipsis().child(text) };
+        let row = div().id("inspector-story").cursor_pointer().child(head).child(body);
+        row.on_click(toggle).into_any_element()
     }
 
     /// "If approved, <agent> will", the numbered steps, the review link and the buttons.
