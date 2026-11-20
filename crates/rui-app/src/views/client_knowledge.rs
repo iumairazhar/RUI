@@ -1,6 +1,8 @@
 //! Client drawer: what the owner knows about one client, and a box to add more.
 
+
 use super::client_deploy::DeployPanel;
+use super::client_edit::{Done, EditPanel};
 use super::client_triggers::TriggerPanel;
 use super::library::{self as lib, after_slide, run, slide_overlay, toast};
 use super::{markdown, primary_button};
@@ -42,6 +44,7 @@ pub struct ClientDrawer {
     busy: bool,
     triggers: Entity<TriggerPanel>,
     deploy: Entity<DeployPanel>,
+    edit: Entity<EditPanel>,
 }
 
 impl ClientDrawer {
@@ -50,15 +53,19 @@ impl ClientDrawer {
         cx.subscribe(&editor, |this, _, _: &Save, cx| this.add(cx)).detach();
         let triggers = cx.new(|cx| TriggerPanel::new(store.clone(), cx));
         let deploy = cx.new(|cx| DeployPanel::new(store.clone(), cx));
-        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers, deploy }
+        let edit = cx.new(|cx| EditPanel::new(store.clone(), cx));
+        cx.subscribe(&edit, |this, _, _: &Done, cx| this.close(cx)).detach();
+        Self { store, open: None, closing: false, text: None, editor, busy: false, triggers, deploy, edit }
     }
 
     /// Open the drawer for a client and load its knowledge.
     pub fn open(&mut self, id: i64, name: String, cx: &mut Context<Self>) {
+        let edit_name = name.clone();
         (self.open, self.closing, self.text, self.busy) = (Some((id, name)), false, None, false);
         self.editor.update(cx, |e, cx| e.set_text("", cx));
         self.triggers.update(cx, |t, cx| t.open(id, cx));
         self.deploy.update(cx, |d, cx| d.open(id, cx));
+        self.edit.update(cx, |e, cx| e.open(id, edit_name, cx));
         run(cx, move || api::get_knowledge(id), move |v, res, cx| v.loaded(id, res, cx));
         cx.notify();
     }
@@ -149,7 +156,8 @@ impl ClientDrawer {
         let known = known.into_any_element();
         let auto = self.triggers.clone().into_any_element();
         let deploy = self.deploy.clone().into_any_element();
-        let body = lib::scroll_body("client-drawer-body", vec![known, auto, deploy]);
+        let edit = self.edit.clone().into_any_element();
+        let body = lib::scroll_body("client-drawer-body", vec![known, auto, deploy, edit]);
         lib::drawer_shell("client-drawer", th).child(self.head(name, th, cx)).child(body).into_any_element()
     }
 }

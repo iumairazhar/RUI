@@ -408,6 +408,7 @@ pub fn library(method: &str, path: &str, body: Option<serde_json::Value>) -> Res
         "GET" => agent.get(&url).header(OWNER_HEADER, owner_token()).call()?,
         "DELETE" => agent.delete(&url).header(OWNER_HEADER, owner_token()).call()?,
         "PUT" => agent.put(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
+        "PATCH" => agent.patch(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
         _ => agent.post(&url).header(OWNER_HEADER, owner_token()).send_json(body)?,
     };
     let json: serde_json::Value = res.body_mut().read_json().unwrap_or(serde_json::Value::Null);
@@ -434,6 +435,21 @@ pub fn skill_files(name: &str) -> Result<serde_json::Value> {
 /// Create a client from a repo folder. Errors carry the daemon's `{error}` text.
 pub fn create_client(name: &str, repo_path: &str) -> Result<serde_json::Value> {
     library("POST", "/clients", Some(serde_json::json!({ "name": name, "repo_path": repo_path })))
+}
+
+/// One client with its extra allowed web hosts, as `{..client, hosts}`.
+pub fn get_client(id: i64) -> Result<serde_json::Value> {
+    library("GET", &format!("/clients/{id}"), None)
+}
+
+/// Change a client's name, repo folder or hosts; `body` holds only the fields to change.
+pub fn update_client(id: i64, body: serde_json::Value) -> Result<serde_json::Value> {
+    library("PATCH", &format!("/clients/{id}"), Some(body))
+}
+
+/// Delete a client and its threads and history. The repo folder is not touched.
+pub fn delete_client(id: i64) -> Result<serde_json::Value> {
+    library("DELETE", &format!("/clients/{id}"), None)
 }
 
 /// What the owner wrote down about a client, as `{text}`.

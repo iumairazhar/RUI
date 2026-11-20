@@ -72,6 +72,7 @@ fn require_text(s: &str, field: &str) -> ApiResult<()> {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/clients", get(list_clients).post(create_client_http))
+        .route("/clients/{id}", get(get_client_http).patch(update_client_http).delete(delete_client_http))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/questions", get(list_questions))
         .route("/questions/{id}/answer", post(answer_question))
@@ -162,6 +163,106 @@ async fn create_client_http(State(s): State<ApiState>, Json(b): Json<NewClient>)
     }
     let client = crate::mcp::logic::register_client(&s.db, &s.data_dir, name, &b.repo_path, None, &[]).map_err(|e| bad_request(&e.to_string()))?;
     Ok((StatusCode::CREATED, Json(client)))
+}
+
+#[derive(serde::Serialize)]
+struct ClientDetail {
+    #[serde(flatten)]
+    client: Client,
+    hosts: Vec<String>,
+}
+
+fn client_hosts(s: &ApiState, name: &str) -> Vec<String> {
+    crate::client_state::read_client(&s.data_dir, name).ok().flatten().map(|c| c.network_hosts).unwrap_or_default()
+}
+
+/// One client with its extra allowed web hosts (from its client.json).
+async fn get_client_http(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<ClientDetail>> {
+    let client = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let hosts = client_hosts(&s, &client.name);
+    Ok(Json(ClientDetail { client, hosts }))
+}
+
+#[derive(Deserialize)]
+struct ClientPatch {
+    name: Option<String>,
+    repo_path: Option<String>,
+    hosts: Option<Vec<String>>,
+}
+
+/// Trims hosts, drops empty and repeated ones.
+fn clean_hosts(hosts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        if !out.iter().any(|o| o == h) {
+            out.push(h.to_string());
+        }
+    }
+    out
+}
+
+/// Checks a new name: not empty, usable as a folder name, and not taken by another client.
+fn check_new_name(s: &ApiState, old: &Client, name: &str) -> ApiResult<()> {
+    require_text(name, "name")?;
+    if crate::projects::slug(name).is_empty() {
+        return Err(bad_request("name needs at least one letter or digit"));
+    }
+    if s.db.get_client_by_name(name)?.is_some_and(|c| c.id != old.id) {
+        return Err(conflict(&format!("client '{name}' already exists")));
+    }
+    let (from, to) = (crate::client_state::dir(&s.data_dir, &old.name), crate::client_state::dir(&s.data_dir, name));
+    if from != to && to.exists() {
+        return Err(conflict("a folder for that name already exists"));
+    }
+    Ok(())
+}
+
+/// Moves the client's state folder to the new name.
+fn rename_state_dir(s: &ApiState, old: &str, new: &str) -> ApiResult<()> {
+    let (from, to) = (crate::client_state::dir(&s.data_dir, old), crate::client_state::dir(&s.data_dir, new));
+    if from != to && from.exists() {
+        std::fs::rename(from, to).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Changes a client's name, repo folder and allowed web hosts.
+async fn update_client_http(State(s): State<ApiState>, Path(id): Path<i64>, Json(b): Json<ClientPatch>) -> ApiResult<Json<ClientDetail>> {
+    let old = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let name = b.name.as_deref().map(str::trim).unwrap_or(&old.name).to_string();
+    check_new_name(&s, &old, &name)?;
+    let repo = b.repo_path.as_deref().map(str::trim).unwrap_or(&old.repo_path);
+    let path = crate::scheduler::expand_home(repo);
+    if !path.is_dir() {
+        return Err(bad_request(&format!("repo_path {} does not exist", path.display())));
+    }
+    let hosts = b.hosts.as_deref().map(clean_hosts).unwrap_or_else(|| client_hosts(&s, &old.name));
+    rename_state_dir(&s, &old.name, &name)?;
+    let client = s.db.update_client(id, &name, &path.to_string_lossy())?;
+    let mut file = crate::client_state::ensure(&s.data_dir, &client.name, &client.repo_path, None)?;
+    file.network_hosts = hosts.clone();
+    let json = serde_json::to_string_pretty(&file).map_err(anyhow::Error::from)?;
+    std::fs::write(crate::client_state::dir(&s.data_dir, &client.name).join("client.json"), json).map_err(anyhow::Error::from)?;
+    if old.name != client.name {
+        apps::stop_project(&s.apps, &old.name);
+    }
+    Ok(Json(ClientDetail { client, hosts }))
+}
+
+/// Stops the client's running work and deletes it with its tasks and history. The repo folder and
+/// task worktrees stay on disk.
+async fn delete_client_http(State(s): State<ApiState>, Path(id): Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    let client = s.db.get_client(id)?.ok_or_else(|| not_found("client not found"))?;
+    let open: Vec<i64> = (s.db.list_tasks()?.iter())
+        .filter(|t| t.client_id == id && t.parent_id.is_none() && !matches!(t.status, TaskStatus::Done | TaskStatus::Stuck))
+        .map(|t| t.id)
+        .collect();
+    for task in open {
+        crate::control::stop_tree(&s.db, &s.runs, task, "owner", Some("Clients"), Some("client deleted"))?;
+    }
+    apps::stop_project(&s.apps, &client.name);
+    s.db.delete_client_cascade(id)?;
+    Ok(Json(serde_json::json!({ "deleted": id })))
 }
 
 async fn list_tasks(State(s): State<ApiState>) -> ApiResult<Json<Vec<Task>>> {
@@ -928,6 +1029,60 @@ mod tests {
         assert_eq!(call(&app, "POST", "/clients", Some(bad)).await.0, StatusCode::BAD_REQUEST);
         let empty = json!({"name": " ", "repo_path": repo.path().to_string_lossy()});
         assert_eq!(call(&app, "POST", "/clients", Some(empty)).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git").arg("-C").arg(repo.path()).arg("init").output().unwrap();
+        assert!(ok.status.success());
+        repo
+    }
+
+    #[tokio::test]
+    async fn patch_client_renames_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.path().to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        let app = router(state);
+        let repo = git_repo();
+        let other = db.create_client("taken", "/repo", None, &[]).unwrap();
+        let body = json!({"name": "newco", "repo_path": repo.path().to_string_lossy()});
+        let (_, c) = call(&app, "POST", "/clients", Some(body)).await;
+        let id = c["id"].as_i64().unwrap();
+        let url = format!("/clients/{id}");
+        let patch = json!({"name": "renamed", "hosts": ["a.example.com", " a.example.com ", "b.example.com"]});
+        let (st, v) = call(&app, "PATCH", &url, Some(patch)).await;
+        assert_eq!((st, v["name"].as_str()), (StatusCode::OK, Some("renamed")));
+        assert_eq!(v["hosts"], json!(["a.example.com", "b.example.com"]));
+        let (_, got) = call(&app, "GET", &url, None).await;
+        assert_eq!(got["hosts"], json!(["a.example.com", "b.example.com"]));
+        let dup = json!({"name": "taken"});
+        assert_eq!(call(&app, "PATCH", &url, Some(dup)).await.0, StatusCode::CONFLICT);
+        let bad = json!({"repo_path": "/no/such/folder/here"});
+        assert_eq!(call(&app, "PATCH", &url, Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let empty = json!({"name": " "});
+        assert_eq!(call(&app, "PATCH", &url, Some(empty)).await.0, StatusCode::BAD_REQUEST);
+        let missing = json!({"name": "x"});
+        assert_eq!(call(&app, "PATCH", "/clients/9999", Some(missing)).await.0, StatusCode::NOT_FOUND);
+        assert!(db.get_client(other.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_client_cascades_and_404s() {
+        let (app, db, _rx) = setup();
+        let (client, task) = seed_task(&db);
+        let (other, keep) = {
+            let o = db.create_client("keeper", "/repo", None, &[]).unwrap();
+            (o.id, seed_task_for(&db, o.id))
+        };
+        let (st, _) = call(&app, "DELETE", &format!("/clients/{client}"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(db.get_client(client).unwrap().is_none());
+        assert!(db.get_task(task).unwrap().is_none());
+        assert!(db.get_client(other).unwrap().is_some());
+        assert!(db.get_task(keep).unwrap().is_some());
+        assert_eq!(call(&app, "DELETE", &format!("/clients/{client}"), None).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
