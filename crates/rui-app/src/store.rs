@@ -676,9 +676,12 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref()) }).await;
             this.update(cx, |s, cx| {
-                if let Ok(id) = res {
-                    s.adopt_new_chat_pick(id);
-                    s.current_chat.get_or_insert(id);
+                match res {
+                    Ok(id) => {
+                        s.adopt_new_chat_pick(id);
+                        s.current_chat.get_or_insert(id);
+                    }
+                    Err(e) => s.show_toast(&format!("Couldn't send your message: {e:#}"), vec![], cx),
                 }
                 s.refresh(cx);
             })
