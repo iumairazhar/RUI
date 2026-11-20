@@ -2,6 +2,7 @@
 
 mod cards;
 mod form;
+pub mod limit_ring;
 pub mod limits;
 
 use super::activity::section;

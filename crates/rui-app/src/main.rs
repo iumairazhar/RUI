@@ -139,6 +139,8 @@ struct Root {
     pill_from: Nav,
     /// Bumped on every selection so the pill animation restarts.
     pill_seq: usize,
+    /// Level the limit notice was dismissed at; a worse level shows it again.
+    limit_dismissed: Option<seat::limits::Level>,
     chat: Entity<ChatView>,
     inbox: Entity<InboxPanel>,
     activity: Entity<ThreadsView>,
@@ -191,6 +193,7 @@ impl Root {
             nav: Nav::from_env(),
             pill_from: Nav::from_env(),
             pill_seq: 0,
+            limit_dismissed: None,
             chat: cx.new(|cx| ChatView::new(store.clone(), cx)),
             inbox: cx.new(|cx| InboxPanel::new(store.clone(), cx)),
             activity: cx.new(|cx| ThreadsView::new(store.clone(), cx)),
@@ -279,7 +282,10 @@ impl Root {
     fn summary(&self, cx: &Context<Self>) -> String {
         let s = self.store.read(cx);
         let base = summary_text(s.clients.len(), open_threads(&s.tasks), seat::seats_free(s));
-        let limit = s.seat.as_ref().and_then(|x| seat::limits::summary(x, views::activity::local_offset()));
+        if self.limit_shown(cx) {
+            return base;
+        }
+        let limit = s.seat.as_ref().and_then(|x| seat::limits::summary(x, store::now_secs(), views::activity::local_offset()));
         limit.map_or(base.clone(), |l| format!("{base} \u{b7} {l}"))
     }
 
@@ -299,6 +305,31 @@ impl Root {
             .child(div().id("header-title").text_size(px(15.)).font_weight(FontWeight::BOLD).child("Rui"))
             .child(div().id("header-summary").text_size(px(12.)).text_color(th.muted).child(self.summary(cx)))
             .children(error.map(|e| e.text_size(px(12.))))
+    }
+
+    /// The limit pill's numbers, when it should show.
+    fn limit_info(&self, cx: &App) -> Option<seat::limit_ring::RingInfo> {
+        let seat = self.store.read(cx).seat.as_ref()?;
+        let info = seat::limit_ring::info(seat, store::now_secs(), views::activity::local_offset())?;
+        seat::limit_ring::visible(&info, self.limit_dismissed).then_some(info)
+    }
+
+    fn limit_shown(&self, cx: &App) -> bool {
+        self.limit_info(cx).is_some()
+    }
+
+    /// Title-bar pill with the 5-hour limit left; click opens Seats, × hides it.
+    fn limit_notice(&self, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let info = self.limit_info(cx)?;
+        let (row, dismiss) = seat::limit_ring::body(&info, th);
+        let level = info.level;
+        let row = row.id("limit-ring-open").cursor_pointer().on_click(cx.listener(|v, _, _, cx| v.go_to_seats(cx)));
+        let dismiss = dismiss.on_click(cx.listener(move |v, _, _, cx| {
+            cx.stop_propagation();
+            v.limit_dismissed = Some(level);
+            cx.notify();
+        }));
+        Some(seat::limit_ring::card(row.into_any_element(), dismiss.into_any_element(), th).into_any_element())
     }
 
     /// Inbox items that are not snoozed.
@@ -467,6 +498,7 @@ impl Render for Root {
             .child(self.content(cx))
             .child(self.header(&th, cx))
             .child(self.rail(&th, cx))
+            .children(self.limit_notice(&th, cx))
             .children(self.store.read(cx).toast.as_ref().map(|t| views::toast::toast(t, &th)))
             .children(self.results.read(cx).is_open().then(|| self.results.clone()))
     }

@@ -10,7 +10,7 @@ const EMPTY: &str = "No limit data yet. It appears after the next agent run.";
 const DAY: i64 = 86_400;
 
 /// How close a window is to its limit; picks the bar color.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Fine,
     Close,
@@ -83,9 +83,12 @@ pub fn clock(at: i64, offset: i64) -> String {
 }
 
 /// "62% of 5-hour limit used, resets 14:00" for the title bar; the 5-hour window first.
-pub fn summary(seat: &SeatInfo, offset: i64) -> Option<String> {
+pub fn summary(seat: &SeatInfo, now: i64, offset: i64) -> Option<String> {
     let w = seat.limits.iter().find(|w| w.name == "five_hour").or(seat.limits.first())?;
     let label = window_label(&w.name);
+    if let Some(at) = w.resets_at.filter(|at| *at <= now) {
+        return Some(format!("{label} limit reset at {}", clock(at, offset)));
+    }
     let reset = w.resets_at.map(|at| format!(", resets {}", clock(at, offset))).unwrap_or_default();
     match (w.used_pct, w.status.as_deref()) {
         (Some(p), _) => Some(format!("{p:.0}% of {label} limit used{reset}")),
@@ -178,10 +181,12 @@ mod tests {
     #[test]
     fn title_bar_summary_text() {
         let w = LimitWindow { name: "five_hour".into(), used_pct: Some(62.4), resets_at: Some(14 * 3600), status: None };
-        assert_eq!(summary(&seat_with(w), 0).as_deref(), Some("62% of 5-hour limit used, resets 14:00"));
+        assert_eq!(summary(&seat_with(w), 0, 0).as_deref(), Some("62% of 5-hour limit used, resets 14:00"));
         let w = LimitWindow { name: "five_hour".into(), used_pct: None, resets_at: Some(14 * 3600), status: Some("allowed".into()) };
-        assert_eq!(summary(&seat_with(w), 3600).as_deref(), Some("5-hour limit allowed, resets 15:00"));
-        assert_eq!(summary(&SeatInfo::default(), 0), None);
+        assert_eq!(summary(&seat_with(w), 0, 3600).as_deref(), Some("5-hour limit allowed, resets 15:00"));
+        assert_eq!(summary(&SeatInfo::default(), 0, 0), None);
+        let w = LimitWindow { name: "five_hour".into(), used_pct: Some(53.0), resets_at: Some(3600), status: None };
+        assert_eq!(summary(&seat_with(w), 7200, 0).as_deref(), Some("5-hour limit reset at 01:00"));
     }
 
     #[test]
