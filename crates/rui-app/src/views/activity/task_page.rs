@@ -12,7 +12,6 @@ use crate::views::trace::trace;
 use crate::views::{chip, tag};
 use super::char_state;
 use gpui::{AnyElement, Context, Div, FontWeight, div, prelude::*, px};
-use rui_core::TaskStatus;
 
 const RESUME_TEXT: &str = "Resume where you left off.";
 
@@ -92,7 +91,8 @@ impl ThreadsView {
             Tab::Results => section("Files it produced", self.result_rows(&results, th, cx)),
         };
         let scroll = div().id("task-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll);
-        let composer = (t.task.status != TaskStatus::Done).then(|| self.composer(t, th, cx));
+        // Always there, like Suite: a done thread can still take a message or be waiting on you.
+        let composer = Some(self.composer(t, th, cx));
         let details = self.details.then(|| self.details_section(t, all, now, th, cx));
         let has_flow = t.task.parent_id.is_none();
         let switch = self.tabs(has_flow, !results.is_empty(), has_flow, th, cx);
