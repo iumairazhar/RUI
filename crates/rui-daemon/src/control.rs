@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::scheduler::Runs;
-use rui_core::{Role, Task, TaskStatus};
+use rui_core::{QuestionStatus, Role, Task, TaskStatus};
 use serde_json::json;
 
 /// Why a control call failed.
@@ -108,8 +108,18 @@ pub fn drop_task(db: &Db, runs: &Runs, id: i64) -> Res<Vec<i64>> {
     // Every teammate is dropped too, so none of them lingers as "Stopped".
     for i in &ids {
         db.add_event(Some(*i), "owner", "dropped", &json!({"by": "owner"}))?;
+        close_open_questions(db, *i)?;
     }
     Ok(ids)
+}
+
+/// Closes a dropped task's open questions so they stop showing as "Needs you". Nothing is
+/// delivered to an agent: the task is no longer running.
+fn close_open_questions(db: &Db, task_id: i64) -> Res<()> {
+    for q in db.questions_for_task(task_id)?.into_iter().filter(|q| q.status == QuestionStatus::Open) {
+        db.answer_question(q.id, "Dropped by the owner", None)?;
+    }
+    Ok(())
 }
 
 /// Records the owner's verdict on landed work. "changes" sends the text back to the Lead.
@@ -406,9 +416,11 @@ mod tests {
         let c = db.create_client("c", "/tmp/c", None, &[]).unwrap();
         let lead = titled(&db, c.id, None, Role::Lead, TaskStatus::Stuck, "Pod Lead");
         let research = titled(&db, c.id, Some(lead.id), Role::Builder, TaskStatus::Stuck, "Researcher 01");
+        let q = db.create_question(research.id, Role::Builder, "Which browser?").unwrap();
         drop_task(&db, &runs, lead.id).unwrap();
         let dropped: Vec<Option<i64>> = db.events_of_kinds(&["dropped"]).unwrap().iter().map(|e| e.task_id).collect();
         assert_eq!(dropped, vec![Some(lead.id), Some(research.id)]);
+        assert_eq!(db.get_question(q.id).unwrap().unwrap().status, QuestionStatus::Answered);
     }
 
     #[test]
