@@ -411,8 +411,65 @@ pub fn current_limits(db: &Db) -> Result<(Vec<rui_core::LimitWindow>, Option<i64
     Ok((w, at))
 }
 
+/// Fresh limits are older than this: check again.
+const LIMITS_STALE_SECS: i64 = 20 * 60;
+/// Never run the check more often than this.
+const PROBE_GAP_SECS: i64 = 10 * 60;
+
+/// True when the limits should be checked: none known, a window's reset has passed,
+/// or the newest numbers are older than LIMITS_STALE_SECS.
+pub fn limits_stale(limits: &[rui_core::LimitWindow], seen_at: Option<i64>, now: i64) -> bool {
+    let Some(seen) = seen_at else { return true };
+    let reset_passed = limits.iter().any(|w| w.resets_at.is_some_and(|at| at <= now));
+    reset_passed || now - seen > LIMITS_STALE_SECS
+}
+
+/// Every minute: when the limits are stale, run a tiny Claude turn that only reports them.
+/// One check costs a fraction of a cent of the 5-hour limit; it runs at most every 10 minutes.
+pub async fn probe_loop(db: std::sync::Arc<Db>) {
+    let mut last_probe = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let now = crate::thread::now_secs();
+        let Ok((limits, seen)) = current_limits(&db) else { continue };
+        if now - last_probe < PROBE_GAP_SECS || !limits_stale(&limits, seen, now) {
+            continue;
+        }
+        last_probe = now;
+        probe_limits().await;
+    }
+}
+
+/// Runs `claude -p` once with no tools and no MCP servers and records the rate-limit line it sends.
+async fn probe_limits() {
+    let bin = std::env::var("RUI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["-p", "Reply with just: ok", "--model", "haiku", "--max-turns", "1"])
+        .args(["--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--tools", ""])
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let run = tokio::time::timeout(std::time::Duration::from_secs(90), cmd.output());
+    let Ok(Ok(out)) = run.await else { return };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            record_limits(&v, crate::thread::now_secs());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn limits_are_stale_when_unknown_old_or_past_reset() {
+        let w = |at| vec![rui_core::LimitWindow { name: "five_hour".into(), used_pct: Some(10.0), resets_at: Some(at), status: None }];
+        assert!(super::limits_stale(&[], None, 1000));
+        assert!(!super::limits_stale(&w(5000), Some(900), 1000));
+        assert!(super::limits_stale(&w(950), Some(900), 1000));
+        assert!(super::limits_stale(&w(99_999), Some(0), 2000));
+    }
+
     use super::*;
 
     const REAL_LIMIT_LINE: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795170600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.42,"resetsAt":1795170600,"status":"allowed"},"seven_day":{"utilization":0.7,"resetsAt":1795402800,"status":"allowed"}}}}"#;
