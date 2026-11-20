@@ -424,6 +424,10 @@ impl ThreadsView {
         let checks = p.done_checks.iter().enumerate().map(|(k, c)| check_row(k, c, th)).collect();
         let cost = vec![mono(12., th.fg, cost_text(p.cost_usd)).into_any_element()];
         let mut out = vec![section("What happened", or_none(rows, th))];
+        if n.kind == "meeting" {
+            let answers = meeting_answers(&p.events).iter().map(|a| answer_block(a, th)).collect();
+            out.push(section("Answers", or_none(answers, th)));
+        }
         out.push(section("What it produced", or_none(produced(n, th), th)));
         out.extend([section("Tool calls", or_none(tools, th)), section("Done check", or_none(checks, th))]);
         out.push(section("Cost", cost));
@@ -510,6 +514,39 @@ fn produced(n: &Node, th: &Theme) -> Vec<AnyElement> {
     std::iter::once(label.into_any_element()).chain(url).chain(preview).collect()
 }
 
+/// One role's answer in a planning meeting.
+#[derive(Debug, PartialEq)]
+pub struct Answer {
+    pub role: String,
+    pub approach: String,
+    pub risks: Vec<String>,
+    pub needs: Vec<String>,
+    pub size: String,
+    pub proof: String,
+}
+
+/// The meeting's `team_reply` events as answers, oldest first.
+pub fn meeting_answers(evs: &[Event]) -> Vec<Answer> {
+    let s = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
+    let list = |p: &serde_json::Value, k: &str| p[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+    let to_answer = |e: &Event| {
+        let p = &e.payload;
+        Answer { role: s(p, "role"), approach: s(p, "approach"), risks: list(p, "risks"), needs: list(p, "needs"), size: s(p, "size"), proof: s(p, "proof") }
+    };
+    evs.iter().filter(|e| e.kind == "team_reply").map(to_answer).collect()
+}
+
+/// A role's answer: name and size, then approach, risks, needs and proof.
+fn answer_block(a: &Answer, th: &Theme) -> AnyElement {
+    let head = div().flex().items_center().gap(px(8.)).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg);
+    let head = head.child(a.role.clone()).child(tag(&th.run, &format!("Size {}", a.size)));
+    let line = |label: &str, text: String| div().text_size(px(12.)).text_color(th.fg_2).child(format!("{label}: {text}"));
+    let joined = |v: &[String]| if v.is_empty() { "none".to_string() } else { v.join("; ") };
+    let body = [("Approach", a.approach.clone()), ("Risks", joined(&a.risks)), ("Needs", joined(&a.needs)), ("Proof", a.proof.clone())];
+    let rows = body.into_iter().map(|(l, t)| line(l, t));
+    div().flex().flex_col().gap(px(4.)).p(px(10.)).rounded(px(8.)).bg(th.well).child(head).children(rows).into_any_element()
+}
+
 fn check_row(k: usize, c: &api::DoneCheck, th: &Theme) -> AnyElement {
     let st = if c.passed { &th.done } else { &th.block };
     let word = tag(st, if c.passed { "Passed" } else { "Failed" });
@@ -545,6 +582,16 @@ mod tests {
     fn page(ids: &[i64], next: Option<i64>, cost: f64) -> Inspector {
         let events = ids.iter().map(|&i| ev(i, "progress", json!({}))).collect();
         Inspector { node_id: "n".into(), events, cost_usd: cost, done_checks: vec![DoneCheck::default()], next_after_id: next }
+    }
+
+    #[test]
+    fn meeting_answers_read_each_reply() {
+        let reply = json!({"role":"tester","approach":"tests first","risks":["flaky"],"needs":["backend: api"],"size":"M","proof":"cargo test"});
+        let evs = [ev(1, "team_asked", json!({"roles":["tester"]})), ev(2, "team_reply", reply)];
+        let a = meeting_answers(&evs);
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].role.as_str(), a[0].size.as_str(), a[0].proof.as_str()), ("tester", "M", "cargo test"));
+        assert_eq!((a[0].risks.clone(), a[0].needs.clone()), (vec!["flaky".to_string()], vec!["backend: api".to_string()]));
     }
 
     #[test]

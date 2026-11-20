@@ -301,7 +301,7 @@ fn kind_hue(kind: &str) -> Option<Hue> {
     Some(match kind {
         "alert" | "schedule" | "armed" | "decision" => Hue::Wait,
         "message" => Hue::Plain,
-        "taskIn" | "taskOut" => Hue::Think,
+        "taskIn" | "taskOut" | "meeting" => Hue::Think,
         "step" => Hue::Run,
         "pr" | "deploy" | "email" | "doc" | "demo" | "result" => Hue::Done,
         _ => return None,
@@ -623,6 +623,7 @@ fn kind_label(kind: &str, zone: Zone) -> &'static str {
         "demo" => "Demo",
         "result" => "Test result",
         "taskOut" => "Task for the team",
+        "meeting" => "Planning meeting",
         _ => match zone {
             Zone::In => "Came in",
             Zone::Out => "Went out",

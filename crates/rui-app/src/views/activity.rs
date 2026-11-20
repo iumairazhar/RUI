@@ -151,6 +151,8 @@ pub fn summarize(e: &Event) -> (String, bool) {
         "stuck" => (with_opt("stuck", str_or(p, "reason")), true),
         "progress" => (with_opt("progress", str_or(p, "note")), false),
         "tool_call" => (with_opt("tool", str_or(p, "tool")), false),
+        "team_asked" => (with_opt("asked the team", str_or(p, "question")), false),
+        "team_reply" => (format!("{} answered · size {}", str_or(p, "role").unwrap_or("?"), str_or(p, "size").unwrap_or("?")), false),
         other => (other.to_string(), false),
     }
 }
