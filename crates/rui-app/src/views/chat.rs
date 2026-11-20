@@ -31,6 +31,8 @@ pub struct ChatView {
     confirm_delete: Option<(i64, String)>,
     open_tools: HashSet<String>,
     client_menu: bool,
+    /// "Saved to ..." lines per Rui message of the current chat.
+    saved: HashMap<i64, Vec<String>>,
 }
 
 impl ChatView {
@@ -39,7 +41,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false }
+        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false, saved: HashMap::new() }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -138,9 +140,12 @@ impl ChatView {
     /// A message with its cards, then the answered asks that were put to the owner right after it.
     fn message_with_asks(&self, m: &ChatMessage, asks: Option<&Vec<ChatAsk>>, cards: &HashMap<i64, Vec<ActCard>>, tools: &HashMap<i64, Vec<ToolCall>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let el = self.message_with_cards(m, cards, tools, th, cx);
-        let Some(asks) = asks else { return el };
-        let lines: Vec<AnyElement> = asks.iter().map(|a| answered_line(a, th)).collect();
-        div().flex().flex_col().gap(px(8.)).child(el).children(lines).into_any_element()
+        let saved: Vec<AnyElement> = self.saved.get(&m.id).into_iter().flatten().map(|t| saved_line(t, th)).collect();
+        let lines: Vec<AnyElement> = asks.into_iter().flatten().map(|a| answered_line(a, th)).collect();
+        if saved.is_empty() && lines.is_empty() {
+            return el;
+        }
+        div().flex().flex_col().gap(px(8.)).child(el).children(saved).children(lines).into_any_element()
     }
 
     fn message_with_cards(&self, m: &ChatMessage, cards: &HashMap<i64, Vec<ActCard>>, tools: &HashMap<i64, Vec<ToolCall>>, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -467,6 +472,37 @@ fn answered_text(a: &ChatAsk) -> String {
     }
 }
 
+/// What Rui saved, from a `memory_saved` payload.
+fn saved_text(p: &Value) -> String {
+    match p["client"].as_str() {
+        Some(c) if p["scope"] == "client" => format!("Saved to {c} knowledge"),
+        _ => "Saved to your preferences".into(),
+    }
+}
+
+/// True when `e` is a `memory_saved` event of this chat between two moments (unix seconds).
+fn saved_in(e: &Event, chat_id: i64, from: i64, to: i64) -> bool {
+    e.kind == "memory_saved" && e.chat_id == Some(chat_id) && parse_secs(&e.created_at).is_some_and(|at| (from..=to).contains(&at))
+}
+
+/// "Saved to ..." lines per Rui message id: what Rui remembered in that turn.
+fn memory_notes(chat: &[ChatMessage], events: &[Event], chat_id: i64) -> HashMap<i64, Vec<String>> {
+    let mut out = HashMap::new();
+    for (i, m) in chat.iter().enumerate().filter(|(i, m)| *i > 0 && m.role == ChatRole::Rui) {
+        let (Some(from), Some(to)) = (parse_secs(&chat[i - 1].created_at), parse_secs(&m.created_at)) else { continue };
+        let lines: Vec<String> = events.iter().filter(|e| saved_in(e, chat_id, from, to)).map(|e| saved_text(&e.payload)).collect();
+        if !lines.is_empty() {
+            out.insert(m.id, lines);
+        }
+    }
+    out
+}
+
+/// A small muted note under Rui's reply, like "Saved to your preferences".
+fn saved_line(text: &str, th: &Theme) -> AnyElement {
+    div().max_w(px(660.)).text_size(px(12.)).text_color(th.muted).child(format!("\u{2713} {text}")).into_any_element()
+}
+
 /// An answered ask as one muted line.
 fn answered_line(a: &ChatAsk, th: &Theme) -> AnyElement {
     let line = div().id(("ask-line", a.id as usize)).max_w(px(660.)).text_size(px(12.)).text_color(th.muted);
@@ -669,6 +705,7 @@ impl Render for ChatView {
             let asks = asks_of(s.current_chat, &s.asks, &s.answered_asks);
             let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
+            self.saved = s.current_chat.map(|id| memory_notes(&s.chat, &s.events, id)).unwrap_or_default();
             let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat, &s.snoozed);
             (s.chat.clone(), s.chats.clone(), s.current_chat, questions, live, state, cards, asks, tools, live_calls)
         };
@@ -775,6 +812,23 @@ mod tests {
         assert_eq!(live_steps(&waiting, &events, 3).map(|s| s.len()), Some(0));
         let answered = vec![msg(ChatRole::User, "2026-11-15T10:00:03Z"), msg(ChatRole::Rui, "2026-11-15T10:00:09Z")];
         assert_eq!(live_steps(&answered, &events, 1), None);
+    }
+
+    #[test]
+    fn memory_notes_sit_under_the_reply_of_their_turn() {
+        let msg = |id: i64, role: ChatRole, at: &str| ChatMessage { id, chat_id: 1, role, content: String::new(), created_at: at.into() };
+        let chat = vec![msg(1, ChatRole::User, "2026-11-15T10:00:00.000Z"), msg(2, ChatRole::Rui, "2026-11-15T10:00:30.000Z")];
+        let ev = |chat_id: i64, at: &str, payload: Value| Event {
+            id: 1, task_id: None, chat_id: Some(chat_id), agent: "rui".into(), kind: "memory_saved".into(), payload, created_at: at.into(),
+        };
+        let events = vec![
+            ev(1, "2026-11-15T10:00:10.000Z", serde_json::json!({"scope": "me", "client": null, "text": "a"})),
+            ev(1, "2026-11-15T10:00:20.000Z", serde_json::json!({"scope": "client", "client": "Acme", "text": "b"})),
+            ev(2, "2026-11-15T10:00:20.000Z", serde_json::json!({"scope": "me", "text": "c"})),
+        ];
+        let notes = memory_notes(&chat, &events, 1);
+        assert_eq!(notes.get(&2).unwrap(), &vec!["Saved to your preferences".to_string(), "Saved to Acme knowledge".to_string()]);
+        assert!(memory_notes(&chat, &events, 3).is_empty());
     }
 
     #[test]

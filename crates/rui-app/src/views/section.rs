@@ -56,7 +56,7 @@ impl Sec {
         match self {
             Sec::Work => &["Board", "Apps"],
             Sec::Clients => &["Clients", "Pods"],
-            Sec::Knowledge => &["Skills", "Playbook"],
+            Sec::Knowledge => &["Skills", "Playbook", "Preferences"],
             Sec::Cost => &["Spend", "Seats"],
             Sec::Analytics | Sec::Settings => &[],
         }

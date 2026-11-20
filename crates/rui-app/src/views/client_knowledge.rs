@@ -6,6 +6,7 @@ use super::client_edit::{Done, EditPanel};
 use super::client_triggers::TriggerPanel;
 use super::library::{self as lib, after_slide, run, slide_overlay, toast};
 use super::clients::{form_buttons, labeled, summary};
+use super::preferences::{FULL_NOTE, reply_full};
 use super::{chip, markdown, primary_button};
 use crate::api;
 use crate::store::Store;
@@ -61,6 +62,8 @@ pub struct ClientDrawer {
     closing: bool,
     /// Current knowledge; `None` while loading.
     text: Option<String>,
+    /// Over 80% of what reaches the agents.
+    full: bool,
     editor: Entity<TextEditor>,
     busy: bool,
     tab: Tab,
@@ -78,7 +81,7 @@ impl ClientDrawer {
         let deploy = cx.new(|cx| DeployPanel::new(store.clone(), cx));
         let edit = cx.new(|cx| EditPanel::new(store.clone(), cx));
         cx.subscribe(&edit, |this, _, _: &Done, cx| this.close(cx)).detach();
-        Self { store, open: None, closing: false, text: None, editor, busy: false, tab: Tab::Knowledge, adding: false, triggers, deploy, edit }
+        Self { store, open: None, closing: false, text: None, full: false, editor, busy: false, tab: Tab::Knowledge, adding: false, triggers, deploy, edit }
     }
 
     /// Open the drawer for a client and load its knowledge.
@@ -98,7 +101,8 @@ impl ClientDrawer {
         if self.open.as_ref().map(|o| o.0) != Some(id) {
             return;
         }
-        self.text = Some(res.map(|v| reply_text(&v)).unwrap_or_default());
+        let v = res.unwrap_or_default();
+        (self.text, self.full) = (Some(reply_text(&v)), reply_full(&v));
         cx.notify();
     }
 
@@ -118,7 +122,7 @@ impl ClientDrawer {
         self.busy = false;
         match res {
             Ok(val) if self.open.as_ref().map(|o| o.0) == Some(id) => {
-                self.text = Some(reply_text(&val));
+                (self.text, self.full) = (Some(reply_text(&val)), reply_full(&val));
                 self.adding = false;
                 self.editor.update(cx, |e, cx| e.set_text("", cx));
                 toast(&self.store, &added_title(name), "", cx);
@@ -189,7 +193,10 @@ impl ClientDrawer {
         match self.text.as_deref() {
             None => lib::note("Loading\u{2026}", th).into_any_element(),
             Some(t) => match shown(t) {
-                Some(md) => div().p(px(16.)).rounded(px(10.)).bg(th.well).child(markdown::render(md, th.fg_2, 12.5, th)).into_any_element(),
+                Some(md) => {
+                    let md = div().p(px(16.)).rounded(px(10.)).bg(th.well).child(markdown::render(md, th.fg_2, 12.5, th));
+                    div().flex().flex_col().gap(px(8.)).child(md).children(self.full.then(|| lib::note(FULL_NOTE, th))).into_any_element()
+                }
                 None => lib::note(EMPTY, th).into_any_element(),
             },
         }

@@ -454,7 +454,7 @@ pub fn delete_client(id: i64) -> Result<serde_json::Value> {
     library("DELETE", &format!("/clients/{id}"), None)
 }
 
-/// What the owner wrote down about a client, as `{text}`.
+/// What the owner wrote down about a client, as `{text, chars, limit}`.
 pub fn get_knowledge(client_id: i64) -> Result<serde_json::Value> {
     library("GET", &format!("/clients/{client_id}/knowledge"), None)
 }
@@ -462,6 +462,16 @@ pub fn get_knowledge(client_id: i64) -> Result<serde_json::Value> {
 /// Append one dated bullet to a client's knowledge; returns the new `{text}`.
 pub fn add_knowledge(client_id: i64, text: &str) -> Result<serde_json::Value> {
     library("POST", &format!("/clients/{client_id}/knowledge"), Some(serde_json::json!({ "text": text })))
+}
+
+/// The owner's preferences, as `{text, chars, limit}`.
+pub fn get_preferences() -> Result<serde_json::Value> {
+    library("GET", "/preferences", None)
+}
+
+/// Replace the whole preferences file; returns the new `{text, chars, limit}`.
+pub fn put_preferences(text: &str) -> Result<serde_json::Value> {
+    library("PUT", "/preferences", Some(serde_json::json!({ "text": text })))
 }
 
 /// A client trigger: start a task when `on` happens ("pr_merged", "email" or "schedule").
