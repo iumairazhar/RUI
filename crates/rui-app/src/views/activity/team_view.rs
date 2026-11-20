@@ -144,7 +144,7 @@ impl ThreadsView {
         }))
     }
 
-    fn toggle_link(&self, id: &'static str, text: String, th: &Theme, cx: &mut Context<Self>, flip: fn(&mut Self)) -> AnyElement {
+    pub(super) fn toggle_link(&self, id: &'static str, text: String, th: &Theme, cx: &mut Context<Self>, flip: fn(&mut Self)) -> AnyElement {
         let hover = th.fg_2;
         div()
             .id(id)

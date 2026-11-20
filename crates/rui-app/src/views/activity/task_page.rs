@@ -148,7 +148,7 @@ impl ThreadsView {
         let actions = div().id("task-actions").flex().items_center().gap(px(8.));
         let links = self.store.read(cx).app_links(t.task.client_id);
         let open = crate::views::apps::open_chips("task-head", &links, cx);
-        let actions = actions.children(open).children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx));
+        let actions = actions.children(open).children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx)).children(self.hide_controls(t, th, cx));
         let row = div().id("task-head").flex().flex_none().items_start().gap(px(14.)).px(px(40.)).pt(px(8.));
         row.child(face).child(info).child(actions).into_any_element()
     }
@@ -165,7 +165,7 @@ impl ThreadsView {
         let actions = div().id("task-actions").flex().items_center().gap(px(8.));
         let links = self.store.read(cx).app_links(t.task.client_id);
         let open = crate::views::apps::open_chips("task-card", &links, cx);
-        let actions = actions.children(open).children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx));
+        let actions = actions.children(open).children(self.page_action(t, th, cx)).children(self.abandon_control(t, th, cx)).children(self.hide_controls(t, th, cx));
         let right = div().flex().flex_wrap().items_center().gap(px(12.)).child(actions).child(switch);
         let top = div().flex().flex_wrap().items_center().justify_between().gap(px(12.)).child(left).child(right);
         let title = div().text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(th.fg).child(t.task.title.clone());

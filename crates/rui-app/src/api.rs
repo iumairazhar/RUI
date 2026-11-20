@@ -596,6 +596,9 @@ pub struct ThreadSummary {
     pub needs_you_count: usize,
     #[serde(default)]
     pub updated_at: String,
+    /// Hidden from the board by the owner.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// Loops a subtask used out of its maximum.
@@ -772,6 +775,26 @@ pub struct HandBack {
 /// Fetch the threads for the board, needs-you first.
 pub fn get_threads() -> Result<Vec<ThreadSummary>> {
     Ok(serde_json::from_value(get("/threads")?)?)
+}
+
+/// Fetch the threads the owner hid (removed ones are not listed).
+pub fn get_hidden_threads() -> Result<Vec<ThreadSummary>> {
+    Ok(serde_json::from_value(get("/threads?hidden=1")?)?)
+}
+
+/// Hide a thread from the board, the Inbox and the needs-you counts. Errors carry the daemon's text.
+pub fn hide_thread(id: i64) -> Result<()> {
+    library("POST", &format!("/threads/{id}/hide"), None).map(|_| ())
+}
+
+/// Bring a hidden thread back to the board. Errors carry the daemon's text.
+pub fn unhide_thread(id: i64) -> Result<()> {
+    library("POST", &format!("/threads/{id}/unhide"), None).map(|_| ())
+}
+
+/// Drop an unfinished thread with its team and hide it for good. Errors carry the daemon's text.
+pub fn remove_thread(id: i64) -> Result<()> {
+    library("POST", &format!("/threads/{id}/remove"), None).map(|_| ())
 }
 
 /// Fetch one thread with its nodes.
@@ -955,12 +978,13 @@ mod tests {
     #[test]
     fn parses_thread_summaries() {
         let j = r#"[{"id":7,"client":{"id":1,"name":"acme"},"title":"Add login","state":"needs_you",
-            "story":"Lead asks: which provider?","needs_you_count":2,"updated_at":"2026-11-18 10:00:00"},
+            "story":"Lead asks: which provider?","needs_you_count":2,"updated_at":"2026-11-18 10:00:00","hidden":true},
             {"id":8,"title":"bare"}]"#;
         let v: Vec<ThreadSummary> = serde_json::from_str(j).unwrap();
         assert_eq!((v[0].client.name.as_str(), v[0].state.as_str(), v[0].needs_you_count), ("acme", "needs_you", 2));
         assert_eq!(v[0].story.as_deref(), Some("Lead asks: which provider?"));
         assert_eq!((v[1].state.as_str(), v[1].story.clone(), v[1].client.id), ("", None, 0));
+        assert_eq!((v[0].hidden, v[1].hidden), (true, false));
     }
 
     #[test]

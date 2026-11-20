@@ -1,6 +1,7 @@
 //! Threads: the board of agent threads, with a full task page for the open one.
 
 mod flow;
+mod hiding;
 mod inspector;
 mod task_page;
 mod team_view;
@@ -16,7 +17,6 @@ use super::motion::{self, delayed, ease, spring};
 use super::roster::{Dot, Loops, member_name, pod_line};
 use team_view::Phase;
 use timeline::ROWS;
-use teams::can_stop;
 use super::section::{Sec, section_top};
 use super::status::{self, Word, thread_word, word_of};
 use super::{chip, markdown, primary_button, tag};
@@ -354,6 +354,10 @@ pub struct ThreadsView {
     flow_scroll: ScrollHandle,
     /// The board's "Every thread" chart is shown.
     show_timeline: bool,
+    /// Thread whose "Remove" was clicked once; the next click removes it.
+    remove_armed: Option<i64>,
+    /// The "Hidden (N)" list at the bottom of the board is open.
+    show_hidden: bool,
 }
 
 impl ThreadsView {
@@ -369,7 +373,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false, remove_armed: None, show_hidden: false }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -382,6 +386,7 @@ impl ThreadsView {
         self.open = Some(id);
         self.stop_open = false;
         self.abandon_armed = false;
+        self.remove_armed = None;
         self.details = false;
         self.flow_key = None;
         self.why.update(cx, |i, cx| i.clear(cx));
@@ -504,6 +509,7 @@ impl ThreadsView {
         self.open = None;
         self.stop_open = false;
         self.abandon_armed = false;
+        self.remove_armed = None;
         self.inspect = None;
         self.store.update(cx, |s, cx| {
             s.load_changes(None, cx);
@@ -595,10 +601,7 @@ impl ThreadsView {
             .child(character(state, px(34.), ("thread-rui", id as usize), color, th))
             .child(text)
             .children(seat_mark(&t.task.status))
-            .children(can_stop(&t.task.status).then(|| {
-                let pill = self.stop_pill(format!("thread-stop-{id}"), id, th, cx);
-                pill.absolute().right(px(8.)).top(px(15.)).opacity(0.).group_hover(group, |s| s.opacity(1.))
-            }));
+            .child(self.card_actions(id, &t.task.status, group, th, cx));
         border_w(row, 1.5).into_any_element()
     }
 
@@ -1241,7 +1244,8 @@ impl Render for ThreadsView {
         let body = div().id("threads-body").flex_1().min_h_0().overflow_y_scroll().children(strip);
         // Tasks first; the four-hour chart sits below them.
         let toggle = self.timeline_toggle(&th, cx);
-        let body = body.child(board).child(timeline::view(chart, self.show_timeline, toggle, &th));
+        let body = body.child(board).children(self.hidden_section(&th, cx));
+        let body = body.child(timeline::view(chart, self.show_timeline, toggle, &th));
         let confirm = self.confirm_view(&th, cx);
         let top = section_top(Sec::Work, Some(lead_line(running, needs, &th)), self.stop_all_button(&th, cx), cx);
         let page = div().id("threads-page").relative().flex().flex_col().size_full();

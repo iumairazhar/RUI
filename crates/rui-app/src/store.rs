@@ -84,6 +84,8 @@ pub struct Store {
     pub states: HashMap<i64, OwnerState>,
     /// Threads for the Work board, needs-you first; refreshed every poll.
     pub threads: Vec<ThreadSummary>,
+    /// Threads the owner hid from the board; refreshed every poll.
+    pub hidden_threads: Vec<ThreadSummary>,
     /// Full threads loaded on demand by id (see `load_thread`).
     pub thread_cache: HashMap<i64, api::Thread>,
     /// Newest events, oldest first (at most 300).
@@ -152,6 +154,7 @@ struct Extras {
     inbox: Option<Vec<InboxItem>>,
     states: Option<Vec<OwnerState>>,
     threads: Option<Vec<ThreadSummary>>,
+    hidden_threads: Option<Vec<ThreadSummary>>,
     events: Option<Vec<Event>>,
     apps: Option<Vec<AppInfo>>,
     asks: Option<Vec<ChatAsk>>,
@@ -167,6 +170,7 @@ fn fetch_extras(after_id: Option<i64>) -> Extras {
         inbox: api::get_inbox().ok(),
         states: api::get_task_states().ok(),
         threads: api::get_threads().ok(),
+        hidden_threads: api::get_hidden_threads().ok(),
         events: api::get_events_after(after_id, limit).ok(),
         apps: api::get_apps().ok(),
         asks: api::get_asks_open().ok(),
@@ -254,6 +258,7 @@ impl Store {
             inbox: vec![],
             states: HashMap::new(),
             threads: vec![],
+            hidden_threads: vec![],
             thread_cache: HashMap::new(),
             events: vec![],
             last_event_id: None,
@@ -378,6 +383,9 @@ impl Store {
         }
         if let Some(threads) = extras.threads {
             changed |= put(&mut self.threads, threads);
+        }
+        if let Some(hidden) = extras.hidden_threads {
+            changed |= put(&mut self.hidden_threads, hidden);
         }
         if let Some(inbox) = extras.inbox {
             changed |= self.apply_inbox(inbox);
@@ -560,7 +568,7 @@ impl Store {
     /// Show a toast, replacing any current one, and hide it after `SHOW_MS`.
     pub fn show_toast(&mut self, title: &str, chips: Vec<String>, cx: &mut Context<Self>) {
         let seq = self.toast.as_ref().map_or(1, |t| t.seq + 1);
-        self.toast = Some(Toast { seq, title: title.into(), chips });
+        self.toast = Some(Toast { seq, title: title.into(), chips, undo_hide: None });
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(SHOW_MS)).await;
@@ -628,6 +636,30 @@ impl Store {
     pub fn drop_task(&mut self, id: i64, cx: &mut Context<Self>) {
         self.show_toast("Dropped", vec![format!("Thread {id}")], cx);
         self.act(move || api::drop_task(id), cx);
+    }
+
+    /// Hide a thread from the board, toast with an Undo, then refresh.
+    pub fn hide_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Thread hidden", vec![], cx);
+        if let Some(t) = self.toast.as_mut() {
+            t.undo_hide = Some(id);
+        }
+        self.threads.retain(|t| t.id != id);
+        self.act(move || api::hide_thread(id), cx);
+    }
+
+    /// Bring a hidden thread back to the board, then refresh.
+    pub fn unhide_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Thread back on the board", vec![], cx);
+        self.hidden_threads.retain(|t| t.id != id);
+        self.act(move || api::unhide_thread(id), cx);
+    }
+
+    /// Drop a thread if it is unfinished and hide it for good, then refresh.
+    pub fn remove_thread(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.show_toast("Thread removed", vec![], cx);
+        self.threads.retain(|t| t.id != id);
+        self.act(move || api::remove_thread(id), cx);
     }
 
     /// Release a step held at a checkpoint, then refresh.
