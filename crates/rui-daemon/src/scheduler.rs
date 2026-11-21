@@ -11,7 +11,7 @@ use crate::runner::{AgentRun, Cli, ParsedLine, RunOutcome, run_agent_with};
 use crate::roster;
 use crate::seats;
 use crate::skills::{self, Skill};
-use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, ensure_task_worktree, merge_into, run_done_command};
+use crate::worktree::{DoneCheck, LandResult, commit_all, create_worktree, ensure_task_worktree, run_done_command};
 use anyhow::{Context, Result};
 use rui_core::{ChatRole, Client, Question, QuestionStatus, Role, Rung, SourceKind, Task, TaskStatus};
 use serde_json::{Value, json};
@@ -1183,7 +1183,7 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
-    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    let res = guarded_lead_run(db, cfg, live, &task, run).await;
     if sandbox_missing(db, task_id, &res)? {
         return Ok(());
     }
@@ -1195,6 +1195,40 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
         reply_after_turn(db, task_id, since, &out)?;
     }
     after_lead_turn(db, task_id)?;
+    Ok(())
+}
+
+/// Runs a Lead turn while watching its task branch; a branch the Lead moved is put back.
+async fn guarded_lead_run(db: &Db, cfg: &Config, live: &Live, task: &Task, run: AgentRun) -> Result<RunOutcome> {
+    let (wt, branch) = (run.cwd.clone(), crate::worktree::task_branch_name(task.id));
+    crate::branch_guard::start(&wt, &branch);
+    let res = run_logged(db, cfg, live, "lead", task.id, run).await;
+    restore_moved_branch(db, &wt, &branch, task)?;
+    res
+}
+
+/// After a turn by `by`: puts a task branch it moved back, logs `branch_restored` and tells it
+/// to keep off the branch. True when the branch had moved.
+fn restore_moved_branch(db: &Db, wt: &Path, branch: &str, by: &Task) -> Result<bool> {
+    let Some(r) = crate::branch_guard::finish(wt, branch)? else { return Ok(false) };
+    let payload = json!({"branch": branch, "from": r.from, "to": r.to, "by_task": by.id});
+    db.add_event(Some(by.id), "scheduler", "branch_restored", &payload)?;
+    let text = format!(
+        "You changed {branch} directly, so RUI put it back. Commit only on your own branch; never merge, rebase, reset, checkout or push. RUI merges finished work into {branch} itself."
+    );
+    db.add_event(Some(by.id), "scheduler", "instruction", &json!({"text": text}))?;
+    Ok(true)
+}
+
+/// Counts a failed loop on a member that moved the task branch, unless it is already waiting.
+fn count_branch_tamper(db: &Db, data_dir: &Path, task: &Task, branch: &str) -> Result<()> {
+    let reason = format!("changed {branch} directly; only RUI merges into the task branch");
+    let status = count_failed_loop(db, data_dir, task, &reason)?;
+    let current = db.get_task(task.id)?.context("task not found")?.status;
+    if matches!(current, TaskStatus::Stuck | TaskStatus::WaitingAnswer) {
+        return Ok(());
+    }
+    db.set_task_status(task.id, status)?;
     Ok(())
 }
 
@@ -1217,7 +1251,7 @@ async fn review_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64) -> Result
     let client = client_for(db, &task)?;
     let prompt = review_prompt(db, &cfg.data_dir, &task, &client)?;
     let run = account_lead_run(db, cfg, &task, &client, "finished work to review", prompt)?;
-    let res = run_logged(db, cfg, live, "lead", task_id, run).await;
+    let res = guarded_lead_run(db, cfg, live, &task, run).await;
     if sandbox_missing(db, task_id, &res)? {
         return Ok(());
     }
@@ -1527,7 +1561,7 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
     let repo = expand_home(&client.repo_path);
     let parent_id = task.parent_id.context("subtask has no parent")?;
     let worktrees = cfg.data_dir.join("worktrees");
-    let (_, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
+    let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     record_parent_branch(db, parent_id, &task_branch)?;
     let (wt, branch) = create_worktree(&repo, &worktrees, task_id, Some(&task_branch))?;
     db.set_task_branch(task_id, &branch)?;
@@ -1561,7 +1595,9 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         let why = "Codex runs can still read RUI's data folder; use Claude for this client";
         return stop_for_sandbox(db, task_id, why, crate::sandbox::CODEX_REFUSED);
     }
+    crate::branch_guard::start(&task_wt, &task_branch);
     let res = run_logged_on(cli, db, cfg, live, "builder", task_id, run).await;
+    let tampered = restore_moved_branch(db, &task_wt, &task_branch, &task)?;
     if cli == Cli::Claude && sandbox_missing(db, task_id, &res)? {
         return Ok(());
     }
@@ -1574,6 +1610,9 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         Err(e) => {
             db.add_event(Some(task_id), "scheduler", "agent_error", &json!({"error": format!("{e:#}")}))?;
         }
+    }
+    if tampered {
+        return count_branch_tamper(db, &cfg.data_dir, &task, &task_branch);
     }
     finish_builder(db, cfg, &task, &wt, &done_command).await
 }
@@ -1786,7 +1825,8 @@ fn merge_subtask(db: &Db, cfg: &Config, task: &Task) -> Result<()> {
     let (task_wt, task_branch) = task_worktree(cfg, &client, &repo, parent_id)?;
     let branch = crate::worktree::branch_name(task.id);
     let message = format!("rui: task {}: {}", task.id, task.title);
-    match merge_into(&task_wt, &branch, &message)? {
+    let merged = crate::worktree::with_worktree_lock(&task_wt, || clean_and_merge(db, task, &task_wt, &task_branch, &branch, &message))?;
+    match merged {
         LandResult::Merged => {
             let payload = json!({"branch": branch, "into": task_branch});
             db.add_event(Some(task.id), "scheduler", "merged_to_task_branch", &payload)?;
@@ -1799,9 +1839,25 @@ fn merge_subtask(db: &Db, cfg: &Config, task: &Task) -> Result<()> {
     Ok(())
 }
 
+/// Under the task worktree lock: drops tracked edits left in the task worktree (RUI owns it; no
+/// agent writes there), merges, and records the new tip as RUI's own.
+fn clean_and_merge(db: &Db, task: &Task, task_wt: &Path, task_branch: &str, branch: &str, message: &str) -> Result<LandResult> {
+    let files = crate::worktree::tracked_changes(task_wt)?;
+    if !files.is_empty() {
+        crate::worktree::git_stdout(task_wt, &["reset", "--hard", "-q", "HEAD"])?;
+        db.add_event(Some(task.id), "scheduler", "task_worktree_cleaned", &json!({"files": files}))?;
+    }
+    let res = crate::worktree::merge_locked(task_wt, branch, message)?;
+    if res == LandResult::Merged {
+        crate::branch_guard::expect(task_wt, task_branch);
+    }
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::merge_into;
 
     #[test]
     fn init_line_event_keeps_raw_fields() {
@@ -2101,6 +2157,96 @@ mod tests {
         let (_, tb) = ensure_task_worktree(repo, &worktrees, parent.id, &crate::worktree::base_branch(repo).unwrap()).unwrap();
         let (wt, _) = create_worktree(repo, &worktrees, sub.id, Some(&tb)).unwrap();
         (db, cfg, sub, wt)
+    }
+
+    /// The task worktree and branch of `sub`'s parent, as set up by `protected_setup`.
+    fn task_wt_of(data: &Path, sub: &Task) -> (PathBuf, String) {
+        let parent = sub.parent_id.unwrap();
+        (data.join("worktrees").join(format!("task-{parent}")), crate::worktree::task_branch_name(parent))
+    }
+
+    fn tip(dir: &Path, branch: &str) -> String {
+        crate::worktree::branch_tip(dir, branch).unwrap()
+    }
+
+    fn member_commit(wt: &Path, file: &str, text: &str) -> String {
+        std::fs::write(wt.join(file), text).unwrap();
+        assert!(commit_all(wt, "member work").unwrap());
+        tip(wt, &crate::worktree::branch_name(wt.file_name().unwrap().to_str().unwrap().parse().unwrap()))
+    }
+
+    fn kinds(db: &Db, id: i64) -> Vec<String> {
+        db.list_events(Some(id), 100).unwrap().into_iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn a_task_branch_moved_by_a_member_is_restored_and_counts_a_loop() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        let (task_wt, tb) = task_wt_of(data.path(), &sub);
+        let before = tip(&task_wt, &tb);
+        crate::branch_guard::start(&task_wt, &tb);
+        let moved = member_commit(&wt, "tests/test_a.py", "member");
+        git_in(&wt, &["update-ref", &format!("refs/heads/{tb}"), &moved]);
+        assert!(restore_moved_branch(&db, &task_wt, &tb, &sub).unwrap());
+        count_branch_tamper(&db, &cfg.data_dir, &sub, &tb).unwrap();
+        assert_eq!(tip(&task_wt, &tb), before);
+        assert!(crate::worktree::tracked_changes(&task_wt).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(task_wt.join("tests/test_a.py")).unwrap(), "orig");
+        let events = db.list_events(Some(sub.id), 50).unwrap();
+        let e = events.iter().find(|e| e.kind == "branch_restored").unwrap();
+        assert_eq!(e.payload, json!({"branch": tb, "from": moved, "to": before, "by_task": sub.id}));
+        assert!(events.iter().any(|e| e.kind == "instruction" && e.payload["text"].as_str().unwrap().contains("Commit only on your own branch")));
+        let after = db.get_task(sub.id).unwrap().unwrap();
+        assert_eq!((after.loops_used, after.status), (1, TaskStatus::Open));
+    }
+
+    #[test]
+    fn a_merge_by_rui_during_a_turn_is_not_restored() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        let (task_wt, tb) = task_wt_of(data.path(), &sub);
+        crate::branch_guard::start(&task_wt, &tb);
+        member_commit(&wt, "b.txt", "b");
+        merge_subtask(&db, &cfg, &sub).unwrap();
+        let merged = tip(&task_wt, &tb);
+        assert!(!restore_moved_branch(&db, &task_wt, &tb, &sub).unwrap());
+        assert_eq!(tip(&task_wt, &tb), merged);
+        assert!(task_wt.join("b.txt").exists());
+        let k = kinds(&db, sub.id);
+        assert!(k.contains(&"merged_to_task_branch".into()) && !k.contains(&"branch_restored".into()));
+    }
+
+    #[test]
+    fn a_dirty_task_worktree_is_cleaned_before_the_merge() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        let (task_wt, tb) = task_wt_of(data.path(), &sub);
+        // The incident: a member moved the task branch, so the task worktree's files lag its HEAD.
+        let moved = member_commit(&wt, "tests/test_a.py", "member");
+        git_in(&wt, &["update-ref", &format!("refs/heads/{tb}"), &moved]);
+        assert_eq!(crate::worktree::tracked_changes(&task_wt).unwrap(), ["tests/test_a.py"]);
+        merge_subtask(&db, &cfg, &sub).unwrap();
+        let events = db.list_events(Some(sub.id), 50).unwrap();
+        let cleaned = events.iter().find(|e| e.kind == "task_worktree_cleaned").unwrap();
+        assert_eq!(cleaned.payload["files"], json!(["tests/test_a.py"]));
+        assert!(events.iter().any(|e| e.kind == "merged_to_task_branch"));
+        assert!(crate::worktree::tracked_changes(&task_wt).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(task_wt.join("tests/test_a.py")).unwrap(), "member");
+    }
+
+    #[test]
+    fn a_merge_conflict_still_goes_stuck() {
+        let (data, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (db, cfg, sub, wt) = protected_setup(data.path(), repo.path());
+        let (task_wt, _) = task_wt_of(data.path(), &sub);
+        std::fs::write(task_wt.join("tests/test_a.py"), "other step").unwrap();
+        assert!(commit_all(&task_wt, "other step").unwrap());
+        member_commit(&wt, "tests/test_a.py", "member");
+        merge_subtask(&db, &cfg, &sub).unwrap();
+        let k = kinds(&db, sub.id);
+        assert!(k.contains(&"land_failed".into()) && !k.contains(&"task_worktree_cleaned".into()));
+        assert_eq!(db.get_task(sub.id).unwrap().unwrap().status, TaskStatus::Stuck);
     }
 
     #[test]

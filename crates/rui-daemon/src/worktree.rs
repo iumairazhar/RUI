@@ -217,15 +217,39 @@ pub fn land(repo: &Path, branch: &str, base: &str, message: &str) -> anyhow::Res
 
 /// Merges `branch` into whatever branch worktree `wt` has checked out, with a merge commit.
 pub fn merge_into(wt: &Path, branch: &str, message: &str) -> anyhow::Result<LandResult> {
-    with_worktree_lock(wt, || {
-        let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
-        let out = git(wt, &args)?;
-        if out.status.success() {
-            return Ok(LandResult::Merged);
-        }
-        merge_failure(wt, &out)
-    })
+    with_worktree_lock(wt, || merge_locked(wt, branch, message))
+}
+
+/// [`merge_into`] for a caller that already holds the worktree lock of `wt`.
+pub fn merge_locked(wt: &Path, branch: &str, message: &str) -> anyhow::Result<LandResult> {
+    let _lock = LAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let args = ["-c", "user.name=RUI", "-c", "user.email=rui@localhost", "merge", "--no-ff", "-m", message, branch];
+    let out = git(wt, &args)?;
+    if out.status.success() {
+        return Ok(LandResult::Merged);
+    }
+    merge_failure(wt, &out)
+}
+
+/// The commit `refs/heads/<branch>` points at, or None when it can't be read.
+pub fn branch_tip(dir: &Path, branch: &str) -> Option<String> {
+    let rev = format!("refs/heads/{branch}");
+    let tip = git_stdout(dir, &["rev-parse", "--verify", "--quiet", &rev]).ok()?;
+    Some(tip.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Tracked files in `wt` that differ from its HEAD (untracked files are left out).
+pub fn tracked_changes(wt: &Path) -> anyhow::Result<Vec<String>> {
+    let out = git_stdout(wt, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(out.lines().filter(|l| l.len() > 3).map(|l| l[3..].to_string()).collect())
+}
+
+/// Points `branch` back at `tip` and makes task worktree `wt` match it exactly.
+pub fn restore_branch(wt: &Path, branch: &str, tip: &str) -> anyhow::Result<()> {
+    git_stdout(wt, &["update-ref", &format!("refs/heads/{branch}"), tip])?;
+    git_stdout(wt, &["reset", "--hard", "-q", tip])?;
+    git_stdout(wt, &["clean", "-fd"])?;
+    Ok(())
 }
 
 /// Files touched by the tip commit of `branch` (works after the branch is merged).
