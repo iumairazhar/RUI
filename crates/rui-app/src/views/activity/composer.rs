@@ -79,6 +79,11 @@ pub fn is_long(text: &str) -> bool {
     text.lines().count() > 4 || text.chars().count() > 320
 }
 
+/// An option that asks the owner to write something, not an answer to send as-is.
+pub fn types_instead(option: &str) -> bool {
+    option.trim().to_lowercase().starts_with("give new instructions")
+}
+
 impl ThreadsView {
     /// The thread's open question: from the thread map, else the task's own open owner question.
     pub(super) fn page_question(&self, id: i64, cx: &Context<Self>) -> Option<OpenQuestion> {
@@ -120,6 +125,12 @@ impl ThreadsView {
 
     /// Answer the open question with one of its options.
     fn pick_option(&mut self, qid: i64, answer: String, cx: &mut Context<Self>) {
+        // "Give new instructions" means "let me type them": switch to answering instead of sending the label.
+        if types_instead(&answer) {
+            self.set_mode(Mode::Answer, qid, cx);
+            self.store.update(cx, |s, cx| s.show_toast("Type your instructions below, then Send answer", vec![], cx));
+            return;
+        }
         self.store.update(cx, |s, cx| s.answer(qid, answer, None, cx));
         if let Some(id) = self.open {
             self.mark_sent(id, cx);
@@ -240,6 +251,9 @@ mod tests {
     fn labels_follow_the_mode() {
         assert_eq!((send_label(Mode::Answer), send_label(Mode::Message)), ("Send answer", "Send message"));
         assert_eq!(placeholder(Mode::Answer), "Type your answer\u{2026}");
+        assert!(types_instead("Give new instructions"));
+        assert!(!types_instead("Retry with more tries"));
+        assert!(!types_instead("Abandon the task"));
         assert_eq!(placeholder(Mode::Message), "Write to the team\u{2026}");
     }
 
