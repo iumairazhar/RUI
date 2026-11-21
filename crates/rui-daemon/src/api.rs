@@ -118,6 +118,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::support_api::routes())
         .merge(crate::inputs_api::routes())
         .merge(crate::costs::routes())
+        .merge(crate::uploads::routes())
         .route_layer(axum::middleware::from_fn_with_state(state.owner_token.clone(), crate::owner_auth::require))
         .with_state(state)
 }
@@ -520,6 +521,14 @@ struct ChatBody {
     content: String,
     #[serde(default)]
     client: Option<String>,
+    /// Upload ids from `POST /uploads`.
+    #[serde(default)]
+    attachments: Vec<String>,
+}
+
+/// The uploads named by `ids`; an unknown id is a bad request.
+fn attachments(s: &ApiState, ids: &[String]) -> ApiResult<Vec<crate::uploads::Upload>> {
+    crate::uploads::resolve(&s.data_dir, ids).map_err(|e| bad_request(&e))
 }
 
 async fn post_chat(
@@ -530,8 +539,12 @@ async fn post_chat(
     if s.db.get_chat(b.chat_id)?.is_none() {
         return Err(not_found("chat not found"));
     }
+    let files = attachments(&s, &b.attachments)?;
     s.db.close_chat_asks(b.chat_id)?;
     let msg = s.db.add_chat_message(b.chat_id, ChatRole::User, &b.content)?;
+    if !files.is_empty() {
+        crate::uploads::record_for_message(&s.db, b.chat_id, msg.id, &files)?;
+    }
     if let Some(c) = b.client.as_deref().and_then(|n| s.db.get_client_by_name(n).ok().flatten()) {
         crate::chat::pick_client(msg.id, &c.name);
     }
@@ -658,6 +671,9 @@ fn conflict(msg: &str) -> ApiError {
 #[derive(Deserialize)]
 struct InstructBody {
     text: String,
+    /// Upload ids from `POST /uploads`.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 impl From<crate::control::ControlError> for ApiError {
@@ -686,8 +702,19 @@ async fn instruct_task(
     Json(b): Json<InstructBody>,
 ) -> ApiResult<Json<InstructReply>> {
     require_text(&b.text, "text")?;
-    let (task, note) = crate::control::instruct(&s.db, &s.runs, id, &b.text, "owner")?;
+    let files = attachments(&s, &b.attachments)?;
+    let text = with_inputs_note(&b.text, &files);
+    let (task, note) = crate::control::instruct(&s.db, &s.runs, id, &text, "owner")?;
+    if !files.is_empty() {
+        crate::uploads::record_for_task(&s.db, id, "owner", &files)?;
+    }
     Ok(Json(InstructReply { task, note }))
+}
+
+/// The instruction with the line naming its attached files, when there are any.
+fn with_inputs_note(text: &str, files: &[crate::uploads::Upload]) -> String {
+    let note = crate::uploads::inputs_note(files);
+    if note.is_empty() { text.to_string() } else { format!("{text}\n\n{note}") }
 }
 
 /// Optional body of a stop call: where it came from and why.
@@ -1127,6 +1154,68 @@ mod tests {
         let ok = std::process::Command::new("git").arg("-C").arg(repo.path()).arg("init").output().unwrap();
         assert!(ok.status.success());
         repo
+    }
+
+    fn setup_in(dir: &std::path::Path) -> (Router, Arc<Db>) {
+        let db = Arc::new(Db::open_test());
+        let (chat_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ApiState { db: db.clone(), chat_tx, seat: SeatCache::default(), runs: Runs::default(), live: Live::default(), data_dir: dir.to_path_buf(), apps: Apps::default(), owner_token: crate::owner_auth::test_token() };
+        (router(state), db)
+    }
+
+    #[tokio::test]
+    async fn uploads_store_files_and_reject_bad_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _db) = setup_in(dir.path());
+        let (st, v) = call(&app, "POST", "/uploads", Some(json!({"name": "notes.md", "data_base64": "aGVsbG8="}))).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!((v["name"].as_str(), v["size"].as_u64(), v["kind"].as_str()), (Some("notes.md"), Some(5), Some("text")));
+        let id = v["id"].as_str().unwrap();
+        assert_eq!(std::fs::read(dir.path().join("uploads").join(id).join("notes.md")).unwrap(), b"hello");
+        let (_, v) = call(&app, "POST", "/uploads", Some(json!({"name": "a.pdf", "data_base64": "JVBERg=="}))).await;
+        assert_eq!(v["kind"], "pdf");
+        for name in ["run.exe", "../../owner.token.txt", "a/b.md"] {
+            let (st, v) = call(&app, "POST", "/uploads", Some(json!({"name": name, "data_base64": "aGk="}))).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{name}");
+            assert!(v["error"].is_string());
+        }
+        let big = "AAAA".repeat(crate::uploads::MAX_BYTES / 3 + 1);
+        let (st, v) = call(&app, "POST", "/uploads", Some(json!({"name": "big.txt", "data_base64": big}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("20 MB"));
+    }
+
+    #[tokio::test]
+    async fn chat_attachments_are_checked_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, db) = setup_in(dir.path());
+        let chat = db.create_chat().unwrap();
+        let bad = json!({"chat_id": chat.id, "content": "hi", "attachments": ["0123456789abcdef"]});
+        let (st, _) = call(&app, "POST", "/chat", Some(bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(db.list_chat(chat.id, 10).unwrap().is_empty());
+        let f = crate::uploads::save(dir.path(), "a.md", b"x").unwrap();
+        let (st, m) = call(&app, "POST", "/chat", Some(json!({"chat_id": chat.id, "content": "hi", "attachments": [f.id]}))).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let ev = db.events_of_kinds(&["attachments"]).unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!((ev[0].chat_id, ev[0].payload["message_id"].as_i64()), (Some(chat.id), m["id"].as_i64()));
+        assert_eq!(ev[0].payload["files"][0]["name"], "a.md");
+    }
+
+    #[tokio::test]
+    async fn instruct_attachments_add_the_inputs_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, db) = setup_in(dir.path());
+        let (_, id) = seed_task(&db);
+        let bad = json!({"text": "go", "attachments": ["0123456789abcdef"]});
+        assert_eq!(call(&app, "POST", &format!("/tasks/{id}/instruct"), Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let f = crate::uploads::save(dir.path(), "n.csv", b"a,b").unwrap();
+        let (st, _) = call(&app, "POST", &format!("/tasks/{id}/instruct"), Some(json!({"text": "go", "attachments": [f.id]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, text) = db.pending_instructions(id).unwrap().pop().unwrap();
+        assert!(text.contains("go") && text.contains(".rui/inputs/: n.csv"), "{text}");
+        assert_eq!(crate::uploads::for_tasks(&db, dir.path(), &[id]).unwrap().len(), 1);
     }
 
     #[tokio::test]

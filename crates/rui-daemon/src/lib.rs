@@ -50,4 +50,5 @@ pub mod sweep;
 pub mod support_mcp;
 pub mod thread;
 pub mod triggers;
+pub mod uploads;
 pub mod worktree;

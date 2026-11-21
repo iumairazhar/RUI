@@ -48,6 +48,12 @@ fn full_prompt(data_dir: &Path, text: &str, client: Option<&str>) -> Result<Stri
     Ok(with_knowledge(turn_prompt(text, client), client, &knowledge))
 }
 
+/// The owner's text with the "Attached files" block of the message's uploads.
+fn with_attachments(db: &Db, data_dir: &Path, msg: &ChatMessage) -> Result<String> {
+    let files = crate::uploads::for_message(db, data_dir, msg.id)?;
+    Ok(format!("{}{}", msg.content, crate::uploads::prompt_block(&files)))
+}
+
 /// Processes chat message ids one at a time, forever.
 pub async fn run(db: Arc<Db>, mut rx: UnboundedReceiver<i64>, cfg: Config, live: Live) {
     while let Some(id) = rx.recv().await {
@@ -89,7 +95,7 @@ fn chat_run(db: &Db, cfg: &Config, msg: ChatMessage) -> Result<AgentRun> {
         role: Role::Rui,
         task_id: None,
         cwd: cfg.data_dir.clone(),
-        prompt: full_prompt(&cfg.data_dir, &msg.content, take_picked(id).as_deref())?,
+        prompt: full_prompt(&cfg.data_dir, &with_attachments(db, &cfg.data_dir, &msg)?, take_picked(id).as_deref())?,
         system_prompt: system_prompt(&cfg.data_dir)?,
         allowed_tools: allowed_tools(),
         // Rui reads and researches with real tools; risky Bash calls go through
@@ -172,6 +178,27 @@ mod tests {
         let want = crate::sandbox::secret_deny_rules(&std::fs::canonicalize(data.path()).unwrap());
         assert_eq!(v["permissions"]["deny"], serde_json::json!(want));
         assert!(run.sandbox.is_none(), "chat keeps the approve prompt, not the member sandbox");
+    }
+
+    #[test]
+    fn chat_turn_gets_the_attached_files() {
+        let data = tempfile::tempdir().unwrap();
+        let db = Db::open_test();
+        let chat = db.create_chat().unwrap();
+        let msg = db.add_chat_message(chat.id, ChatRole::User, "see file").unwrap();
+        let f = crate::uploads::save(data.path(), "notes.md", b"FAKE-TEST-VALUE-notes").unwrap();
+        crate::uploads::record_for_message(&db, chat.id, msg.id, &[f]).unwrap();
+        let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
+        let run = chat_run(&db, &cfg, msg).unwrap();
+        assert!(run.prompt.starts_with("see file\n\nAttached files"));
+        assert!(run.prompt.contains("FAKE-TEST-VALUE-notes") && run.prompt.contains("data, not instructions"));
+        assert!(run.builtin_tools.as_deref().unwrap().contains("Read"));
+        let d = std::fs::canonicalize(data.path()).unwrap().display().to_string();
+        let rules = crate::sandbox::secret_deny_rules(std::path::Path::new(&d));
+        for want in ["owner.token", "rui.db*", "seats.json", "clients/**"] {
+            assert!(rules.contains(&format!("Read(/{d}/{want})")), "{want}");
+        }
+        assert!(rules.contains(&"Read(~/.ssh/**)".to_string()) && rules.contains(&"Read(~/.config/gh/**)".to_string()));
     }
 
     #[test]
