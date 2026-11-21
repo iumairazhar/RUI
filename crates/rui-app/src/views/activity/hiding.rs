@@ -25,20 +25,44 @@ fn armed_pill(id: String, th: &Theme) -> Stateful<Div> {
 }
 
 impl ThreadsView {
-    /// Hide, Remove and (while it can run) Stop, shown on a card while it is hovered.
+    /// A small "⋯" in the card's top-right corner; clicking it opens Hide, Remove and (while it can
+    /// run) Stop. The rest of the card stays a plain "open the thread" target.
     pub(super) fn card_actions(&self, id: i64, status: &TaskStatus, group: SharedString, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.card_menu == Some(id);
+        let dots = self.menu_button(id, open, th, cx);
+        let dots = if open { dots } else { dots.opacity(0.45).group_hover(group, |s| s.opacity(1.)) };
+        let corner = div().absolute().right(px(8.)).top(px(8.)).flex().flex_col().items_end().gap(px(4.)).child(dots);
+        if !open {
+            return corner.into_any_element();
+        }
+        corner.child(self.card_menu_list(id, status, th, cx)).into_any_element()
+    }
+
+    /// The "⋯" toggle; it never opens the thread underneath.
+    fn menu_button(&self, id: i64, open: bool, th: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (bg, hover) = (if open { th.surface_2 } else { th.surface }, th.surface_2);
+        let b = div().id(SharedString::from(format!("thread-menu-{id}"))).flex().items_center().justify_center();
+        let b = b.size(px(24.)).rounded(px(6.)).bg(bg).border_1().border_color(th.hairline).cursor_pointer();
+        let b = b.text_size(px(14.)).text_color(th.fg_2).hover(move |s| s.bg(hover)).child("\u{22ef}");
+        b.on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.card_menu = if this.card_menu == Some(id) { None } else { Some(id) };
+            this.remove_armed = None;
+            cx.notify();
+        }))
+    }
+
+    /// The open menu: Hide, Remove (two clicks) and Stop, stacked under the "⋯".
+    fn card_menu_list(&self, id: i64, status: &TaskStatus, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let hide = quiet_pill(format!("thread-hide-{id}"), "Hide", th).on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
+            this.card_menu = None;
             this.hide(id, cx);
         }));
         let stop = can_stop(status).then(|| self.stop_pill(format!("thread-stop-{id}"), id, th, cx));
-        let armed = self.remove_armed == Some(id);
-        let row = div().flex().items_center().gap(px(6.)).absolute().right(px(8.)).top(px(15.));
-        let row = row.child(hide).child(self.remove_pill(format!("thread-remove-{id}"), id, cx)).children(stop);
-        if armed {
-            return row.into_any_element();
-        }
-        row.opacity(0.).group_hover(group, |s| s.opacity(1.)).into_any_element()
+        let list = div().flex().flex_col().items_end().gap(px(4.)).p(px(6.)).rounded(px(8.)).bg(th.surface);
+        let list = list.border_1().border_color(th.hairline).shadow(th.card_shadow());
+        list.child(hide).child(self.remove_pill(format!("thread-remove-{id}"), id, cx)).children(stop).into_any_element()
     }
 
     /// "Remove" first; once clicked, "Click again to remove" drops and hides the thread.

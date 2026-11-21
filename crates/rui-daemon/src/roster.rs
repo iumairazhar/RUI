@@ -2,7 +2,8 @@
 //!
 //! Roles are seeded from the source tree (`roles/`) like skills. Frontmatter is
 //! parsed by hand: `name`, `code`, `title`, `description`, `tools: [..]`,
-//! `skills: [..]` and `max_loops`. Unknown keys and nested lines are ignored.
+//! `skills: [..]`, `max_loops`, and optional run defaults
+//! `model` and `effort` (see `run_settings`). Unknown keys and nested lines are ignored.
 
 use crate::skills::{field, seed_from, split_frontmatter};
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,12 @@ pub struct Role {
     /// Skill folder names installed for this role.
     pub skills: Vec<String>,
     pub max_loops: i64,
+    /// Default model for this role's runs; None leaves the CLI's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Default effort for this role's runs; None leaves the CLI's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(skip_serializing)]
     pub body: String,
 }
@@ -56,6 +63,7 @@ pub fn parse(src: &str) -> Result<Role> {
     if body.trim().is_empty() {
         bail!("empty role body");
     }
+    let run = crate::run_settings::check(field(front, "model"), field(front, "effort"))?;
     Ok(Role {
         code: text(front, "code").unwrap_or_else(|| name.clone()),
         title: text(front, "title").unwrap_or_else(|| name.clone()),
@@ -63,6 +71,8 @@ pub fn parse(src: &str) -> Result<Role> {
         tools: string_list(front, "tools")?,
         skills: string_list(front, "skills")?,
         max_loops,
+        model: run.model,
+        effort: run.effort,
         body: body.trim_end().into(),
         name,
     })
@@ -143,6 +153,15 @@ mod tests {
         assert!(parse("---\nname: x\n---\nb").is_err());
         assert!(parse("---\nname: x\ndescription: d\ntools: nope\n---\nb").is_err());
         assert!(parse("---\nname: x\ndescription: d\n---\n").is_err());
+        assert_eq!((r.model, r.effort), (None, None));
+    }
+
+    #[test]
+    fn parses_run_defaults_and_rejects_bad_ones() {
+        let r = parse("---\nname: x\ndescription: d\nmodel: Opus\neffort: high\n---\nb\n").unwrap();
+        assert_eq!((r.model.as_deref(), r.effort.as_deref()), (Some("opus"), Some("high")));
+        assert!(parse("---\nname: x\ndescription: d\nmodel: gpt\n---\nb\n").is_err());
+        assert!(parse("---\nname: x\ndescription: d\neffort: huge\n---\nb\n").is_err());
     }
 
     #[test]

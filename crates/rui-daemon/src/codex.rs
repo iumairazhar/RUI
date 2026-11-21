@@ -13,6 +13,7 @@
 //! file; a Codex build without HTTP MCP support cannot call
 //! report_status or ask_lead, and then the done_command is the only check of its work.
 //! Not supported on Codex: resuming a session (every turn is fresh), allowed-tool lists, live typing,
+//! model and effort picks (RUI's model names are Claude aliases; Codex keeps its own default),
 //! seat environments, and dollar costs (Codex reports tokens only, so its result has no total_cost_usd).
 //!
 //! Codex JSONL is mapped onto the Claude shapes: `thread.started` is Init, an `agent_message` is an
@@ -218,6 +219,8 @@ mod tests {
             seat: None,
             sandbox: None,
             deny_secrets: None,
+            model: None,
+            effort: None,
         }
     }
 
@@ -233,6 +236,9 @@ mod tests {
         ]);
         assert_eq!(a.last().unwrap(), "You are a builder\n\n---\n\nFix the bug");
         assert_eq!(a.len(), 12, "no resume or tool flags: Codex does not take them");
+        r.model = Some("opus".into());
+        r.effort = Some("high".into());
+        assert_eq!(build_args(&r).len(), 12, "Claude model aliases and effort are not passed to Codex");
         r.permission_mode = None;
         r.system_prompt = String::new();
         let a = build_args(&r);

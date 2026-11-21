@@ -183,6 +183,10 @@ pub fn client_skills(data_dir: &Path, client: &str) -> Vec<String> {
 /// Copies the named skills into `<wt>/.claude/skills/` and `<wt>/.agents/skills/`, replacing what is there,
 /// and keeps both folders out of git. Skills that are missing or switched off are skipped.
 pub fn install_skills(wt: &Path, data_dir: &Path, names: &[String]) -> Result<()> {
+    // Turns that share a worktree (planning-meeting turns) install at the same time; one
+    // removing a skill folder while another copies it fails with "No such file or directory".
+    static INSTALLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = INSTALLING.lock().unwrap_or_else(|e| e.into_inner());
     for name in installable(data_dir, names) {
         let src = skills_dir(data_dir).join(&name);
         for dir in SKILL_DIRS {
@@ -280,6 +284,27 @@ mod tests {
         write(&dst.path().join("a/SKILL.md"), "edited too");
         seed_from(src.path(), dst.path());
         assert_eq!(std::fs::read_to_string(dst.path().join("a/SKILL.md")).unwrap(), "edited too");
+    }
+
+    #[test]
+    fn parallel_installs_into_one_worktree_all_succeed() {
+        let (data, wt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        assert!(std::process::Command::new("git").arg("init").arg("-q").arg(wt.path()).status().unwrap().success());
+        for n in ["a", "b", "c"] {
+            write(&skills_dir(data.path()).join(n).join("SKILL.md"), &format!("---\nname: {n}\ndescription: d\n---\nbody\n"));
+            write(&skills_dir(data.path()).join(n).join("refs/more.md"), "more");
+        }
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                let (d, w, n) = (data.path().to_path_buf(), wt.path().to_path_buf(), names.clone());
+                std::thread::spawn(move || install_skills(&w, &d, &n))
+            })
+            .collect();
+        for r in runs {
+            r.join().unwrap().unwrap();
+        }
+        assert!(wt.path().join(".claude/skills/c/refs/more.md").exists());
     }
 
     #[test]

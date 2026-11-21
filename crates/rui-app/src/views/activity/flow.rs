@@ -643,10 +643,22 @@ fn risk_part(n: &Node) -> String {
     if risk.is_empty() || risk == "unknown" { String::new() } else { format!(" \u{b7} {risk} risk") }
 }
 
+/// "Designer" plus the picked model and effort when set: "Designer \u{b7} Opus high".
+pub fn agent_and_model(n: &Node) -> String {
+    let agent = n.agent.as_deref().unwrap_or("");
+    let Some(model) = n.model.as_deref().filter(|m| !m.is_empty()) else { return agent.to_string() };
+    let mut m = model[..1].to_uppercase() + &model[1..];
+    if let Some(e) = n.effort.as_deref().filter(|e| !e.is_empty()) {
+        m = format!("{m} {e}");
+    }
+    dotted(&[agent, &m])
+}
+
 /// Card subtitle: "Waiting on you \u{b7} low risk", "Planned \u{b7} Ops", "Reviewer \u{b7} 10:20", "Task for the team \u{b7} unclaimed".
 pub fn subtitle(n: &Node) -> String {
     let time = n.started_at.get(11..16).unwrap_or("");
-    let agent = n.agent.as_deref().unwrap_or("");
+    let who = agent_and_model(n);
+    let agent = who.as_str();
     let zone = zone_of(n);
     if is_planned(n) {
         return dotted(&["Planned", agent]);
@@ -834,6 +846,16 @@ mod tests {
         let (o1, o2) = (at(&l, &nodes, "o1"), at(&l, &nodes, "o2"));
         assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + NEAR));
         assert!(close(o2.x, ax + 40.) && close(o2.y, SPINE_Y + FAR));
+    }
+
+    #[test]
+    fn card_shows_the_picked_model_and_effort() {
+        let mut n = node("s", "work", "running", "2026-11-18 10:00:00");
+        n.agent = Some("Designer".into());
+        assert_eq!(agent_and_model(&n), "Designer");
+        n.model = Some("opus".into());
+        n.effort = Some("high".into());
+        assert_eq!(agent_and_model(&n), "Designer \u{b7} Opus high");
     }
 
     #[test]

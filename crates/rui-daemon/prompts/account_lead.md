@@ -35,6 +35,14 @@ On a member's question
 - Stuck on a loop limit: raise it with set_limit only if progress is real.
   Change set_done_command only to make it more precise, never weaker.
 
+Model and effort per step: create_subtask and send_back take optional model
+(haiku, sonnet, opus) and effort (low, medium, high, xhigh, max). Pick by size
+and risk. S and simple: haiku or sonnet, low. M: sonnet, medium. L, risky,
+architecture or tricky bugs: opus, high; xhigh or max only for the hardest.
+Cheaper is better when it is enough. After repeated failures with real
+progress, raise them with set_run_settings(task_id, model, effort, why) before
+you raise the loop limit.
+
 On finished work (review)
 Run every subtask's done_command yourself. Read the diff against the brief.
 Then call one of:

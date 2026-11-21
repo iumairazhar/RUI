@@ -25,7 +25,7 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story";
+mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story,mcp__rui__set_run_settings";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -905,11 +905,17 @@ pub(crate) async fn run_logged(db: &Db, cfg: &Config, live: &Live, agent: &str, 
 async fn run_logged_on(cli: Cli, db: &Db, cfg: &Config, live: &Live, agent: &str, task_id: i64, mut run: AgentRun) -> Result<RunOutcome> {
     let seat = seats::pick_from(db, &cfg.data_dir, crate::thread::now_secs())?.context("all seats are used up")?;
     run.seat = Some(seat.clone());
+    if cli == Cli::Codex {
+        // The model names are Claude aliases and Codex has no effort flag: Codex keeps its own defaults.
+        (run.model, run.effort) = (None, None);
+    }
+    let (model, effort) = (run.model.clone(), run.effort.clone());
     let res = run_agent_with(cli, &run, |p| {
         on_line(live, LiveKey::Task(task_id), p);
         let Some((kind, payload)) = line_event(p) else { return };
         seats::record_limits(&payload, crate::thread::now_secs());
-        let _ = db.add_event(Some(task_id), agent, kind, &tag_seat(kind, payload, &seat.id));
+        let payload = tag_run_settings(kind, tag_seat(kind, payload, &seat.id), model.as_deref(), effort.as_deref());
+        let _ = db.add_event(Some(task_id), agent, kind, &payload);
     })
     .await;
     if seat_used_up(cli, &res) {
@@ -944,6 +950,20 @@ pub async fn within<T>(limit: std::time::Duration, fut: impl std::future::Future
 pub fn tag_seat(kind: &str, mut payload: Value, seat_id: &str) -> Value {
     if kind == "result" && payload.is_object() {
         payload["seat_id"] = json!(seat_id);
+    }
+    payload
+}
+
+/// Adds the requested `effort` and model to an `init` payload. The CLI's own `model` (the full
+/// name it resolved) is kept when present; the alias asked for goes in `requested_model`.
+pub fn tag_run_settings(kind: &str, mut payload: Value, model: Option<&str>, effort: Option<&str>) -> Value {
+    if kind != "init" || !payload.is_object() {
+        return payload;
+    }
+    payload["effort"] = json!(effort);
+    payload["requested_model"] = json!(model);
+    if payload["model"].as_str().is_none() && model.is_some() {
+        payload["model"] = json!(model);
     }
     payload
 }
@@ -1102,6 +1122,7 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
     let names = role.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
     install_logged(db, cfg, &wt, task, "lead", &client.name, &names)?;
     let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &account_lead_vars(&cfg.data_dir, client, event)?);
+    let run = crate::run_settings::for_lead(&cfg.data_dir);
     Ok(AgentRun {
         role: Role::Lead,
         task_id: Some(task.id),
@@ -1119,6 +1140,8 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
         seat: None,
         sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
         deny_secrets: None,
+        model: run.model,
+        effort: run.effort,
     })
 }
 
@@ -1333,6 +1356,8 @@ fn rui_decision_run(cfg: &Config, parent: &Task, prompt: String, system_prompt: 
         seat: None,
         sandbox: None,
         deny_secrets: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -1461,6 +1486,7 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
     let block = take_instructions(db, task_id)?;
     let (system_prompt, allowed_tools) = member_setup(db, cfg, &task, &client, &done_command, &wt)?;
     let resume = if block.is_empty() { None } else { db.get_session(Role::Builder, Some(task_id))? };
+    let settings = crate::run_settings::for_member(db, &cfg.data_dir, task_id, task.agent.as_deref())?;
     let run = AgentRun {
         role: Role::Builder,
         task_id: Some(task_id),
@@ -1478,6 +1504,8 @@ async fn builder_turn(db: &Arc<Db>, cfg: &Config, live: &Live, task_id: i64) -> 
         seat: None,
         sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
         deny_secrets: None,
+        model: settings.model,
+        effort: settings.effort,
     };
     let cli = crate::codex::for_member(&cfg.data_dir, &client.name, task.agent.as_deref().unwrap_or("builder"));
     if cli == Cli::Codex && crate::sandbox::codex_refused() {
@@ -1736,6 +1764,18 @@ mod tests {
         assert_eq!(payload["apiKeySource"], "none");
         assert_eq!(payload["session_id"], "s");
     }
+    #[test]
+    fn init_events_carry_the_requested_model_and_effort() {
+        let cli = json!({"model": "claude-opus-x", "session_id": "s"});
+        let v = tag_run_settings("init", cli, Some("opus"), Some("high"));
+        assert_eq!((v["model"].as_str(), v["requested_model"].as_str(), v["effort"].as_str()), (Some("claude-opus-x"), Some("opus"), Some("high")));
+        let v = tag_run_settings("init", json!({}), Some("haiku"), None);
+        assert_eq!((v["model"].as_str(), v["effort"].as_str()), (Some("haiku"), None));
+        let v = tag_run_settings("init", json!({}), None, None);
+        assert!(v["model"].is_null() && v["requested_model"].is_null());
+        assert_eq!(tag_run_settings("result", json!({"x": 1}), Some("opus"), Some("low")), json!({"x": 1}));
+    }
+
     #[test]
     fn stream_lines_are_not_stored() {
         let line = r#"{"type":"stream_event","event":{"type":"message_start"}}"#;
