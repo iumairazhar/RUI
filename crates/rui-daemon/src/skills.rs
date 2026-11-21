@@ -139,12 +139,17 @@ const SKILL_DIRS: [&str; 2] = [".claude/skills", ".agents/skills"];
 
 /// Adds both installed-skill folders to the repo's `info/exclude`, each only once.
 fn exclude_installed_skills(wt: &Path) -> Result<()> {
+    let lines: Vec<String> = SKILL_DIRS.iter().map(|d| format!("{d}/")).collect();
+    add_excludes(wt, &lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Adds each line to the repo's `info/exclude`, only once.
+pub(crate) fn add_excludes(wt: &Path, lines: &[&str]) -> Result<()> {
     let info = git_common_dir(wt)?.join("info");
     std::fs::create_dir_all(&info)?;
     let file = info.join("exclude");
     let mut text = std::fs::read_to_string(&file).unwrap_or_default();
-    for dir in SKILL_DIRS {
-        let line = format!("{dir}/");
+    for &line in lines {
         if text.lines().any(|l| l.trim() == line) {
             continue;
         }

@@ -1080,6 +1080,7 @@ pub(crate) fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agen
         }
     }
     skills::install_skills(wt, &cfg.data_dir, &unique)?;
+    crate::uploads::copy_task_inputs(db, &cfg.data_dir, wt, task)?;
     for n in &unique {
         db.add_event(Some(task.id), agent, "skill_used", &json!({"skill": n}))?;
     }

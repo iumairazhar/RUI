@@ -528,8 +528,8 @@ pub fn stop_all(source: &str) -> Result<Vec<i64>> {
 }
 
 /// Pass new instructions down to a task; returns the daemon's note about what happens next.
-pub fn instruct(id: i64, text: &str) -> Result<Option<String>> {
-    let v = post_value(&format!("/tasks/{id}/instruct"), serde_json::json!({ "text": text }))?;
+pub fn instruct(id: i64, text: &str, attachments: &[String]) -> Result<Option<String>> {
+    let v = post_value(&format!("/tasks/{id}/instruct"), serde_json::json!({ "text": text, "attachments": attachments }))?;
     Ok(v["note"].as_str().map(str::to_string))
 }
 
@@ -558,9 +558,9 @@ pub fn delete_chat(id: i64) -> Result<()> {
     library("DELETE", &format!("/chats/{id}"), None).map(|_| ())
 }
 
-/// Post a user message to a chat, with the client the owner picked for it (if any).
-pub fn post_chat(chat_id: i64, content: &str, client: Option<&str>) -> Result<()> {
-    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content, "client": client }))
+/// Post a user message to a chat, with the client the owner picked for it (if any) and attached upload ids.
+pub fn post_chat(chat_id: i64, content: &str, client: Option<&str>, attachments: &[String]) -> Result<()> {
+    post("/chat", serde_json::json!({ "chat_id": chat_id, "content": content, "client": client, "attachments": attachments }))
 }
 
 /// How to undo a held owner answer before `run_at` (unix seconds).

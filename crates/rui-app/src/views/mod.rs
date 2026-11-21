@@ -4,6 +4,7 @@ pub mod activity;
 pub mod agents;
 pub mod apps;
 pub mod asks;
+pub mod attach;
 pub mod character;
 pub mod chat;
 pub mod client_knowledge;
