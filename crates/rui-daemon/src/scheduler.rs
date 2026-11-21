@@ -381,7 +381,7 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     if let Some(why) = &q.why {
         text.push_str(&format!("\nWhy: {why}"));
     }
-    db.add_event(Some(task.id), by, "instruction", &json!({"text": text}))?;
+    db.add_event(Some(task.id), by, "instruction", &json!({"text": text, "from_question": q.id}))?;
     if task.status != TaskStatus::WaitingAnswer {
         return Ok(());
     }
@@ -410,7 +410,7 @@ fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result
     if word.starts_with("retry") {
         return retry_stuck(db, task.id, by).map(|_| ());
     }
-    db.add_event(Some(task.id), by, "instruction", &json!({"text": answer}))?;
+    db.add_event(Some(task.id), by, "instruction", &json!({"text": answer, "from_question": q.id}))?;
     db.set_task_status(task.id, TaskStatus::New)
 }
 

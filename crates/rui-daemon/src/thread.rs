@@ -290,7 +290,11 @@ fn task_in_node(ctx: &Ctx) -> Node {
     node(format!("task:{}", ctx.top.id), "in", "task_in", "done", title, &ctx.top.created_at)
 }
 
+/// An owner's answer forwarded as an instruction: tagged with `from_question`, or (older events) by its text.
 fn is_answer_text(e: &Event) -> bool {
+    if e.payload.get("from_question").is_some_and(|v| !v.is_null()) {
+        return true;
+    }
     e.payload["text"].as_str().is_some_and(|t| t.starts_with("Answer to your question"))
 }
 
@@ -1282,6 +1286,23 @@ mod tests {
         let th = get(&db, top, real_now());
         let titles: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
         assert_eq!(titles, vec!["You said: use v2".to_string()]);
+    }
+
+    #[test]
+    fn stuck_answer_shows_once_as_an_answer() {
+        let (db, top, sub) = setup(TaskStatus::Stuck);
+        db.set_task_status(top, TaskStatus::Stuck).unwrap();
+        db.add_event(Some(sub), "scheduler", "agent_error", &json!({"error": "boom"})).unwrap();
+        crate::scheduler::raise_stuck_question(&db, top, "boom").unwrap();
+        let q = db.questions_for_task(top).unwrap().pop().unwrap();
+        crate::scheduler::answer_question(&db, q.id, "why we use astro?", None, "owner").unwrap();
+        let inst = db.pending_instructions(top).unwrap();
+        assert_eq!(inst[0].1, "why we use astro?");
+        let th = get(&db, top, real_now());
+        let ins: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").collect();
+        let ans: Vec<_> = th.nodes.iter().filter(|n| n.kind == "answer").map(|n| n.title.clone()).collect();
+        assert!(ins.is_empty(), "{ins:?}");
+        assert_eq!(ans, vec!["You answered: why we use astro?".to_string()]);
     }
 
     fn listed(db: &Db, all: bool, now: i64) -> usize {
