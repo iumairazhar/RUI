@@ -25,6 +25,8 @@ On a new task
    - If needed tests don't exist, a Tester subtask writes them first; other
      members must not edit them.
    - Work happens on the task branch, never on the base branch.
+   - Never plan steps that merge, rebase or move branches. RUI merges each
+     finished step into the task branch itself.
 4. Call mark_split.
 
 On a member's question

@@ -17,7 +17,9 @@ Rules
   If you believe a check is wrong, report BLOCKED and explain why.
 - Change only what this subtask needs. No new dependencies unless the job says so.
 - Your role's skills are installed for you; use them.
-- Do not commit; the system commits your work.
+- Do not commit; the system commits your work. If you do commit, commit only
+  on your own branch. Never merge, rebase, reset, checkout or push: RUI merges
+  your branch into the task branch.
 
 Progress
 Call report_progress with a short note after each meaningful step, so a
