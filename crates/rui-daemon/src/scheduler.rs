@@ -25,7 +25,8 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story,mcp__rui__set_run_settings,mcp__rui__request_role";
+mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story,mcp__rui__set_run_settings,mcp__rui__request_role,\
+mcp__rui__reply_owner";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -1175,6 +1176,8 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
 async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Vec<(String, String)>) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = client_for(db, &task)?;
+    let owner_spoke = !answers.is_empty() || owner_pending(db, task_id)?;
+    let since = db.max_event_id(&[task_id])?;
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
@@ -1182,11 +1185,28 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     if sandbox_missing(db, task_id, &res)? {
         return Ok(());
     }
-    if let Err(e) = res {
-        return agent_failed(db, task_id, &e);
+    let out = match res {
+        Ok(out) => out,
+        Err(e) => return agent_failed(db, task_id, &e),
+    };
+    if owner_spoke {
+        reply_after_turn(db, task_id, since, &out)?;
     }
     after_lead_turn(db, task_id)?;
     Ok(())
+}
+
+/// True when an instruction waiting for the Lead was written by the owner.
+fn owner_pending(db: &Db, task_id: i64) -> Result<bool> {
+    let ids: Vec<i64> = db.pending_instructions(task_id)?.into_iter().map(|(id, _)| id).collect();
+    crate::lead_reply::any_from_owner(db, &ids)
+}
+
+/// The owner always hears back: a turn that read owner input but did not call reply_owner
+/// gets a reply from its final text.
+fn reply_after_turn(db: &Db, task_id: i64, since: i64, out: &RunOutcome) -> Result<()> {
+    let text = out.result_text.as_deref().filter(|_| !out.is_error);
+    crate::lead_reply::ensure(db, task_id, since, text)
 }
 
 /// The Account Lead reviews a task whose subtasks are all done and calls send_back or forward_pr.
@@ -2490,6 +2510,32 @@ mod tests {
         let last = db.list_chat(chat.id, 10).unwrap().pop().unwrap();
         assert!(last.content.contains("**Account Lead:** Mind the schema"));
         assert!(last.content.contains("PR: https://x.test/pr/2"));
+    }
+
+    #[test]
+    fn owner_input_gets_a_reply_from_the_turns_final_text() {
+        let db = Db::open_test();
+        let t = chat_task(&db, None);
+        db.add_event(Some(t.id), "scout", "instruction", &json!({"text": "report"})).unwrap();
+        assert!(!owner_pending(&db, t.id).unwrap());
+        db.set_task_status(t.id, TaskStatus::Stuck).unwrap();
+        raise_stuck_question(&db, t.id, "boom").unwrap();
+        let q = db.questions_for_task(t.id).unwrap().pop().unwrap();
+        answer_question(&db, q.id, "why we use astro?", None, "owner").unwrap();
+        assert!(owner_pending(&db, t.id).unwrap());
+        let since = db.max_event_id(&[t.id]).unwrap();
+        let out = |text: &str, is_error| RunOutcome { session_id: None, result_text: Some(text.into()), is_error, exit_ok: true };
+        reply_after_turn(&db, t.id, since, &out("Astro builds the static pages.", false)).unwrap();
+        reply_after_turn(&db, t.id, since, &out("ignored", false)).unwrap();
+        let replies = db.events_for_tasks(&[t.id], &["lead_reply"], 0, 10).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].payload["text"], "Astro builds the static pages.");
+        let inst = db.events_for_tasks(&[t.id], &["instruction"], 0, 10).unwrap().into_iter().rfind(|e| e.agent == "owner").unwrap();
+        assert_eq!(replies[0].payload["to_event_id"], inst.id);
+        let later = db.max_event_id(&[t.id]).unwrap();
+        reply_after_turn(&db, t.id, later, &out("limit hit", true)).unwrap();
+        let last = db.events_for_tasks(&[t.id], &["lead_reply"], later, 10).unwrap();
+        assert_eq!(last[0].payload["text"], crate::lead_reply::FALLBACK);
     }
 
     #[test]

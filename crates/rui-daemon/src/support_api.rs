@@ -1,7 +1,8 @@
 //! HTTP routes for the support agents:
 //! POST /tasks/{id}/diagnose (ask the Scout), POST /proposals/{event_id} (approve or dismiss a
 //! Coach proposal), POST /scout-reports/{event_id}/dismiss (clear a Scout report from the Inbox),
-//! POST /role-added/{event_id}/dismiss (clear a "role added" note from the Inbox).
+//! POST /role-added/{event_id}/dismiss (clear a "role added" note from the Inbox),
+//! POST /lead-replies/{event_id}/dismiss (clear a Lead reply from the Inbox).
 
 use crate::api::ApiState;
 use crate::{coach, scout};
@@ -30,6 +31,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/proposals/{event_id}", post(resolve_proposal))
         .route("/scout-reports/{event_id}/dismiss", post(dismiss_report))
         .route("/role-added/{event_id}/dismiss", post(dismiss_role_added))
+        .route("/lead-replies/{event_id}/dismiss", post(dismiss_lead_reply))
 }
 
 /// Asks the Scout why this task failed or stalled. The report shows in the Inbox.
@@ -68,6 +70,13 @@ async fn dismiss_report(State(s): State<ApiState>, Path(event_id): Path<i64>) ->
 async fn dismiss_role_added(State(s): State<ApiState>, Path(event_id): Path<i64>) -> Reply {
     if !crate::role_request::dismiss(&s.db, event_id).map_err(internal)? {
         return Err(fail(StatusCode::NOT_FOUND, "no open role-added note with that id"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn dismiss_lead_reply(State(s): State<ApiState>, Path(event_id): Path<i64>) -> Reply {
+    if !crate::lead_reply::dismiss(&s.db, event_id).map_err(internal)? {
+        return Err(fail(StatusCode::NOT_FOUND, "no open Lead reply with that id"));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -118,6 +127,18 @@ mod tests {
         assert_eq!((open.len(), open[0].id), (1, body["request_event_id"].as_i64().unwrap()));
         assert_eq!(open[0].payload["by"], "owner");
         assert_eq!(post(&app, "/tasks/999/diagnose", json!({})).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lead_reply_dismiss_needs_the_owner_and_an_open_reply() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, db, id) = app(d.path());
+        let rid = crate::lead_reply::record(&db, id, "Done").unwrap();
+        let uri = format!("/lead-replies/{rid}/dismiss");
+        let bare = Request::post(&uri).body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(bare).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post(&app, &uri, json!({})).await.0, StatusCode::OK);
+        assert_eq!(post(&app, &uri, json!({})).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub mod heartbeat;
 pub mod hide;
 pub mod inbox;
 pub mod inputs_api;
+pub mod lead_reply;
 pub mod library;
 pub mod library_api;
 pub mod library_roles;

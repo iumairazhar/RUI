@@ -388,6 +388,14 @@ pub struct LogDecisionArgs {
     pub line: String,
 }
 
+/// Arguments for `reply_owner`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplyOwnerArgs {
+    /// Short reply: what you understood, what you did, what happens next.
+    pub text: String,
+}
+
 /// Arguments for the Account Lead's `send_back`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -1146,6 +1154,17 @@ pub mod logic {
         Ok(json!({"ok": true}))
     }
 
+    /// Account Lead replies to the owner on its task; shows on the thread and in the Inbox.
+    pub fn reply_owner(db: &Db, ctx: &Ctx, a: ReplyOwnerArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if a.text.trim().is_empty() {
+            anyhow::bail!("text must not be empty");
+        }
+        let id = crate::lead_reply::record(db, task.id, &a.text)?;
+        record(db, ctx, Role::Lead, "reply_owner", &a)?;
+        Ok(json!({"ok": true, "event_id": id}))
+    }
+
     /// Account Lead adds a missing library role to its client's Pod, or asks the owner for one.
     pub fn request_role(db: &Db, data_dir: &Path, ctx: &Ctx, a: RequestRoleArgs) -> anyhow::Result<Value> {
         let task = current_task(db, ctx)?;
@@ -1578,6 +1597,15 @@ impl LeadServer {
         Parameters(a): Parameters<LogDecisionArgs>,
     ) -> CallToolResult {
         finish(logic::log_decision(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Reply to the owner after they write or answer: what you understood, what you did, what happens next. Short.")]
+    async fn reply_owner(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<ReplyOwnerArgs>,
+    ) -> CallToolResult {
+        finish(logic::reply_owner(&self.db, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Add a role the work truly needs but the Pod lacks, with why. Adds it when the role library has it switched on; otherwise asks the owner.")]
@@ -2190,6 +2218,15 @@ mod tests {
     }
 
     #[test]
+    fn reply_owner_records_a_lead_reply() {
+        let (db, _data, lead, _member) = staffed();
+        assert!(logic::reply_owner(&db, &lead, ReplyOwnerArgs { text: " ".into() }).is_err());
+        let r = logic::reply_owner(&db, &lead, ReplyOwnerArgs { text: "Got it, retrying.".into() }).unwrap();
+        let e = db.events_by_ids(&[r["event_id"].as_i64().unwrap()]).unwrap().remove(0);
+        assert_eq!((e.kind.as_str(), e.task_id, e.payload["text"].as_str()), ("lead_reply", lead.task_id, Some("Got it, retrying.")));
+    }
+
+    #[test]
     fn set_limit_refuses_a_second_raise_on_the_same_failure() {
         let (db, _data, lead, member) = staffed();
         let id = member.task_id.unwrap();
@@ -2652,7 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "request_role", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
+        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "reply_owner", "request_role", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);

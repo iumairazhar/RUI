@@ -14,10 +14,11 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 25] = [
+const KINDS: [&str; 26] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
     "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
     "handed_back", "pr_merged", "pr_closed", "deploy_requested", "deploy_started", "deploy_finished", "team_asked", "team_reply",
+    "lead_reply",
 ];
 const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
 const TAKEOVER_REASON: &str = "You're doing this step";
@@ -590,6 +591,19 @@ fn forward_node(ctx: &Ctx) -> Option<Node> {
     }
 }
 
+/// One "reply" output per `lead_reply`: the Lead's answer to the owner, full text in the preview.
+fn reply_nodes(ctx: &Ctx) -> Vec<Node> {
+    let replies = ctx.events.iter().filter(|e| e.kind == "lead_reply");
+    replies.map(reply_node).collect()
+}
+
+fn reply_node(e: &Event) -> Node {
+    let text = e.payload["text"].as_str().unwrap_or_default();
+    let title = format!("Lead replied: {}", first_line(text).chars().take(120).collect::<String>());
+    let out = Output { kind: "reply", label: "Lead reply".into(), url: None, preview: Some(text.into()), output_tail: None };
+    out_node(e, "reply", &title, out)
+}
+
 /// A merged PR is a done "pr" output; one closed without a merge is a failed one.
 fn pr_outcome_nodes(ctx: &Ctx) -> Vec<Node> {
     let evs = ctx.evs(ctx.top.id);
@@ -662,6 +676,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     v.extend(review_decision(ctx));
     v.extend(forward_node(ctx));
     v.extend(pr_outcome_nodes(ctx));
+    v.extend(reply_nodes(ctx));
     v.extend(app_nodes(ctx));
     v.extend(deploy_nodes(ctx));
     v
@@ -1286,6 +1301,19 @@ mod tests {
         let th = get(&db, top, real_now());
         let titles: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
         assert_eq!(titles, vec!["You said: use v2".to_string()]);
+    }
+
+    #[test]
+    fn lead_reply_is_a_done_out_node_with_the_full_text() {
+        let (db, top, _sub) = setup(TaskStatus::Open);
+        let long = format!("{}\nsecond line", "a".repeat(130));
+        let id = crate::lead_reply::record(&db, top, &long).unwrap();
+        let th = get(&db, top, real_now());
+        let n = th.nodes.iter().find(|n| n.kind == "reply").unwrap();
+        assert_eq!((n.id.clone(), n.lane, n.status), (format!("ev:{id}"), "out", "done"));
+        assert_eq!(n.title, format!("Lead replied: {}", "a".repeat(120)));
+        assert_eq!(n.output.as_ref().unwrap().preview.as_deref(), Some(long.as_str()));
+        assert_eq!(n.event_ids, vec![id]);
     }
 
     #[test]
