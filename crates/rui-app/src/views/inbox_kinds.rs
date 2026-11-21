@@ -12,6 +12,8 @@ pub const EMAIL_KIND: &str = "email";
 pub const BRIEF_KIND: &str = "meeting_brief";
 /// Kind string for a PR closed without merging.
 pub const PR_CLOSED_KIND: &str = "pr_closed";
+/// Kind string for a role the Lead added to a client's Pod.
+pub const ROLE_ADDED_KIND: &str = "role_added";
 /// Kind strings for a deploy waiting for the owner's OK, and one that failed.
 pub const DEPLOY_KIND: &str = "deploy";
 pub const DEPLOY_FAILED_KIND: &str = "deploy_failed";
@@ -31,6 +33,7 @@ pub enum Kind {
     Email,
     Brief,
     PrClosed,
+    RoleAdded,
     Deploy,
     DeployFailed,
     Other,
@@ -50,6 +53,7 @@ pub fn kind_of(kind: &str) -> Kind {
         "scout" => Kind::Scout,
         EMAIL_KIND => Kind::Email,
         BRIEF_KIND => Kind::Brief,
+        ROLE_ADDED_KIND => Kind::RoleAdded,
         PR_CLOSED_KIND => Kind::PrClosed,
         DEPLOY_KIND => Kind::Deploy,
         DEPLOY_FAILED_KIND => Kind::DeployFailed,
@@ -72,6 +76,7 @@ pub fn tag_of(k: Kind, th: &Theme) -> (&'static str, &Status) {
         Kind::Email => ("Email", &th.wait),
         Kind::Brief => ("Meeting", &th.wait),
         Kind::PrClosed => ("PR closed", &th.block),
+        Kind::RoleAdded => ("Pod", &th.done),
         Kind::Deploy => ("Deploy", &th.block),
         Kind::DeployFailed => ("Deploy failed", &th.block),
         Kind::Other => ("Inbox", &th.wait),
@@ -139,7 +144,7 @@ impl ItemAct {
 pub fn acts_of(k: Kind) -> Vec<ItemAct> {
     match k {
         Kind::Proposal => vec![ItemAct::Approve, ItemAct::Dismiss],
-        Kind::Scout | Kind::Brief => vec![ItemAct::Dismiss],
+        Kind::Scout | Kind::Brief | Kind::RoleAdded => vec![ItemAct::Dismiss],
         Kind::Email => vec![ItemAct::MakeTask, ItemAct::Dismiss],
         Kind::Seats => vec![ItemAct::OpenSeats],
         Kind::Undo => vec![ItemAct::Undo],
@@ -250,6 +255,8 @@ mod tests {
         assert_eq!(acts_of(Kind::Scout), [ItemAct::Dismiss]);
         assert_eq!(acts_of(Kind::Email), [ItemAct::MakeTask, ItemAct::Dismiss]);
         assert_eq!(acts_of(Kind::Brief), [ItemAct::Dismiss]);
+        assert_eq!(kind_of(ROLE_ADDED_KIND), Kind::RoleAdded);
+        assert_eq!(acts_of(Kind::RoleAdded), [ItemAct::Dismiss]);
         assert_eq!(acts_of(Kind::Seats), [ItemAct::OpenSeats]);
         assert_eq!(acts_of(Kind::Undo), [ItemAct::Undo]);
         assert_eq!(acts_of(Kind::Checkpoint), [ItemAct::Release]);

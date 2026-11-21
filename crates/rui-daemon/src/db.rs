@@ -440,6 +440,13 @@ impl Db {
         Ok(())
     }
 
+    /// Replace a task's pod (the roles that may work on it).
+    pub fn set_task_pod(&self, id: i64, pod: &[String]) -> Result<()> {
+        let sql = format!("UPDATE tasks SET pod = ?1, updated_at = {NOW} WHERE id = ?2");
+        self.conn()?.execute(&sql, params![serde_json::to_string(pod)?, id])?;
+        Ok(())
+    }
+
     /// Make `task_id` depend on `depends_on`.
     pub fn add_task_dep(&self, task_id: i64, depends_on: i64) -> Result<()> {
         let sql = "INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?1, ?2)";
