@@ -99,6 +99,20 @@ pub const PACKAGE_CACHES: [&str; 10] = [
     "~/Library/Caches/ms-playwright",
 ];
 
+/// Playwright test commands run outside the sandbox: on macOS Chrome must register a Mach service
+/// at startup, which no sandbox setting allows. Same trust as the done_command, which already runs
+/// the same tests unsandboxed. Every other command stays sandboxed. Allowed by the owner on 2026-11-21.
+pub const BROWSER_TEST_COMMANDS: [&str; 8] = [
+    "npx playwright test",
+    "npx playwright test *",
+    "pnpm exec playwright test",
+    "pnpm exec playwright test *",
+    "pnpm test:e2e",
+    "pnpm test:e2e *",
+    "npm run test:e2e",
+    "npm run test:e2e *",
+];
+
 /// Where a run may write: its worktree, the repo's .git, and the package-manager caches.
 fn allow_write(wt: &str, repo: &Path) -> Vec<String> {
     let mut out = vec![wt.to_string(), repo.join(".git").display().to_string()];
@@ -127,6 +141,7 @@ pub fn run_settings(data_dir: &Path, worktree: &Path, repo: &Path, hosts: &[Stri
             "enabled": true,
             "allowUnsandboxedCommands": false,
             "failIfUnavailable": true,
+            "excludedCommands": BROWSER_TEST_COMMANDS,
             "filesystem": {
                 "allowWrite": allow_write(&wt, repo),
                 "denyRead": deny_read,
@@ -274,10 +289,11 @@ mod tests {
         ];
         assert_eq!(s(&p["deny"]), want);
         let sb = &v["sandbox"];
-        assert_eq!(sb.as_object().unwrap().len(), 5);
+        assert_eq!(sb.as_object().unwrap().len(), 6);
         assert_eq!(sb["enabled"], true);
         assert_eq!(sb["allowUnsandboxedCommands"], false);
         assert_eq!(sb["failIfUnavailable"], true);
+        assert_eq!(sb["excludedCommands"], json!(BROWSER_TEST_COMMANDS), "only Playwright test commands leave the sandbox");
         let fs = &sb["filesystem"];
         assert_eq!(fs.as_object().unwrap().len(), 2);
         let write = s(&fs["allowWrite"]);
