@@ -149,6 +149,10 @@ fn git_danger(rest: &[&str]) -> Option<&'static str> {
     }
     let tail: Vec<&str> = args.collect();
     let has = |x: &str| tail.contains(&x);
+    // Merging, pulling or moving a branch changes the project's branches (e.g. main), so it waits.
+    if matches!(sub, "merge" | "pull" | "cherry-pick" | "update-ref") {
+        return Some("changes a branch (merge, pull or ref update)");
+    }
     let risky = match sub {
         "push" | "clean" | "restore" | "rebase" | "filter-branch" => true,
         "reset" => has("--hard"),
@@ -262,6 +266,10 @@ mod tests {
             ("eval rm a", "deletes or moves files"), ("timeout 5 rm x", "deletes or moves files"),
             ("ls | xargs -n 1 rm", "deletes or moves files"), ("cp a b", "writes files"), ("ln -sf a b", "writes files"),
             ("git push", "rewrites or pushes git history"), ("git reset --hard HEAD~1", "rewrites or pushes git history"),
+            ("git -C /p merge --no-ff rui/task-26 -m x", "changes a branch (merge, pull or ref update)"),
+            ("git pull", "changes a branch (merge, pull or ref update)"),
+            ("git cherry-pick abc", "changes a branch (merge, pull or ref update)"),
+            ("git update-ref refs/heads/main abc", "changes a branch (merge, pull or ref update)"),
             ("git clean -fd", "rewrites or pushes git history"), ("git checkout -- a", "rewrites or pushes git history"),
             ("git checkout .", "rewrites or pushes git history"), ("git branch -D x", "rewrites or pushes git history"),
             ("git -C repo push", "rewrites or pushes git history"), ("git stash drop", "rewrites or pushes git history"),
