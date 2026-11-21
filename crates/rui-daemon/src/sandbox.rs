@@ -82,6 +82,44 @@ pub const SECRETS: [&str; 8] = ["owner.token", "rui.db", "rui.db-wal", "rui.db-s
 
 /// The settings JSON for one run. Permission rules take `//` for an absolute path; sandbox paths
 /// are plain absolute paths.
+/// Package-manager caches in the home folder. Installs (pnpm, npm, yarn, pip, Playwright's
+/// browsers) write here; without them every `pnpm install` fails with EPERM in the sandbox.
+/// None of these hold credentials: `~/.npmrc` lives in the home folder itself and stays closed.
+/// Allowed by the owner on 2026-11-21.
+pub const PACKAGE_CACHES: [&str; 10] = [
+    "~/Library/pnpm",
+    "~/.local/share/pnpm",
+    "~/.pnpm-store",
+    "~/Library/Caches/pnpm",
+    "~/.npm",
+    "~/Library/Caches/Yarn",
+    "~/.yarn",
+    "~/Library/Caches/pip",
+    "~/.cache/pip",
+    "~/Library/Caches/ms-playwright",
+];
+
+/// Playwright test commands run outside the sandbox: on macOS Chrome must register a Mach service
+/// at startup, which no sandbox setting allows. Same trust as the done_command, which already runs
+/// the same tests unsandboxed. Every other command stays sandboxed. Allowed by the owner on 2026-11-21.
+pub const BROWSER_TEST_COMMANDS: [&str; 8] = [
+    "npx playwright test",
+    "npx playwright test *",
+    "pnpm exec playwright test",
+    "pnpm exec playwright test *",
+    "pnpm test:e2e",
+    "pnpm test:e2e *",
+    "npm run test:e2e",
+    "npm run test:e2e *",
+];
+
+/// Where a run may write: its worktree, the repo's .git, and the package-manager caches.
+fn allow_write(wt: &str, repo: &Path) -> Vec<String> {
+    let mut out = vec![wt.to_string(), repo.join(".git").display().to_string()];
+    out.extend(PACKAGE_CACHES.iter().map(|p| p.to_string()));
+    out
+}
+
 pub fn run_settings(data_dir: &Path, worktree: &Path, repo: &Path, hosts: &[String]) -> Value {
     let d = data_dir.display();
     let wt = worktree.display().to_string();
@@ -103,8 +141,9 @@ pub fn run_settings(data_dir: &Path, worktree: &Path, repo: &Path, hosts: &[Stri
             "enabled": true,
             "allowUnsandboxedCommands": false,
             "failIfUnavailable": true,
+            "excludedCommands": BROWSER_TEST_COMMANDS,
             "filesystem": {
-                "allowWrite": [wt, repo.join(".git").display().to_string()],
+                "allowWrite": allow_write(&wt, repo),
                 "denyRead": deny_read,
             },
             "network": { "allowedDomains": hosts },
@@ -250,13 +289,17 @@ mod tests {
         ];
         assert_eq!(s(&p["deny"]), want);
         let sb = &v["sandbox"];
-        assert_eq!(sb.as_object().unwrap().len(), 5);
+        assert_eq!(sb.as_object().unwrap().len(), 6);
         assert_eq!(sb["enabled"], true);
         assert_eq!(sb["allowUnsandboxedCommands"], false);
         assert_eq!(sb["failIfUnavailable"], true);
+        assert_eq!(sb["excludedCommands"], json!(BROWSER_TEST_COMMANDS), "only Playwright test commands leave the sandbox");
         let fs = &sb["filesystem"];
         assert_eq!(fs.as_object().unwrap().len(), 2);
-        assert_eq!(s(&fs["allowWrite"]), ["/Users/o/.rui/worktrees/7", "/code/app/.git"]);
+        let write = s(&fs["allowWrite"]);
+        assert_eq!(write[..2], ["/Users/o/.rui/worktrees/7", "/code/app/.git"]);
+        assert_eq!(write[2..], PACKAGE_CACHES);
+        assert!(!write.iter().any(|p| *p == "~" || *p == "~/" || p.contains(".ssh") || p.contains(".npmrc")), "only caches: {write:?}");
         let deny_read = s(&fs["denyRead"]);
         assert!(!deny_read.iter().any(|p| *p == "/Users/o/.rui" || p.contains("worktrees")), "the worktree stays readable: {deny_read:?}");
         assert_eq!(deny_read[..3], ["/Users/o/.rui/owner.token", "/Users/o/.rui/rui.db", "/Users/o/.rui/rui.db-wal"]);

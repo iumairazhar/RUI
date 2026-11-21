@@ -14,10 +14,11 @@ pub const STALL_SECS: i64 = 600;
 pub const PAGE: usize = 200;
 const TAIL_CHARS: usize = 2000;
 /// The only event kinds node building reads.
-const KINDS: [&str; 25] = [
+const KINDS: [&str; 26] = [
     "instruction", "sent_back", "forwarded", "landed", "land_failed", "loop_limit", "apps_started", "done_check", "stopped",
     "dropped", "agent_error", "reviewed", "resumed", "escalated", "checkpoint_set", "checkpoint_cleared", "taken_over",
     "handed_back", "pr_merged", "pr_closed", "deploy_requested", "deploy_started", "deploy_finished", "team_asked", "team_reply",
+    "lead_reply",
 ];
 const CHECKPOINT_REASON: &str = "Waiting for you to release this step";
 const TAKEOVER_REASON: &str = "You're doing this step";
@@ -96,6 +97,15 @@ pub struct Node {
     pub effort: Option<String>,
 }
 
+/// The oldest open owner question in a thread, for the answer box.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenQuestion {
+    pub id: i64,
+    pub text: String,
+    pub options: Vec<String>,
+    pub risk: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Thread {
     pub id: i64,
@@ -108,6 +118,7 @@ pub struct Thread {
     pub cost_usd: f64,
     pub last_event_id: i64,
     pub nodes: Vec<Node>,
+    pub open_question: Option<OpenQuestion>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +160,8 @@ struct Ctx<'a> {
     meeting_cost: HashMap<i64, f64>,
     /// `run_settings` events of the subtasks, oldest first. Kept apart from `events`, so status logic never sees them.
     run_settings: Vec<Event>,
+    /// `question_raised` events, for the options the daemon saved on its own questions. Kept apart like `run_settings`.
+    raised: Vec<Event>,
     now: i64,
     stall: i64,
 }
@@ -290,13 +303,20 @@ fn task_in_node(ctx: &Ctx) -> Node {
     node(format!("task:{}", ctx.top.id), "in", "task_in", "done", title, &ctx.top.created_at)
 }
 
-fn is_answer_text(e: &Event) -> bool {
-    e.payload["text"].as_str().is_some_and(|t| t.starts_with("Answer to your question"))
+/// An owner's answer forwarded as an instruction: tagged with `from_question`, or (older events)
+/// by its text: the "Answer to your question" form, or exactly the text of an owner answer.
+fn is_answer_text(e: &Event, answers: &[&str]) -> bool {
+    if e.payload.get("from_question").is_some_and(|v| !v.is_null()) {
+        return true;
+    }
+    let Some(t) = e.payload["text"].as_str() else { return false };
+    t.starts_with("Answer to your question") || answers.contains(&t.trim())
 }
 
 fn instruction_nodes(ctx: &Ctx) -> Vec<Node> {
     // An answer to a question is stored as an instruction too; the answer node already shows it.
-    let said = |e: &&Event| e.kind == "instruction" && e.agent == "owner" && !is_answer_text(e);
+    let answers: Vec<&str> = ctx.questions.iter().filter(|q| q.level == "owner").filter_map(|q| q.answer.as_deref()).map(str::trim).collect();
+    let said = |e: &&Event| e.kind == "instruction" && e.agent == "owner" && !is_answer_text(e, &answers);
     ctx.events
         .iter()
         .filter(said)
@@ -508,6 +528,28 @@ fn decision_node(id: String, title: String, at: &str, d: Decision) -> Node {
     n
 }
 
+/// Options saved on the question's `question_raised` event (the daemon's own stuck questions).
+fn raised_options(ctx: &Ctx, q: &Question) -> Vec<String> {
+    let e = ctx.raised.iter().rev().find(|e| e.payload["question_id"] == q.id);
+    let opts = e.and_then(|e| e.payload["options"].as_array());
+    opts.into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+}
+
+/// The oldest open owner-level question on the top task or any subtask.
+fn open_question(ctx: &Ctx) -> Option<OpenQuestion> {
+    let open = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Open && q.level == "owner");
+    let q = open.min_by_key(|q| q.id)?;
+    let esc = owner_escalation(ctx.evs(q.task_id), q);
+    let text = esc.and_then(|e| short_question(&e.payload)).unwrap_or_else(|| q.text.clone());
+    let saved = esc.and_then(|e| e.payload["options"].as_array());
+    let mut options: Vec<String> = saved.into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+    if options.is_empty() {
+        options = raised_options(ctx, q);
+    }
+    let risk = esc.and_then(|e| e.payload["risk"].as_str()).map(String::from);
+    Some(OpenQuestion { id: q.id, text, options, risk })
+}
+
 fn question_decisions(ctx: &Ctx) -> Vec<Node> {
     let open = ctx.questions.iter().filter(|q| q.status == QuestionStatus::Open && q.level == "owner");
     let build = |q: &Question| {
@@ -517,6 +559,7 @@ fn question_decisions(ctx: &Ctx) -> Vec<Node> {
         d.why = q.ladder.last().map(|r| r.why.clone()).unwrap_or_default();
         d.ladder = q.ladder.clone();
         let esc = owner_escalation(ctx.evs(q.task_id), q);
+        d.options = raised_options(ctx, q);
         if let Some(e) = esc {
             apply_meta(&mut d, &e.payload);
         }
@@ -584,6 +627,19 @@ fn forward_node(ctx: &Ctx) -> Option<Node> {
         None if max_id(&evs, "landed") > fwd.id => Some(out_node(fwd, "diff", "Changes merged", out("diff", "Changes merged", None))),
         None => None,
     }
+}
+
+/// One "reply" output per `lead_reply`: the Lead's answer to the owner, full text in the preview.
+fn reply_nodes(ctx: &Ctx) -> Vec<Node> {
+    let replies = ctx.events.iter().filter(|e| e.kind == "lead_reply");
+    replies.map(reply_node).collect()
+}
+
+fn reply_node(e: &Event) -> Node {
+    let text = e.payload["text"].as_str().unwrap_or_default();
+    let title = format!("Lead replied: {}", first_line(text).chars().take(120).collect::<String>());
+    let out = Output { kind: "reply", label: "Lead reply".into(), url: None, preview: Some(text.into()), output_tail: None };
+    out_node(e, "reply", &title, out)
 }
 
 /// A merged PR is a done "pr" output; one closed without a merge is a failed one.
@@ -658,6 +714,7 @@ fn nodes(ctx: &Ctx) -> Vec<Node> {
     v.extend(review_decision(ctx));
     v.extend(forward_node(ctx));
     v.extend(pr_outcome_nodes(ctx));
+    v.extend(reply_nodes(ctx));
     v.extend(app_nodes(ctx));
     v.extend(deploy_nodes(ctx));
     v
@@ -698,7 +755,8 @@ pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
     let meeting_cost = meeting_costs(db, top.id, &events)?;
     let (questions, last, cost) = (open_questions(db, &ids)?, db.last_activity(&ids)?, db.cost_by_task(&ids)?);
     let run_settings = db.events_for_tasks(&ids, &[crate::run_settings::EVENT], 0, i64::MAX)?;
-    let ctx = Ctx { top, subs: &subs, events, questions, last, cost, meeting_cost, run_settings, now, stall };
+    let raised = db.events_for_tasks(&ids, &["question_raised"], 0, i64::MAX)?;
+    let ctx = Ctx { top, subs: &subs, events, questions, last, cost, meeting_cost, run_settings, raised, now, stall };
     let nodes = nodes(&ctx);
     let mut statuses: Vec<&str> = nodes.iter().map(|n| n.status).collect();
     let all_planned = !subs.is_empty() && subs.iter().all(|s| task_status(&ctx, s) == "planned");
@@ -717,6 +775,7 @@ pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
         cost_usd: ctx.cost.values().sum(),
         last_event_id: db.max_event_id(&ids)?,
         nodes,
+        open_question: open_question(&ctx),
     })
 }
 
@@ -1199,6 +1258,20 @@ mod tests {
     }
 
     #[test]
+    fn an_old_forwarded_answer_is_not_a_second_node() {
+        let (db, top, _sub) = setup(TaskStatus::InProgress);
+        let q = db.create_ladder_question(top, Role::Lead, "owner", &[], "Stopped: what now?").unwrap();
+        db.answer_question(q.id, "why we use astro ?", None).unwrap();
+        // Before `from_question` existed, the answer was forwarded as a plain owner instruction.
+        db.add_event(Some(top), "owner", "instruction", &json!({"text": "why we use astro ?"})).unwrap();
+        db.add_event(Some(top), "owner", "instruction", &json!({"text": "a separate message"})).unwrap();
+        let th = get(&db, top, real_now());
+        let said: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
+        assert_eq!(said, vec!["You said: a separate message".to_string()]);
+        assert_eq!(th.nodes.iter().filter(|n| n.kind == "answer").count(), 1);
+    }
+
+    #[test]
     fn questions_closed_by_a_drop_are_not_shown_as_answers() {
         let (db, _top, sub) = setup(TaskStatus::InProgress);
         let q = db.create_ladder_question(sub, Role::Builder, "owner", &[], "Pick").unwrap();
@@ -1282,6 +1355,55 @@ mod tests {
         let th = get(&db, top, real_now());
         let titles: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
         assert_eq!(titles, vec!["You said: use v2".to_string()]);
+    }
+
+    #[test]
+    fn lead_reply_is_a_done_out_node_with_the_full_text() {
+        let (db, top, _sub) = setup(TaskStatus::Open);
+        let long = format!("{}\nsecond line", "a".repeat(130));
+        let id = crate::lead_reply::record(&db, top, &long).unwrap();
+        let th = get(&db, top, real_now());
+        let n = th.nodes.iter().find(|n| n.kind == "reply").unwrap();
+        assert_eq!((n.id.clone(), n.lane, n.status), (format!("ev:{id}"), "out", "done"));
+        assert_eq!(n.title, format!("Lead replied: {}", "a".repeat(120)));
+        assert_eq!(n.output.as_ref().unwrap().preview.as_deref(), Some(long.as_str()));
+        assert_eq!(n.event_ids, vec![id]);
+    }
+
+    #[test]
+    fn open_question_is_the_oldest_open_owner_question() {
+        let (db, top, sub) = setup(TaskStatus::WaitingAnswer);
+        assert!(get(&db, top, real_now()).open_question.is_none());
+        db.create_ladder_question(sub, Role::Builder, "lead", &[], "lead only").unwrap();
+        let q = db.create_ladder_question(sub, Role::Builder, "owner", &[], "Long text\nmore").unwrap();
+        let p = json!({"question_id": q.id, "to": "owner", "question": "Use v2?", "options": ["Yes", "No"], "risk": "low"});
+        db.add_event(Some(sub), "rui", "escalated", &p).unwrap();
+        db.set_task_status(top, TaskStatus::Stuck).unwrap();
+        crate::scheduler::raise_stuck_question(&db, top, "boom").unwrap();
+        let oq = get(&db, top, real_now()).open_question.unwrap();
+        assert_eq!((oq.id, oq.text.as_str(), oq.risk.as_deref()), (q.id, "Use v2?", Some("low")));
+        assert_eq!(oq.options, ["Yes", "No"]);
+        db.answer_question(q.id, "Yes", None).unwrap();
+        let oq = get(&db, top, real_now()).open_question.unwrap();
+        assert!(oq.text.starts_with("work stopped: boom."), "{}", oq.text);
+        assert_eq!((oq.options.clone(), oq.risk), (crate::stuck::ERROR_OPTIONS.map(String::from).to_vec(), None));
+    }
+
+    #[test]
+    fn stuck_answer_shows_once_as_an_answer() {
+        let (db, top, sub) = setup(TaskStatus::Stuck);
+        db.set_task_status(top, TaskStatus::Stuck).unwrap();
+        db.add_event(Some(sub), "scheduler", "agent_error", &json!({"error": "boom"})).unwrap();
+        crate::scheduler::raise_stuck_question(&db, top, "boom").unwrap();
+        let q = db.questions_for_task(top).unwrap().pop().unwrap();
+        crate::scheduler::answer_question(&db, q.id, "why we use astro?", None, "owner").unwrap();
+        let inst = db.pending_instructions(top).unwrap();
+        assert_eq!(inst[0].1, "why we use astro?");
+        let th = get(&db, top, real_now());
+        let ins: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").collect();
+        let ans: Vec<_> = th.nodes.iter().filter(|n| n.kind == "answer").map(|n| n.title.clone()).collect();
+        assert!(ins.is_empty(), "{ins:?}");
+        assert_eq!(ans, vec!["You answered: why we use astro?".to_string()]);
     }
 
     fn listed(db: &Db, all: bool, now: i64) -> usize {

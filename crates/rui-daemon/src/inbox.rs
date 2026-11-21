@@ -213,6 +213,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
     items.extend(crate::email::inbox_items(db)?);
     items.extend(crate::deploy::inbox_items(db)?);
     items.extend(crate::role_request::inbox_items(db)?);
+    items.extend(crate::lead_reply::inbox_items(db)?);
     drop_hidden(db, &tasks, &mut items)?;
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(items)

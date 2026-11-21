@@ -117,6 +117,15 @@ impl TextInput {
         self
     }
 
+    /// Change the placeholder; true when it differs from the old one.
+    pub fn set_placeholder(&mut self, text: &str) -> bool {
+        if self.placeholder == text {
+            return false;
+        }
+        self.placeholder = text.to_string().into();
+        true
+    }
+
     /// Current text.
     pub fn content(&self) -> String {
         self.content.to_string()

@@ -388,6 +388,14 @@ pub struct LogDecisionArgs {
     pub line: String,
 }
 
+/// Arguments for `reply_owner`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplyOwnerArgs {
+    /// Short reply: what you understood, what you did, what happens next.
+    pub text: String,
+}
+
 /// Arguments for the Account Lead's `send_back`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -1090,8 +1098,13 @@ pub mod logic {
     }
 
     /// Lead changes a subtask's loop limit.
+    /// Refuses a raise when the step failed the same way twice and the Lead already raised it once since.
     pub fn set_limit(db: &Db, ctx: &Ctx, a: SetLimitArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
+        let parent = task.parent_id.unwrap_or_default();
+        if a.max_loops > task.max_loops && crate::stuck::spiral(db, parent, task.id)? {
+            anyhow::bail!(crate::stuck::SAME_FAILURE);
+        }
         crate::control::apply_limit(db, task.id, a.max_loops)?;
         record(db, ctx, Role::Lead, "set_limit", &a)?;
         Ok(json!({"ok": true, "task_id": task.id, "max_loops": a.max_loops}))
@@ -1139,6 +1152,17 @@ pub mod logic {
         crate::client_state::append_decision(data_dir, &client.name, &a.line)?;
         record(db, ctx, Role::Lead, "log_decision", &a)?;
         Ok(json!({"ok": true}))
+    }
+
+    /// Account Lead replies to the owner on its task; shows on the thread and in the Inbox.
+    pub fn reply_owner(db: &Db, ctx: &Ctx, a: ReplyOwnerArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        if a.text.trim().is_empty() {
+            anyhow::bail!("text must not be empty");
+        }
+        let id = crate::lead_reply::record(db, task.id, &a.text)?;
+        record(db, ctx, Role::Lead, "reply_owner", &a)?;
+        Ok(json!({"ok": true, "event_id": id}))
     }
 
     /// Account Lead adds a missing library role to its client's Pod, or asks the owner for one.
@@ -1573,6 +1597,15 @@ impl LeadServer {
         Parameters(a): Parameters<LogDecisionArgs>,
     ) -> CallToolResult {
         finish(logic::log_decision(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Reply to the owner after they write or answer: what you understood, what you did, what happens next. Short.")]
+    async fn reply_owner(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<ReplyOwnerArgs>,
+    ) -> CallToolResult {
+        finish(logic::reply_owner(&self.db, &ctx_from(&parts), a))
     }
 
     #[tool(description = "Add a role the work truly needs but the Pod lacks, with why. Adds it when the role library has it switched on; otherwise asks the owner.")]
@@ -2185,6 +2218,31 @@ mod tests {
     }
 
     #[test]
+    fn reply_owner_records_a_lead_reply() {
+        let (db, _data, lead, _member) = staffed();
+        assert!(logic::reply_owner(&db, &lead, ReplyOwnerArgs { text: " ".into() }).is_err());
+        let r = logic::reply_owner(&db, &lead, ReplyOwnerArgs { text: "Got it, retrying.".into() }).unwrap();
+        let e = db.events_by_ids(&[r["event_id"].as_i64().unwrap()]).unwrap().remove(0);
+        assert_eq!((e.kind.as_str(), e.task_id, e.payload["text"].as_str()), ("lead_reply", lead.task_id, Some("Got it, retrying.")));
+    }
+
+    #[test]
+    fn set_limit_refuses_a_second_raise_on_the_same_failure() {
+        let (db, _data, lead, member) = staffed();
+        let id = member.task_id.unwrap();
+        let fail = |tail: &str| db.add_event(Some(id), "scheduler", "done_check", &json!({"passed": false, "output_tail": tail})).unwrap();
+        fail("Error: EPERM: operation not permitted, mkdir '/a/store/1'");
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 9 }).unwrap();
+        fail("Error: EPERM: operation not permitted, mkdir '/a/store/2'");
+        let err = logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 11 }).unwrap_err();
+        assert_eq!(err.to_string(), crate::stuck::SAME_FAILURE);
+        assert_eq!(db.get_task(id).unwrap().unwrap().max_loops, 9);
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 4 }).unwrap();
+        fail("Error: test login failed");
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 11 }).unwrap();
+    }
+
+    #[test]
     fn member_status_logs_event_and_validates() {
         let (db, _data, _lead, member) = staffed();
         let a = StatusArgs { status: "DONE_WITH_CONCERNS".into(), note: "n".into() };
@@ -2631,7 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "request_role", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
+        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "reply_owner", "request_role", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);

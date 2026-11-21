@@ -1,12 +1,12 @@
 //! The Inspector: a docked side panel on the thread page with one Flow node's story and controls.
 
-use super::flow::node_style;
+use super::flow::{node_style, step_group};
 use super::{ThreadsView, icon, is_empty_turn, mono, parse_secs, section, summarize};
 use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
 use crate::views::decision::{CardData, DecisionCard, first_line, reversible_text, risk_label, risk_style};
 use crate::views::status::thread_word;
-use crate::views::{chip, primary_button, tag};
+use crate::views::{chip, markdown, primary_button, tag};
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
 use rui_core::Event;
 
@@ -287,10 +287,34 @@ impl ThreadsView {
             (Some(d), Some(card)) => self.decision_rows(&node, d, card, i, th, cx),
             _ => self.node_rows(&node, i, th, cx),
         };
+        let rows: Vec<AnyElement> = self.earlier_section(t, &node.id, th, cx).into_iter().chain(rows).collect();
         let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).py(px(18.));
         let body = body.flex().flex_col().gap(px(18.)).children(rows);
         let panel = panel_shell(th).relative().child(self.inspector_head(&node, now, th)).child(body);
         Some(panel.child(self.close_button(th, cx)).into_any_element())
+    }
+
+    /// "Earlier on this step": every card the map folds into this one, newest first, each clickable.
+    fn earlier_section(&self, t: &Thread, id: &str, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let group = step_group(&t.nodes, id);
+        if group.len() < 2 {
+            return None;
+        }
+        let rows = group.iter().map(|&k| self.earlier_row(t, k, t.nodes[k].id == id, th, cx)).collect();
+        Some(section("Earlier on this step", rows))
+    }
+
+    /// One card in "Earlier on this step": its time and title; the open one is bold.
+    fn earlier_row(&self, t: &Thread, k: usize, open: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let n = &t.nodes[k];
+        let (tid, nid) = (t.id, n.id.clone());
+        let time = mono(10.5, th.muted, n.started_at.get(11..16).unwrap_or("").to_string()).flex_none();
+        let title = div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(if open { th.fg } else { th.fg_2 });
+        let title = if open { title.font_weight(FontWeight::SEMIBOLD) } else { title };
+        let row = div().id(("earlier-row", k)).flex().items_center().gap(px(10.)).cursor_pointer().rounded(px(6.));
+        let hover = th.surface_2;
+        let row = row.hover(move |st| st.bg(hover)).child(time).child(title.child(n.title.clone()));
+        row.on_click(cx.listener(move |this, _, _, cx| this.inspect(tid, nid.clone(), cx))).into_any_element()
     }
 
     /// The "×" in the panel's top-right corner: hides the panel until a step is clicked again.
@@ -424,6 +448,10 @@ impl ThreadsView {
         let checks = p.done_checks.iter().enumerate().map(|(k, c)| check_row(k, c, th)).collect();
         let cost = vec![mono(12., th.fg, cost_text(p.cost_usd)).into_any_element()];
         let mut out = vec![section("What happened", or_none(rows, th))];
+        if n.kind == "reply" {
+            let text = reply_text(n, &p.events).map(|t| markdown::render(&t, th.fg, 12.5, th));
+            out.insert(0, section("The Lead's reply", or_none(text.into_iter().collect(), th)));
+        }
         if n.kind == "meeting" {
             let answers = meeting_answers(&p.events).iter().map(|a| answer_block(a, th)).collect();
             out.push(section("Answers", or_none(answers, th)));
@@ -514,6 +542,14 @@ fn produced(n: &Node, th: &Theme) -> Vec<AnyElement> {
     std::iter::once(label.into_any_element()).chain(url).chain(preview).collect()
 }
 
+/// The full text of a reply node: its `lead_reply` event, else its output preview, else its title.
+pub fn reply_text(n: &Node, evs: &[Event]) -> Option<String> {
+    let from_event = evs.iter().rev().find(|e| e.kind == "lead_reply").and_then(|e| e.payload["text"].as_str().map(String::from));
+    let preview = || n.output.as_ref().and_then(|o| o.preview.clone());
+    let title = || Some(n.title.clone());
+    from_event.or_else(preview).or_else(title).filter(|t| !t.trim().is_empty())
+}
+
 /// One role's answer in a planning meeting.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -582,6 +618,14 @@ mod tests {
     fn page(ids: &[i64], next: Option<i64>, cost: f64) -> Inspector {
         let events = ids.iter().map(|&i| ev(i, "progress", json!({}))).collect();
         Inspector { node_id: "n".into(), events, cost_usd: cost, done_checks: vec![DoneCheck::default()], next_after_id: next }
+    }
+
+    #[test]
+    fn reply_text_prefers_the_event() {
+        let n = Node { id: "r".into(), kind: "reply".into(), title: "Lead replied: hi".into(), ..Default::default() };
+        let evs = [ev(1, "lead_reply", serde_json::json!({"text": "hi there\n\nfull text"}))];
+        assert_eq!(reply_text(&n, &evs).as_deref(), Some("hi there\n\nfull text"));
+        assert_eq!(reply_text(&n, &[]).as_deref(), Some("Lead replied: hi"));
     }
 
     #[test]

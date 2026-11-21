@@ -92,7 +92,7 @@ impl ThreadsView {
         };
         let scroll = div().id("task-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll);
         // Always there, like Suite: a done thread can still take a message or be waiting on you.
-        let composer = Some(self.composer(t, th, cx));
+        let composer = Some(self.composer(t.task.id, th, cx));
         let details = self.details.then(|| self.details_section(t, all, now, th, cx));
         let has_flow = t.task.parent_id.is_none();
         let switch = self.tabs(has_flow, !results.is_empty(), has_flow, th, cx);

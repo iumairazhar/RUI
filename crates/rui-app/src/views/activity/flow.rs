@@ -18,7 +18,6 @@ const SPINE_Y: f32 = 196.;
 const WORLD_H: f32 = 390.;
 /// How far above or below the spine the first and second attached node sit.
 const NEAR: f32 = 108.;
-const FAR: f32 = 162.;
 /// Where the first spine node sits, from the track's left edge.
 const FIRST_X: f32 = 70.;
 const DOT: f32 = 34.;
@@ -51,6 +50,8 @@ pub struct Placed {
     pub y: f32,
     /// The spine node an attached node hangs from.
     pub anchor: Option<usize>,
+    /// Older cards on the same step and side, left off the map behind this one.
+    pub earlier: usize,
 }
 
 /// Every node placed (spine first, in order), the now line and the track's width.
@@ -118,7 +119,7 @@ fn place_spine(nodes: &[Node], order: &[usize]) -> (Vec<Placed>, Option<f32>) {
                 _ => 262. + (16. * (1. + gap_minutes(&nodes[prev.node], &nodes[i])).log2()).min(70.),
             };
         }
-        out.push(Placed { node: i, zone: Zone::Spine, planned, x, y: SPINE_Y, anchor: None });
+        out.push(Placed { node: i, zone: Zone::Spine, planned, x, y: SPINE_Y, anchor: None, earlier: 0 });
     }
     let last_started = out.iter().rev().find(|p| !p.planned);
     if now_x.is_none()
@@ -145,48 +146,76 @@ fn anchor_of(nodes: &[Node], i: usize, spine: &[Placed]) -> Option<usize> {
 /// Horizontal room one attached card takes, gap included, so cards in a row never overlap.
 const CARD_W: f32 = DOT / 2. + CARD_RIGHT + 14.;
 
-/// The x where a card goes in its row: as close to `want` as the cards already there allow.
-fn free_x(rows: &mut Vec<(Zone, bool, f32)>, zone: Zone, far: bool, want: f32) -> f32 {
-    let row = rows.iter_mut().find(|(z, f, _)| *z == zone && *f == far);
-    let x = row.as_ref().map_or(want, |(_, _, next)| want.max(*next));
+/// The x where a card goes on its side's row: as close to `want` as the cards already there allow.
+fn free_x(rows: &mut Vec<(Zone, f32)>, zone: Zone, want: f32) -> f32 {
+    let row = rows.iter_mut().find(|(z, _)| *z == zone);
+    let x = row.as_ref().map_or(want, |(_, next)| want.max(*next));
     match row {
-        Some(r) => r.2 = x + CARD_W,
-        None => rows.push((zone, far, x + CARD_W)),
+        Some(r) => r.1 = x + CARD_W,
+        None => rows.push((zone, x + CARD_W)),
     }
     x
 }
 
-/// Attached nodes: above (came in) or below (went out) their spine step. Cards for one step take turns
-/// between the near and far row, and each row pushes a card right until it clears the one before.
+/// An attached node before grouping: the node, its side and the spine step it hangs from.
+type Hang = (usize, Zone, Option<usize>);
+
+/// Every attached node with its side and spine step, in node order.
+fn hangs(nodes: &[Node], spine: &[Placed]) -> Vec<Hang> {
+    let attached = (0..nodes.len()).filter(|&i| zone_of(&nodes[i]) != Zone::Spine);
+    attached.map(|i| (i, zone_of(&nodes[i]), anchor_of(nodes, i, spine))).collect()
+}
+
+/// Node indexes newest first by `started_at`; ties keep node order.
+fn newest_first(nodes: &[Node], mut group: Vec<usize>) -> Vec<usize> {
+    group.sort_by(|&a, &b| nodes[b].started_at.cmp(&nodes[a].started_at));
+    group
+}
+
+/// The nodes sharing a step and side with `h`, newest first.
+fn group_of(nodes: &[Node], hangs: &[Hang], h: Hang) -> Vec<usize> {
+    let same = hangs.iter().filter(|g| g.1 == h.1 && g.2 == h.2).map(|g| g.0).collect();
+    newest_first(nodes, same)
+}
+
+/// The newest node of each (step, side) group and how many older ones it hides, in node order.
+fn newest_per_group(nodes: &[Node], hangs: &[Hang]) -> Vec<(Hang, usize)> {
+    let keep = |&h: &Hang| {
+        let group = group_of(nodes, hangs, h);
+        (group.first() == Some(&h.0)).then_some((h, group.len() - 1))
+    };
+    hangs.iter().filter_map(keep).collect()
+}
+
+/// Every card on the same step and side as node `id`, newest first; empty when it rides the spine.
+pub fn step_group(nodes: &[Node], id: &str) -> Vec<usize> {
+    let (spine, _) = place_spine(nodes, &spine_order(nodes));
+    let hangs = hangs(nodes, &spine);
+    let Some(&h) = hangs.iter().find(|h| nodes[h.0].id == id) else {
+        return Vec::new();
+    };
+    group_of(nodes, &hangs, h)
+}
+
+/// The badge on a card that hides older ones: "+N earlier".
+pub fn earlier_text(hidden: usize) -> Option<String> {
+    (hidden > 0).then(|| format!("+{hidden} earlier"))
+}
+
+/// Attached nodes: above (came in) or below (went out) their spine step, on one row per side.
+/// Only the newest card per step and side is shown, so a busy step does not stretch the row; the
+/// rest are counted on it. Each card still pushes right until it clears the one before.
 fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
-    let mut rank: Vec<(Option<usize>, Zone, u32)> = Vec::new();
-    let mut rows: Vec<(Zone, bool, f32)> = Vec::new();
+    let mut rows: Vec<(Zone, f32)> = Vec::new();
     let mut out = Vec::new();
-    for (i, n) in nodes.iter().enumerate() {
-        let zone = zone_of(n);
-        if zone == Zone::Spine {
-            continue;
-        }
-        let anchor = anchor_of(nodes, i, spine);
-        let r = match rank.iter_mut().find(|(a, z, _)| *a == anchor && *z == zone) {
-            Some(e) => {
-                e.2 += 1;
-                e.2
-            }
-            None => {
-                rank.push((anchor, zone, 1));
-                1
-            }
-        };
+    for ((node, zone, anchor), earlier) in newest_per_group(nodes, &hangs(nodes, spine)) {
         let ax = anchor.and_then(|a| spine.iter().find(|p| p.node == a)).map_or(FIRST_X, |p| p.x);
-        let far = r % 2 == 0;
-        let off = if far { FAR } else { NEAR };
         let (want, y) = match zone {
-            Zone::In => (ax - 40., SPINE_Y - off),
-            _ => (ax + 40., SPINE_Y + off),
+            Zone::In => (ax - 40., SPINE_Y - NEAR),
+            _ => (ax + 40., SPINE_Y + NEAR),
         };
-        let x = free_x(&mut rows, zone, far, want);
-        out.push(Placed { node: i, zone, planned: false, x, y, anchor });
+        let x = free_x(&mut rows, zone, want);
+        out.push(Placed { node, zone, planned: false, x, y, anchor, earlier });
     }
     out
 }
@@ -301,7 +330,7 @@ fn kind_hue(kind: &str) -> Option<Hue> {
     Some(match kind {
         "alert" | "schedule" | "armed" | "decision" => Hue::Wait,
         "message" => Hue::Plain,
-        "taskIn" | "taskOut" | "meeting" => Hue::Think,
+        "taskIn" | "taskOut" | "meeting" | "reply" => Hue::Think,
         "step" => Hue::Run,
         "pr" | "deploy" | "email" | "doc" | "demo" | "result" => Hue::Done,
         _ => return None,
@@ -530,9 +559,17 @@ impl ThreadsView {
         let chip = chip.on_click(cx.listener(move |this, _, _, cx| {
             this.inspect(tid, nid.clone(), cx);
         }));
+        let chip = chip.children(earlier_text(p.earlier).map(|t| earlier_badge(t, th)));
         let dx = if p.zone == Zone::Spine { DOT / 2. } else { DOT_SIDE / 2. };
         chip.absolute().left(px(p.x - dx)).top(px(p.y - 40.)).into_any_element()
     }
+}
+
+/// The small "+N earlier" pill on a card's top-right corner.
+fn earlier_badge(text: String, th: &Theme) -> AnyElement {
+    let pill = div().absolute().top(px(2.)).right(px(-10.)).h(px(18.)).px(px(7.)).flex().items_center().rounded_full();
+    let pill = pill.bg(th.surface_2).border_1().border_color(th.hairline).shadow_sm();
+    pill.text_size(px(10.5)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg_2).child(text).into_any_element()
 }
 
 /// The three lane names at the canvas's left edge, each with a coloured bar and a sub-line.
@@ -600,6 +637,7 @@ pub fn node_icon(n: &Node) -> &'static str {
         ("failed", ..) => "close",
         (_, "pr", _) => "diff",
         (_, "doc", _) => "file",
+        (_, "reply", _) => "send",
         (.., 0) => "arrow",
         (.., 2) => "check",
         _ => "claude",
@@ -624,6 +662,7 @@ fn kind_label(kind: &str, zone: Zone) -> &'static str {
         "result" => "Test result",
         "taskOut" => "Task for the team",
         "meeting" => "Planning meeting",
+        "reply" => "Lead replied",
         _ => match zone {
             Zone::In => "Came in",
             Zone::Out => "Went out",
@@ -843,9 +882,42 @@ mod tests {
         let i = at(&l, &nodes, "i");
         assert_eq!((i.zone, i.anchor.map(|n| nodes[n].id.as_str())), (Zone::In, Some("a")));
         assert!(close(i.x, ax - 40.) && close(i.y, SPINE_Y - NEAR));
-        let (o1, o2) = (at(&l, &nodes, "o1"), at(&l, &nodes, "o2"));
+        let o1 = at(&l, &nodes, "o1");
         assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + NEAR));
-        assert!(close(o2.x, ax + 40.) && close(o2.y, SPINE_Y + FAR));
+        assert_eq!((i.earlier, o1.earlier), (0, 1));
+        assert!(!l.placed.iter().any(|p| nodes[p.node].id == "o2"), "the older card on the step is hidden");
+    }
+
+    #[test]
+    fn a_busy_step_shows_only_its_newest_card() {
+        let mut a = node("a", "work", "done", "2026-11-18 10:00:00");
+        a.after = (1..=5).map(|k| format!("i{k}")).collect();
+        let ins = (1..=5).map(|k| node(&format!("i{k}"), "in", "done", &format!("2026-11-18 09:5{k}:00")));
+        let nodes: Vec<Node> = std::iter::once(a).chain(ins).collect();
+        let l = layout(&nodes);
+        let shown: Vec<&Placed> = l.placed.iter().filter(|p| p.zone == Zone::In).collect();
+        assert_eq!(shown.len(), 1);
+        assert_eq!((nodes[shown[0].node].id.as_str(), shown[0].earlier), ("i5", 4));
+        assert!(close(shown[0].x, l.placed[0].x - 40.));
+    }
+
+    #[test]
+    fn step_group_lists_the_side_newest_first() {
+        let mut a = node("a", "work", "done", "2026-11-18 10:00:00");
+        a.after = vec!["i1".into(), "i2".into()];
+        let o = node("o", "out", "done", "2026-11-18 10:01:00");
+        let nodes = vec![a, node("i1", "in", "done", "2026-11-18 09:51:00"), node("i2", "in", "done", "2026-11-18 09:52:00"), o];
+        let ids = |id: &str| step_group(&nodes, id).iter().map(|&i| nodes[i].id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids("i1"), ["i2", "i1"]);
+        assert_eq!(ids("i2"), ["i2", "i1"]);
+        assert_eq!(ids("o"), ["o"]);
+        assert!(ids("a").is_empty());
+    }
+
+    #[test]
+    fn earlier_badge_text() {
+        assert_eq!(earlier_text(0), None);
+        assert_eq!(earlier_text(3).as_deref(), Some("+3 earlier"));
     }
 
     #[test]
@@ -860,12 +932,17 @@ mod tests {
 
     #[test]
     fn cards_in_one_row_never_overlap() {
-        let mut a = node("a", "work", "done", "2026-11-18 10:00:00");
-        a.after = vec!["i1".into(), "i2".into(), "i3".into(), "i4".into()];
-        let ins: Vec<Node> = (1..=4).map(|k| node(&format!("i{k}"), "in", "done", "2026-11-18 09:59:00")).collect();
-        let nodes: Vec<Node> = std::iter::once(a).chain(ins).collect();
+        let steps = (1..=4).map(|k| {
+            let mut s = node(&format!("s{k}"), "work", "done", &format!("2026-11-18 10:0{k}:00"));
+            s.after = vec![format!("i{k}a"), format!("i{k}b")];
+            s
+        });
+        let ins = (1..=4).flat_map(|k| ["a", "b"].map(|v| node(&format!("i{k}{v}"), "in", "done", &format!("2026-11-18 10:0{k}:00"))));
+        let nodes: Vec<Node> = steps.chain(ins).collect();
         let l = layout(&nodes);
         let cards: Vec<&Placed> = l.placed.iter().filter(|p| p.zone == Zone::In).collect();
+        assert_eq!(cards.len(), 4, "one card per step");
+        assert!(cards.iter().all(|p| p.earlier == 1));
         for (i, p) in cards.iter().enumerate() {
             for q in &cards[i + 1..] {
                 assert!(!close(p.y, q.y) || (p.x - q.x).abs() >= CARD_W - 0.5, "cards overlap");
@@ -897,6 +974,18 @@ mod tests {
     }
 
     #[test]
+    fn hidden_cards_get_no_edge() {
+        let mut a = node("a", "work", "done", "2026-11-18 10:00:00");
+        a.after = vec!["i1".into(), "i2".into(), "i3".into()];
+        let ins = (1..=3).map(|k| node(&format!("i{k}"), "in", "done", &format!("2026-11-18 09:5{k}:00")));
+        let nodes: Vec<Node> = std::iter::once(a).chain(ins).collect();
+        let l = layout(&nodes);
+        let links = edges(&nodes, &l).into_iter().filter(|e| matches!(e, Edge::Link { .. })).count();
+        assert_eq!(links, l.placed.len() - l.spine_len);
+        assert_eq!(links, 1);
+    }
+
+    #[test]
     fn planned_only_after_finished_work_is_a_dotted_line() {
         let nodes = vec![node("a", "work", "done", "2026-11-18 10:00:00"), node("p", "work", "planned", "")];
         let l = layout(&nodes);
@@ -914,13 +1003,17 @@ mod tests {
         assert_eq!(icon("work", "needs_you", at), "hand");
         assert_eq!(icon("work", "failed", at), "close");
         assert_eq!(icon("out", "planned", ""), "claude");
-        for name in ["arrow", "claude", "check", "hand", "close", "diff", "file"] {
+        for name in ["arrow", "claude", "check", "hand", "close", "diff", "file", "send"] {
             let path = format!("icons/{name}.svg");
             assert!(gpui::AssetSource::load(&crate::assets::Assets, &path).unwrap().is_some(), "{path}");
         }
         let mut pr = node("x", "out", "done", at);
         pr.kind = "pr".into();
         assert_eq!(node_icon(&pr), "diff");
+        let mut reply = node("r", "out", "done", at);
+        reply.kind = "reply".into();
+        assert_eq!(node_icon(&reply), "send");
+        assert_eq!((subtitle(&reply), dot_hue(&reply, zone_of(&reply))), ("Lead replied".to_string(), Hue::Think));
     }
 
     #[test]

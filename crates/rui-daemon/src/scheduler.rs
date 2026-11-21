@@ -25,7 +25,8 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story,mcp__rui__set_run_settings,mcp__rui__request_role";
+mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story,mcp__rui__set_run_settings,mcp__rui__request_role,\
+mcp__rui__reply_owner";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -251,10 +252,7 @@ pub(crate) fn count_failed_loop(db: &Db, data_dir: &Path, task: &Task, reason: &
     if used < task.max_loops {
         return Ok(TaskStatus::Open);
     }
-    let text = format!(
-        "Loop limit {} reached; {reason}. Raise the limit, narrow the criteria, or reassign?",
-        task.max_loops
-    );
+    let text = crate::stuck::lead_loop_text(db, task, used, reason)?;
     raise_lead_question(db, data_dir, task, &text)?;
     Ok(TaskStatus::WaitingAnswer)
 }
@@ -381,7 +379,7 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     if let Some(why) = &q.why {
         text.push_str(&format!("\nWhy: {why}"));
     }
-    db.add_event(Some(task.id), by, "instruction", &json!({"text": text}))?;
+    db.add_event(Some(task.id), by, "instruction", &json!({"text": text, "from_question": q.id}))?;
     if task.status != TaskStatus::WaitingAnswer {
         return Ok(());
     }
@@ -395,22 +393,25 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     db.set_task_status(fresh.id, TaskStatus::Stuck)
 }
 
-/// The owner's reply to a "stopped" question on a top-level task: cancel leaves it stuck,
-/// retry reopens the stuck subtasks, anything else goes to the Lead as an instruction.
+/// The owner's reply to a "stopped" question on a top-level task: cancel, drop or abandon
+/// ("Abandon the task") drops the task like the Abandon button, retry ("Retry with more tries") reopens the stuck subtasks, anything else
+/// ("Give new instructions" or typed text) goes to the Lead as an instruction.
 fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result<()> {
     if task.status != TaskStatus::Stuck || !q.text.contains(STOPPED_MARK) {
         return Ok(());
     }
     let answer = q.answer.as_deref().unwrap_or_default().trim();
     let word = answer.to_lowercase();
-    if word.starts_with("cancel") {
+    if word.starts_with("cancel") || word.starts_with("drop") || word.starts_with("abandon") {
+        // Same as the Abandon button: stop the team, mark it dropped, close its open questions.
         db.add_event(Some(task.id), by, "cancelled", &json!({"question_id": q.id}))?;
+        crate::control::drop_task(db, &Runs::default(), task.id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         return Ok(());
     }
     if word.starts_with("retry") {
         return retry_stuck(db, task.id, by).map(|_| ());
     }
-    db.add_event(Some(task.id), by, "instruction", &json!({"text": answer}))?;
+    db.add_event(Some(task.id), by, "instruction", &json!({"text": answer, "from_question": q.id}))?;
     db.set_task_status(task.id, TaskStatus::New)
 }
 
@@ -571,11 +572,10 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
                 report_error(db, Some(task_id), &e);
             } else if status == TaskStatus::Done {
                 launch_apps(db, &cfg.data_dir, apps, task_id);
-            } else if status == TaskStatus::Stuck {
-                let reason = stuck_reason(db, task_id).ok().flatten();
-                if let Some(r) = reason {
-                    let _ = raise_stuck_question(db, task_id, &r);
-                }
+            } else if status == TaskStatus::Stuck
+                && let Ok(Some(note)) = stuck_note(db, task_id)
+            {
+                let _ = raise_stuck_note(db, task_id, &note);
             }
         }
         Action::StartLead { task_id, answers } => {
@@ -748,6 +748,19 @@ const STOPPED_MARK: &str = " stopped: ";
 /// For a top-level task that got stuck by an error, asks the owner (shows in the Inbox) what to do.
 /// Does nothing for subtasks, owner stops, or when such a question is already open.
 pub(crate) fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Result<()> {
+    raise_stuck_note(db, task_id, &crate::stuck::error_note(reason))
+}
+
+/// "<task> stopped: <headline>.", the details, then what the owner can do, one per line.
+fn stuck_text(task: &Task, note: &crate::stuck::Note) -> String {
+    let mut lines = vec![format!("{}{STOPPED_MARK}{}.", task.title, note.headline.trim_end_matches('.'))];
+    lines.extend(note.details.iter().cloned());
+    lines.push(note.can_do.clone());
+    lines.join("\n")
+}
+
+/// Opens the owner's "stopped" question for a top-level task from `note`; its options go on `question_raised`.
+pub(crate) fn raise_stuck_note(db: &Db, task_id: i64, note: &crate::stuck::Note) -> Result<()> {
     let Some(task) = db.get_task(task_id)? else { return Ok(()) };
     if task.parent_id.is_some() {
         return Ok(());
@@ -756,28 +769,45 @@ pub(crate) fn raise_stuck_question(db: &Db, task_id: i64, reason: &str) -> Resul
     if open.iter().any(|q| q.status == QuestionStatus::Open && q.text.contains(STOPPED_MARK)) {
         return Ok(());
     }
-    let reason: String = reason.lines().next().unwrap_or_default().chars().take(200).collect();
-    let text = format!("{}{STOPPED_MARK}{reason}. Retry, give instructions, or cancel?", task.title);
-    let ladder = [Rung { who: "Scheduler".into(), why: reason }];
-    let q = db.create_ladder_question(task_id, Role::Lead, "owner", &ladder, &text)?;
-    db.add_event(Some(task_id), "scheduler", "question_raised", &json!({"question_id": q.id, "level": "owner"}))?;
+    let why = note.details.first().cloned().unwrap_or_else(|| note.headline.clone());
+    let ladder = [Rung { who: "Scheduler".into(), why }];
+    let q = db.create_ladder_question(task_id, Role::Lead, "owner", &ladder, &stuck_text(&task, note))?;
+    let payload = json!({"question_id": q.id, "level": "owner", "options": note.options});
+    db.add_event(Some(task_id), "scheduler", "question_raised", &payload)?;
     Ok(())
+}
+
+/// The newest stopping cause of the first stuck subtask that has one (not an owner stop).
+fn stuck_cause(db: &Db, parent_id: i64) -> Result<Option<(Task, rui_core::Event)>> {
+    const CAUSES: [&str; 5] = ["agent_error", "scheduler_error", "land_failed", "stopped", "loop_limit"];
+    for sub in db.subtasks(parent_id)?.into_iter().filter(|s| s.status == TaskStatus::Stuck) {
+        let events = db.list_events(Some(sub.id), 30)?;
+        let Some(e) = events.into_iter().rev().find(|e| CAUSES.contains(&e.kind.as_str())) else { continue };
+        if e.kind != "stopped" {
+            return Ok(Some((sub, e)));
+        }
+    }
+    Ok(None)
 }
 
 /// Why a stuck parent's subtasks stopped, when it was an error or a land conflict (not a stop or loop limit).
 fn stuck_reason(db: &Db, parent_id: i64) -> Result<Option<String>> {
-    for sub in db.subtasks(parent_id)?.iter().filter(|s| s.status == TaskStatus::Stuck) {
-        let events = db.list_events(Some(sub.id), 30)?;
-        let last = events.iter().rev().find(|e| ["agent_error", "scheduler_error", "land_failed", "stopped", "loop_limit"].contains(&e.kind.as_str()));
-        let Some(e) = last else { continue };
-        match e.kind.as_str() {
-            "land_failed" => return Ok(Some(format!("{} could not be merged (conflict in {})", sub.title, e.payload["files"]))),
-            "stopped" => {}
-            "loop_limit" => return Ok(Some(loop_limit_reason(sub, e))),
-            _ => return Ok(Some(format!("{}: {}", sub.title, e.payload["error"].as_str().unwrap_or("error")))),
-        }
+    let Some((sub, e)) = stuck_cause(db, parent_id)? else { return Ok(None) };
+    Ok(Some(match e.kind.as_str() {
+        "land_failed" => format!("{} could not be merged (conflict in {})", sub.title, e.payload["files"]),
+        "loop_limit" => loop_limit_reason(&sub, &e),
+        _ => format!("{}: {}", sub.title, e.payload["error"].as_str().unwrap_or("error")),
+    }))
+}
+
+/// The owner's note for a stuck parent: the full explanation for a loop limit, the reason otherwise.
+fn stuck_note(db: &Db, parent_id: i64) -> Result<Option<crate::stuck::Note>> {
+    let Some((sub, e)) = stuck_cause(db, parent_id)? else { return Ok(None) };
+    if e.kind != "loop_limit" {
+        return Ok(stuck_reason(db, parent_id)?.map(|r| crate::stuck::error_note(&r)));
     }
-    Ok(None)
+    let n = |k: &str| e.payload[k].as_i64().unwrap_or(0);
+    crate::stuck::loop_note(db, &sub, n("loops_used"), n("max_loops")).map(Some)
 }
 
 fn loop_limit_reason(sub: &Task, e: &rui_core::Event) -> String {
@@ -1148,6 +1178,8 @@ fn account_lead_run(db: &Db, cfg: &Config, task: &Task, client: &Client, event: 
 async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Vec<(String, String)>) -> Result<()> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = client_for(db, &task)?;
+    let owner_spoke = !answers.is_empty() || owner_pending(db, task_id)?;
+    let since = db.max_event_id(&[task_id])?;
     let block = take_instructions(db, task_id)?;
     let prompt = format!("{block}{}{}", lead_prompt(&task, &client, &answers), subtasks_note(db, &task, &block)?);
     let run = account_lead_run(db, cfg, &task, &client, "a new task", prompt)?;
@@ -1155,11 +1187,28 @@ async fn lead_turn(db: &Db, cfg: &Config, live: &Live, task_id: i64, answers: Ve
     if sandbox_missing(db, task_id, &res)? {
         return Ok(());
     }
-    if let Err(e) = res {
-        return agent_failed(db, task_id, &e);
+    let out = match res {
+        Ok(out) => out,
+        Err(e) => return agent_failed(db, task_id, &e),
+    };
+    if owner_spoke {
+        reply_after_turn(db, task_id, since, &out)?;
     }
     after_lead_turn(db, task_id)?;
     Ok(())
+}
+
+/// True when an instruction waiting for the Lead was written by the owner.
+fn owner_pending(db: &Db, task_id: i64) -> Result<bool> {
+    let ids: Vec<i64> = db.pending_instructions(task_id)?.into_iter().map(|(id, _)| id).collect();
+    crate::lead_reply::any_from_owner(db, &ids)
+}
+
+/// The owner always hears back: a turn that read owner input but did not call reply_owner
+/// gets a reply from its final text.
+fn reply_after_turn(db: &Db, task_id: i64, since: i64, out: &RunOutcome) -> Result<()> {
+    let text = out.result_text.as_deref().filter(|_| !out.is_error);
+    crate::lead_reply::ensure(db, task_id, since, text)
 }
 
 /// The Account Lead reviews a task whose subtasks are all done and calls send_back or forward_pr.
@@ -2466,6 +2515,32 @@ mod tests {
     }
 
     #[test]
+    fn owner_input_gets_a_reply_from_the_turns_final_text() {
+        let db = Db::open_test();
+        let t = chat_task(&db, None);
+        db.add_event(Some(t.id), "scout", "instruction", &json!({"text": "report"})).unwrap();
+        assert!(!owner_pending(&db, t.id).unwrap());
+        db.set_task_status(t.id, TaskStatus::Stuck).unwrap();
+        raise_stuck_question(&db, t.id, "boom").unwrap();
+        let q = db.questions_for_task(t.id).unwrap().pop().unwrap();
+        answer_question(&db, q.id, "why we use astro?", None, "owner").unwrap();
+        assert!(owner_pending(&db, t.id).unwrap());
+        let since = db.max_event_id(&[t.id]).unwrap();
+        let out = |text: &str, is_error| RunOutcome { session_id: None, result_text: Some(text.into()), is_error, exit_ok: true };
+        reply_after_turn(&db, t.id, since, &out("Astro builds the static pages.", false)).unwrap();
+        reply_after_turn(&db, t.id, since, &out("ignored", false)).unwrap();
+        let replies = db.events_for_tasks(&[t.id], &["lead_reply"], 0, 10).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].payload["text"], "Astro builds the static pages.");
+        let inst = db.events_for_tasks(&[t.id], &["instruction"], 0, 10).unwrap().into_iter().rfind(|e| e.agent == "owner").unwrap();
+        assert_eq!(replies[0].payload["to_event_id"], inst.id);
+        let later = db.max_event_id(&[t.id]).unwrap();
+        reply_after_turn(&db, t.id, later, &out("limit hit", true)).unwrap();
+        let last = db.events_for_tasks(&[t.id], &["lead_reply"], later, 10).unwrap();
+        assert_eq!(last[0].payload["text"], crate::lead_reply::FALLBACK);
+    }
+
+    #[test]
     fn lead_turn_outcomes() {
         let (db, c) = setup();
         let t = mk(&db, c, None, TaskStatus::Clarifying);
@@ -2505,10 +2580,9 @@ mod tests {
         assert_eq!(db.get_task(f.id).unwrap().unwrap().status, TaskStatus::WaitingAnswer);
         let q = &db.questions_for_task(f.id).unwrap()[0];
         assert_eq!(q.level, "lead");
-        assert_eq!(
-            q.text,
-            "Loop limit 2 reached; last check still fails: out. Raise the limit, narrow the criteria, or reassign?"
-        );
+        assert!(q.text.contains("is blocked: it used all 2 of its attempts."), "{}", q.text);
+        assert!(q.text.contains("\nCause: last check still fails: out\nAlready tried: 2 of 2 attempts."), "{}", q.text);
+        assert!(q.text.contains("ask_scout"), "{}", q.text);
         assert_eq!(q.ladder.len(), 1);
         assert!(q.ladder[0].who.ends_with(&f.id.to_string()));
     }
@@ -2753,10 +2827,33 @@ mod tests {
         let qs = db.questions_for_task(t.id).unwrap();
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].level, "owner");
-        assert_eq!(qs[0].text, "Guide stopped: claude failed. Retry, give instructions, or cancel?");
+        assert_eq!(qs[0].text, "Guide stopped: claude failed.\nWhat you can do: retry, give new instructions, or cancel.");
         let sub = mk(&db, t.client_id, Some(t.id), TaskStatus::Stuck);
         raise_stuck_question(&db, sub.id, "x").unwrap();
         assert!(db.questions_for_task(sub.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn loop_limit_stuck_question_explains_cause_tries_and_options() {
+        let (db, c) = setup();
+        let (parent, member, q) = limited_member(&db, c);
+        let tail = "\n\n----\n ERR_PNPM_EPERM  EPERM: operation not permitted\n";
+        db.add_event(Some(member.id), "scheduler", "done_check", &json!({"passed": false, "output_tail": tail})).unwrap();
+        answer_question(&db, q, "Reinstall the deps. Then retry.", None, "lead").unwrap();
+        db.set_task_status(parent.id, TaskStatus::Stuck).unwrap();
+        let note = stuck_note(&db, parent.id).unwrap().unwrap();
+        raise_stuck_note(&db, parent.id, &note).unwrap();
+        let oq = db.questions_for_task(parent.id).unwrap().pop().unwrap();
+        let lines: Vec<&str> = oq.text.lines().collect();
+        assert_eq!(lines[0], format!("{} stopped: step \"{}\" is blocked.", parent.title, member.title));
+        assert_eq!(lines[1], "Cause: ERR_PNPM_EPERM  EPERM: operation not permitted");
+        assert_eq!(lines[2], "Already tried: 2 of 2 attempts. The Lead's last diagnosis: Reinstall the deps.");
+        assert!(lines[3].starts_with("What you can do: retry with more tries"));
+        let raised = db.list_events(Some(parent.id), 50).unwrap().into_iter().rfind(|e| e.kind == "question_raised").unwrap();
+        assert_eq!(raised.payload["options"], json!(crate::stuck::LOOP_OPTIONS));
+        answer_question(&db, oq.id, "Abandon the task", None, "owner").unwrap();
+        assert!(has_event(&db, parent.id, "cancelled"));
+        assert!(has_event(&db, parent.id, "dropped"), "abandoning really drops the task");
     }
 
     #[test]

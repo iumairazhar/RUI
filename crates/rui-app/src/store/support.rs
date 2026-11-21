@@ -64,6 +64,7 @@ impl Store {
             Kind::Scout | Kind::Brief => Box::new(move || api::dismiss_scout_report(id)),
             Kind::Email => Box::new(move || api::input_action(api::EMAIL_INPUT, id, "dismiss")),
             Kind::RoleAdded => Box::new(move || api::dismiss_role_added(id)),
+            Kind::LeadReply => Box::new(move || api::dismiss_lead_reply(id)),
             _ => return,
         };
         self.act_toast("Dismissed", String::new(), call, cx);
