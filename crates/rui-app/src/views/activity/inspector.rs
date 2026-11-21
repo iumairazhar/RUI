@@ -1,6 +1,6 @@
 //! The Inspector: a docked side panel on the thread page with one Flow node's story and controls.
 
-use super::flow::node_style;
+use super::flow::{node_style, step_group};
 use super::{ThreadsView, icon, is_empty_turn, mono, parse_secs, section, summarize};
 use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
@@ -287,10 +287,34 @@ impl ThreadsView {
             (Some(d), Some(card)) => self.decision_rows(&node, d, card, i, th, cx),
             _ => self.node_rows(&node, i, th, cx),
         };
+        let rows: Vec<AnyElement> = self.earlier_section(t, &node.id, th, cx).into_iter().chain(rows).collect();
         let body = div().id("inspector-body").flex_1().min_h_0().overflow_y_scroll().px(px(20.)).py(px(18.));
         let body = body.flex().flex_col().gap(px(18.)).children(rows);
         let panel = panel_shell(th).relative().child(self.inspector_head(&node, now, th)).child(body);
         Some(panel.child(self.close_button(th, cx)).into_any_element())
+    }
+
+    /// "Earlier on this step": every card the map folds into this one, newest first, each clickable.
+    fn earlier_section(&self, t: &Thread, id: &str, th: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let group = step_group(&t.nodes, id);
+        if group.len() < 2 {
+            return None;
+        }
+        let rows = group.iter().map(|&k| self.earlier_row(t, k, t.nodes[k].id == id, th, cx)).collect();
+        Some(section("Earlier on this step", rows))
+    }
+
+    /// One card in "Earlier on this step": its time and title; the open one is bold.
+    fn earlier_row(&self, t: &Thread, k: usize, open: bool, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let n = &t.nodes[k];
+        let (tid, nid) = (t.id, n.id.clone());
+        let time = mono(10.5, th.muted, n.started_at.get(11..16).unwrap_or("").to_string()).flex_none();
+        let title = div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(if open { th.fg } else { th.fg_2 });
+        let title = if open { title.font_weight(FontWeight::SEMIBOLD) } else { title };
+        let row = div().id(("earlier-row", k)).flex().items_center().gap(px(10.)).cursor_pointer().rounded(px(6.));
+        let hover = th.surface_2;
+        let row = row.hover(move |st| st.bg(hover)).child(time).child(title.child(n.title.clone()));
+        row.on_click(cx.listener(move |this, _, _, cx| this.inspect(tid, nid.clone(), cx))).into_any_element()
     }
 
     /// The "×" in the panel's top-right corner: hides the panel until a step is clicked again.
