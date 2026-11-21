@@ -678,7 +678,7 @@ pub struct Output {
     pub output_tail: Option<String>,
 }
 
-/// One step of a thread, in lane `in`, `work` or `out`.
+/// One step of a thread, in lane `in`, `work` or `out`. Kinds include "reply": the Lead answering the owner.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Node {
     pub id: String,
@@ -741,6 +741,21 @@ pub struct Thread {
     pub last_event_id: i64,
     #[serde(default)]
     pub nodes: Vec<Node>,
+    /// The oldest open owner-level question anywhere in the thread, if any.
+    #[serde(default)]
+    pub open_question: Option<OpenQuestion>,
+}
+
+/// A question the team is waiting on the owner to answer, from a thread's `open_question`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct OpenQuestion {
+    pub id: i64,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub risk: Option<String>,
 }
 
 /// One run of a done check.
@@ -1024,6 +1039,16 @@ mod tests {
         assert_eq!((d.question_id, d.risk.as_str(), d.reversible, d.ladder[0].who.as_str()), (Some(3), "high", Some(false), "Lead"));
         assert_eq!(n.output.as_ref().unwrap().output_tail.as_deref(), Some("boom"));
         assert_eq!(t.nodes[0].reason, None);
+        assert_eq!(t.open_question, None);
+    }
+
+    #[test]
+    fn parses_a_threads_open_question() {
+        let j = r#"{"id":7,"open_question":{"id":3,"text":"Which db?","options":["pg","sqlite"],"risk":null}}"#;
+        let q = serde_json::from_str::<Thread>(j).unwrap().open_question.unwrap();
+        assert_eq!((q.id, q.text.as_str(), q.options.len(), q.risk), (3, "Which db?", 2, None));
+        let none: Thread = serde_json::from_str(r#"{"id":7,"open_question":null}"#).unwrap();
+        assert_eq!(none.open_question, None);
     }
 
     #[test]

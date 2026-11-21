@@ -1,5 +1,6 @@
 //! Threads: the board of agent threads, with a full task page for the open one.
 
+mod composer;
 mod flow;
 mod hiding;
 mod inspector;
@@ -19,7 +20,7 @@ use team_view::Phase;
 use timeline::ROWS;
 use super::section::{Sec, section_top};
 use super::status::{self, Word, thread_word, word_of};
-use super::{chip, markdown, primary_button, tag};
+use super::{markdown, tag};
 use super::decision::{self, CardEvent, Cards};
 use super::results::row_meta;
 use crate::api::{Change, LiveSnapshot, LiveState, ResultFile, ThreadSummary};
@@ -32,7 +33,7 @@ use gpui::{
     SharedString, Stateful, StyledText, Transformation, Window, div, prelude::*, px, radians,
     svg,
 };
-use rui_core::{Event, QuestionStatus, Role, Task, TaskStatus};
+use rui_core::{Event, Role, Task, TaskStatus};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -210,7 +211,6 @@ struct Thread {
     task: Task,
     client: String,
     model: Option<String>,
-    question: Option<(i64, String)>,
     /// "Backend Engineer 01", or "Builder 7" when the task has no agent.
     name: String,
     /// Pod line such as "Lead, Pod: BE FE", set on a lead parent.
@@ -224,19 +224,14 @@ struct Thread {
 }
 
 fn threads_of(s: &Store) -> Vec<Thread> {
-    let open_q = |id: i64| {
-        let q = s.questions.iter().find(|q| q.task_id == id && q.status == QuestionStatus::Open);
-        q.map(|q| (q.id, q.text.clone()))
-    };
-    s.tasks.iter().map(|t| thread_of(s, t, open_q(t.id))).collect()
+    s.tasks.iter().map(|t| thread_of(s, t)).collect()
 }
 
-fn thread_of(s: &Store, t: &Task, question: Option<(i64, String)>) -> Thread {
+fn thread_of(s: &Store, t: &Task) -> Thread {
     Thread {
         task: t.clone(),
         client: s.clients.iter().find(|c| c.id == t.client_id).map_or(String::new(), |c| c.name.clone()),
         model: s.runs.get(&t.id).and_then(|r| r.model.clone()),
-        question,
         name: member_name(t, &s.tasks, &s.roles).unwrap_or_else(|| label(t)),
         pod_line: pod_line(t, &s.roles),
         word: word_of(&s.states, t.id),
@@ -253,7 +248,7 @@ fn board_threads(s: &Store) -> Vec<Thread> {
 /// A thread summary as a card; skipped until its task has loaded too (the page needs it).
 fn board_thread(s: &Store, sum: &ThreadSummary) -> Option<Thread> {
     let task = s.tasks.iter().find(|t| t.id == sum.id)?;
-    let mut t = thread_of(s, task, None);
+    let mut t = thread_of(s, task);
     t.client = sum.client.name.clone();
     t.word = board_word(word_of(&s.states, sum.id), &sum.state);
     t.reason = sum.story.clone().unwrap_or_default();
@@ -364,13 +359,15 @@ pub struct ThreadsView {
     show_hidden: bool,
     /// Files picked for the next thread message.
     picked: super::attach::Attachments,
+    /// The composer's answer/message switch and "Sent" note.
+    compose: composer::Compose,
 }
 
 impl ThreadsView {
     /// Build the threads view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let input = cx.new(|cx| TextInput::new("Write to the thread", cx).multiline());
+        let input = cx.new(|cx| TextInput::new("Write to the team\u{2026}", cx).multiline());
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         let why = cx.new(|cx| TextInput::new("Why? (optional)", cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.stop_now(cx)).detach();
@@ -379,7 +376,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false, remove_armed: None, card_menu: None, show_hidden: false, picked: Default::default() }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false, remove_armed: None, card_menu: None, show_hidden: false, picked: Default::default(), compose: Default::default() }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -397,6 +394,7 @@ impl ThreadsView {
         self.flow_key = None;
         self.why.update(cx, |i, cx| i.clear(cx));
         self.picked = Default::default();
+        self.reset_compose();
         let top = self.store.read(cx).tasks.iter().any(|t| t.id == id && t.parent_id.is_none());
         self.set_tab(if top { Tab::Flow } else { Tab::Trace });
         self.file = None;
@@ -548,17 +546,6 @@ impl ThreadsView {
         self.file = Some(path.clone());
         self.store.update(cx, |s, cx| s.load_file(id, path, cx));
         cx.notify();
-    }
-
-    fn send(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.open else { return };
-        let text = self.input.read(cx).content();
-        if text.trim().is_empty() {
-            return;
-        }
-        self.input.update(cx, |i, cx| i.clear(cx));
-        let files = self.picked.take_ids();
-        self.store.update(cx, |s, cx| s.instruct_with_files(id, text, files, cx));
     }
 
     fn picked(v: &mut Self) -> &mut super::attach::Attachments {
@@ -782,37 +769,6 @@ impl ThreadsView {
             .p(px(8.))
             .child(body)
             .into_any_element()
-    }
-
-    /// A calm bar pointing at the Inbox while the thread waits on an answer.
-    fn answer_bar(&self, qid: i64, text: &str, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let label = format!("Waiting on you: {}", first_line(text, 100));
-        let msg = div().flex_1().min_w_0().truncate().text_size(px(12.5)).text_color(th.fg).child(label);
-        let go = primary_button("thread-answer-inbox", "Answer in Inbox", cx);
-        let go = go.on_click(cx.listener(move |this, _, _, cx| this.store.update(cx, |s, cx| s.open_question(qid, cx))));
-        let bar = div().flex().items_center().gap(px(10.)).px(px(14.)).py(px(10.)).rounded(px(10.));
-        let bar = bar.bg(th.wait.dim).border_1().border_color(th.wait.rim);
-        let bar = bar.child(icon("hand", 14., th.wait.fg)).child(msg).child(go);
-        let wrap = div().id("threads-answer-bar").flex().flex_none().pt(px(16.)).px(px(20.)).pb(px(20.));
-        wrap.border_t_1().border_color(th.hairline).child(bar).into_any_element()
-    }
-
-    /// Suite's composer: one rounded bar with a Message segment, the field and Send.
-    fn composer(&self, t: &Thread, th: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if let Some((qid, text)) = &t.question {
-            return self.answer_bar(*qid, text, th, cx);
-        }
-        let seg = div().flex().items_center().flex_none().p(px(3.)).rounded(px(9.)).bg(th.well);
-        let on = div().flex().items_center().h(px(26.)).px(px(12.)).rounded(px(7.)).bg(th.surface);
-        let on = on.text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(th.fg).child("Message");
-        let field = div().flex_1().min_w_0().child(self.input.clone());
-        let send = chip("thread-send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
-        let attach = super::attach::attach_button("thread-attach", &self.store, Self::picked, cx);
-        let chips = super::attach::picked_row("thread-file", self.picked.items(), Self::picked, th, cx);
-        let bar = div().flex().items_end().gap(px(10.)).p(px(6.)).rounded(px(14.)).bg(th.surface_2);
-        let bar = bar.border_1().border_color(th.hairline).child(seg.child(on)).child(field).child(attach).child(send);
-        let wrap = div().id("threads-composer").flex_none().px(px(14.)).pb(px(14.)).pt(px(4.));
-        super::attach::on_drop(wrap, &self.store, Self::picked, cx).children(chips).child(bar).into_any_element()
     }
 }
 
