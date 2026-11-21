@@ -72,25 +72,6 @@ fn undo_items(db: &Db, now: i64) -> Result<Vec<InboxItem>> {
         .collect())
 }
 
-/// Open chat asks, with their options as buttons.
-fn ask_items(db: &Db) -> Result<Vec<InboxItem>> {
-    let asks = db.list_chat_asks(Some("open"))?;
-    Ok(asks
-        .into_iter()
-        .map(|a| InboxItem {
-            kind: "ask",
-            id: a.id,
-            task_id: None,
-            title: first_line(&a.text),
-            reason: format!("Rui asked in chat: {}", a.chat_title),
-            actions: a.options,
-            created_at: a.created_at,
-            detail: None,
-            link: None,
-        })
-        .collect())
-}
-
 /// The top-level task a task belongs to, as an id.
 fn top_of(t: &Task) -> i64 {
     t.parent_id.unwrap_or(t.id)
@@ -202,7 +183,7 @@ pub fn inbox(db: &Db) -> Result<Vec<InboxItem>> {
         .filter_map(|i| tasks.iter().find(|t| Some(t.id) == i.task_id))
         .map(top_of)
         .collect();
-    items.extend(ask_items(db)?);
+    // Rui's chat questions stay in the chat; the Inbox is for work that needs the owner.
     items.extend(undo_items(db, crate::thread::now_secs())?);
     items.extend(task_items(db, &questioned)?);
     items.extend(checkpoint_items(db, &tasks)?);
@@ -252,7 +233,7 @@ mod tests {
         let find = |kind: &str| items.iter().filter(|i| i.kind == kind).collect::<Vec<_>>();
         assert_eq!(find("question").len(), 1);
         assert_eq!(find("question")[0].title, "Which one?");
-        assert_eq!(find("ask")[0].actions, ["A", "B"]);
+        assert!(find("ask").is_empty(), "chat questions stay in the chat");
         let stuck_items = find("stuck");
         assert_eq!((stuck_items.len(), stuck_items[0].id), (1, stuck.id));
         assert_eq!(stuck_items[0].actions, ["Retry", "New instructions", "Drop it"]);
