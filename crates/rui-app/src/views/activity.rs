@@ -358,6 +358,8 @@ pub struct ThreadsView {
     show_timeline: bool,
     /// Thread whose "Remove" was clicked once; the next click removes it.
     remove_armed: Option<i64>,
+    /// The board card whose ⋯ menu (Hide, Remove, Stop) is open.
+    card_menu: Option<i64>,
     /// The "Hidden (N)" list at the bottom of the board is open.
     show_hidden: bool,
     /// Files picked for the next thread message.
@@ -368,7 +370,7 @@ impl ThreadsView {
     /// Build the threads view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let input = cx.new(|cx| TextInput::new("Write to the thread", cx));
+        let input = cx.new(|cx| TextInput::new("Write to the thread", cx).multiline());
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         let why = cx.new(|cx| TextInput::new("Why? (optional)", cx));
         cx.subscribe(&why, |this, _, _: &Submit, cx| this.stop_now(cx)).detach();
@@ -377,7 +379,7 @@ impl ThreadsView {
         let expanded = HashSet::new();
         let note = cx.new(|cx| TextInput::new("What did you change? (optional)", cx));
         cx.subscribe(&note, |this, _, _: &Submit, cx| this.hand_back(false, cx)).detach();
-        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false, remove_armed: None, show_hidden: false, picked: Default::default() }
+        Self { store, open: None, tab: Tab::Trace, file: None, auto_results: false, input, scroll, last_len: 0, expanded, stop_open: false, abandon_armed: false, why, bands, moves, seen, show_done: false, stopping: HashMap::new(), confirm_all: false, inspect: None, note, cards: Cards::default(), details: false, flow_key: None, flow_scroll: ScrollHandle::new(), show_timeline: false, remove_armed: None, card_menu: None, show_hidden: false, picked: Default::default() }
     }
 
     /// Forget shown rows so the next render staggers them in again.
@@ -807,7 +809,7 @@ impl ThreadsView {
         let send = chip("thread-send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
         let attach = super::attach::attach_button("thread-attach", &self.store, Self::picked, cx);
         let chips = super::attach::picked_row("thread-file", self.picked.items(), Self::picked, th, cx);
-        let bar = div().flex().items_center().gap(px(10.)).p(px(6.)).rounded(px(14.)).bg(th.surface_2);
+        let bar = div().flex().items_end().gap(px(10.)).p(px(6.)).rounded(px(14.)).bg(th.surface_2);
         let bar = bar.border_1().border_color(th.hairline).child(seg.child(on)).child(field).child(attach).child(send);
         let wrap = div().id("threads-composer").flex_none().px(px(14.)).pb(px(14.)).pt(px(4.));
         super::attach::on_drop(wrap, &self.store, Self::picked, cx).children(chips).child(bar).into_any_element()

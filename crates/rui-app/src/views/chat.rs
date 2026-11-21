@@ -44,7 +44,7 @@ impl ChatView {
     /// Build the chat view.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         store::observe(&store, cx);
-        let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
+        let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx).multiline());
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
         Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false, saved: HashMap::new(), picked: Attachments::default(), files: HashMap::new() }
     }
@@ -251,7 +251,7 @@ impl ChatView {
                 div()
                     .id("chat-composer")
                     .flex()
-                    .items_center()
+                    .items_end()
                     .gap(px(8.))
                     .p(px(8.))
                     .pl(px(14.))
@@ -259,7 +259,7 @@ impl ChatView {
                     .bg(th.surface)
                     .shadow(th.card_shadow())
                     .child(self.client_picker(cx))
-                    .child(div().flex_1().child(self.input.clone()))
+                    .child(div().flex_1().min_w_0().child(self.input.clone()))
                     .child(attach)
                     .child(send),
             )
