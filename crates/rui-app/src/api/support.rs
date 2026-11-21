@@ -66,6 +66,11 @@ pub fn dismiss_scout_report(event_id: i64) -> Result<()> {
     post(&format!("/scout-reports/{event_id}/dismiss"), json!({}))
 }
 
+/// Clear a "role added to the Pod" note from the Inbox.
+pub fn dismiss_role_added(event_id: i64) -> Result<()> {
+    post(&format!("/role-added/{event_id}/dismiss"), json!({}))
+}
+
 /// Give a task a new attempt limit.
 pub fn set_limit(task_id: i64, max_loops: i64) -> Result<()> {
     post(&format!("/tasks/{task_id}/limit"), json!({ "max_loops": max_loops }))
