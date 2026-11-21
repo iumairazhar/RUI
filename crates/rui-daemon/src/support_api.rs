@@ -1,6 +1,7 @@
 //! HTTP routes for the support agents:
 //! POST /tasks/{id}/diagnose (ask the Scout), POST /proposals/{event_id} (approve or dismiss a
-//! Coach proposal), POST /scout-reports/{event_id}/dismiss (clear a Scout report from the Inbox).
+//! Coach proposal), POST /scout-reports/{event_id}/dismiss (clear a Scout report from the Inbox),
+//! POST /role-added/{event_id}/dismiss (clear a "role added" note from the Inbox).
 
 use crate::api::ApiState;
 use crate::{coach, scout};
@@ -28,6 +29,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/tasks/{id}/diagnose", post(diagnose))
         .route("/proposals/{event_id}", post(resolve_proposal))
         .route("/scout-reports/{event_id}/dismiss", post(dismiss_report))
+        .route("/role-added/{event_id}/dismiss", post(dismiss_role_added))
 }
 
 /// Asks the Scout why this task failed or stalled. The report shows in the Inbox.
@@ -59,6 +61,13 @@ async fn resolve_proposal(State(s): State<ApiState>, Path(event_id): Path<i64>, 
 async fn dismiss_report(State(s): State<ApiState>, Path(event_id): Path<i64>) -> Reply {
     if !scout::dismiss(&s.db, event_id).map_err(internal)? {
         return Err(fail(StatusCode::NOT_FOUND, "no open Scout report with that id"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn dismiss_role_added(State(s): State<ApiState>, Path(event_id): Path<i64>) -> Reply {
+    if !crate::role_request::dismiss(&s.db, event_id).map_err(internal)? {
+        return Err(fail(StatusCode::NOT_FOUND, "no open role-added note with that id"));
     }
     Ok(Json(json!({ "ok": true })))
 }

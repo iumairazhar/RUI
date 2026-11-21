@@ -30,6 +30,7 @@ pub mod pr_watch;
 pub mod projects;
 pub mod protected;
 pub mod results;
+pub mod role_request;
 pub mod roster;
 pub mod run_settings;
 pub mod run_tokens;

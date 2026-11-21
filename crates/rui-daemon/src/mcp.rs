@@ -446,6 +446,16 @@ pub struct ForwardPrArgs {
     pub if_approved: Option<Vec<String>>,
 }
 
+/// Arguments for the Account Lead's `request_role`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct RequestRoleArgs {
+    /// Library role name, e.g. "designer".
+    pub role: String,
+    /// Why the work needs this role.
+    pub why: String,
+}
+
 /// Arguments for the Account Lead's `set_story`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -1131,6 +1141,14 @@ pub mod logic {
         Ok(json!({"ok": true}))
     }
 
+    /// Account Lead adds a missing library role to its client's Pod, or asks the owner for one.
+    pub fn request_role(db: &Db, data_dir: &Path, ctx: &Ctx, a: RequestRoleArgs) -> anyhow::Result<Value> {
+        let task = current_task(db, ctx)?;
+        let out = crate::role_request::request(db, data_dir, &task, &a.role, &a.why)?;
+        record(db, ctx, Role::Lead, "request_role", &a)?;
+        Ok(out)
+    }
+
     /// Account Lead records one sentence on where things stand.
     pub fn set_story(db: &Db, ctx: &Ctx, a: SetStoryArgs) -> anyhow::Result<Value> {
         let task = current_task(db, ctx)?;
@@ -1555,6 +1573,15 @@ impl LeadServer {
         Parameters(a): Parameters<LogDecisionArgs>,
     ) -> CallToolResult {
         finish(logic::log_decision(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
+    #[tool(description = "Add a role the work truly needs but the Pod lacks, with why. Adds it when the role library has it switched on; otherwise asks the owner.")]
+    async fn request_role(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<RequestRoleArgs>,
+    ) -> CallToolResult {
+        finish(logic::request_role(&self.db, &self.data_dir, &ctx_from(&parts), a))
     }
 }
 
@@ -2045,6 +2072,18 @@ mod tests {
         assert!(err.to_string().contains("not in this task's pod"));
         assert!(logic::create_subtask(&db, data.path(), &lead, sub_args("lead", "x")).is_err());
         assert!(logic::create_subtask(&db, data.path(), &lead, sub_args("tester", "x")).is_ok());
+    }
+
+    #[test]
+    fn request_role_lets_create_subtask_use_the_new_role_in_the_same_turn() {
+        let (db, data, lead, _member) = staffed();
+        let dir = data.path().join("roles").join("designer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENT.md"), "---\nname: designer\ndescription: d\n---\nI design.\n").unwrap();
+        assert!(logic::create_subtask(&db, data.path(), &lead, sub_args("designer", "x")).is_err());
+        let a = RequestRoleArgs { role: "designer".into(), why: "the page needs a layout".into() };
+        assert_eq!(logic::request_role(&db, data.path(), &lead, a).unwrap()["added"], true);
+        assert!(logic::create_subtask(&db, data.path(), &lead, sub_args("designer", "x")).is_ok());
     }
 
     #[test]
@@ -2592,7 +2631,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
+        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "request_role", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
