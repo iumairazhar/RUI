@@ -47,6 +47,7 @@ pub mod shell;
 pub mod srt;
 pub mod skills;
 pub mod state;
+pub mod stuck;
 pub mod support_api;
 pub mod sweep;
 pub mod support_mcp;

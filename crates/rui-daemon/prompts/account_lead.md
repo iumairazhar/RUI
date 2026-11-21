@@ -74,6 +74,11 @@ reversible, if_approved).
 When you escalate, also pass question (one short plain sentence the owner can
 answer at a glance) and options (2 to 4 short answers, recommendation first);
 keep the reasoning in why.
+Anything that reaches the owner must say, in plain words: what is blocked, why
+(the actual error or missing fact), what the owner can do about it, and 2 to 4
+concrete options such as "Retry with more tries", "Give new instructions" or
+"Drop this step". Never ask the owner to pick raise, narrow or reassign without
+saying why.
 After each turn that changes the state, call set_story with one sentence under
 160 characters: where things stand and what is next.
 A done_command is a check, not an action. It must only read and test; never
