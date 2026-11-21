@@ -301,7 +301,7 @@ fn kind_hue(kind: &str) -> Option<Hue> {
     Some(match kind {
         "alert" | "schedule" | "armed" | "decision" => Hue::Wait,
         "message" => Hue::Plain,
-        "taskIn" | "taskOut" | "meeting" => Hue::Think,
+        "taskIn" | "taskOut" | "meeting" | "reply" => Hue::Think,
         "step" => Hue::Run,
         "pr" | "deploy" | "email" | "doc" | "demo" | "result" => Hue::Done,
         _ => return None,
@@ -600,6 +600,7 @@ pub fn node_icon(n: &Node) -> &'static str {
         ("failed", ..) => "close",
         (_, "pr", _) => "diff",
         (_, "doc", _) => "file",
+        (_, "reply", _) => "send",
         (.., 0) => "arrow",
         (.., 2) => "check",
         _ => "claude",
@@ -624,6 +625,7 @@ fn kind_label(kind: &str, zone: Zone) -> &'static str {
         "result" => "Test result",
         "taskOut" => "Task for the team",
         "meeting" => "Planning meeting",
+        "reply" => "Lead replied",
         _ => match zone {
             Zone::In => "Came in",
             Zone::Out => "Went out",
@@ -914,13 +916,17 @@ mod tests {
         assert_eq!(icon("work", "needs_you", at), "hand");
         assert_eq!(icon("work", "failed", at), "close");
         assert_eq!(icon("out", "planned", ""), "claude");
-        for name in ["arrow", "claude", "check", "hand", "close", "diff", "file"] {
+        for name in ["arrow", "claude", "check", "hand", "close", "diff", "file", "send"] {
             let path = format!("icons/{name}.svg");
             assert!(gpui::AssetSource::load(&crate::assets::Assets, &path).unwrap().is_some(), "{path}");
         }
         let mut pr = node("x", "out", "done", at);
         pr.kind = "pr".into();
         assert_eq!(node_icon(&pr), "diff");
+        let mut reply = node("r", "out", "done", at);
+        reply.kind = "reply".into();
+        assert_eq!(node_icon(&reply), "send");
+        assert_eq!((subtitle(&reply), dot_hue(&reply, zone_of(&reply))), ("Lead replied".to_string(), Hue::Think));
     }
 
     #[test]

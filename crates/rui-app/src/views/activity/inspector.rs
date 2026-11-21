@@ -6,7 +6,7 @@ use crate::api::{self, HandBack, Inspector, Node, TakeOver, Thread};
 use crate::theme::Theme;
 use crate::views::decision::{CardData, DecisionCard, first_line, reversible_text, risk_label, risk_style};
 use crate::views::status::thread_word;
-use crate::views::{chip, primary_button, tag};
+use crate::views::{chip, markdown, primary_button, tag};
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, FontWeight, Stateful, div, prelude::*, px};
 use rui_core::Event;
 
@@ -424,6 +424,10 @@ impl ThreadsView {
         let checks = p.done_checks.iter().enumerate().map(|(k, c)| check_row(k, c, th)).collect();
         let cost = vec![mono(12., th.fg, cost_text(p.cost_usd)).into_any_element()];
         let mut out = vec![section("What happened", or_none(rows, th))];
+        if n.kind == "reply" {
+            let text = reply_text(n, &p.events).map(|t| markdown::render(&t, th.fg, 12.5, th));
+            out.insert(0, section("The Lead's reply", or_none(text.into_iter().collect(), th)));
+        }
         if n.kind == "meeting" {
             let answers = meeting_answers(&p.events).iter().map(|a| answer_block(a, th)).collect();
             out.push(section("Answers", or_none(answers, th)));
@@ -514,6 +518,14 @@ fn produced(n: &Node, th: &Theme) -> Vec<AnyElement> {
     std::iter::once(label.into_any_element()).chain(url).chain(preview).collect()
 }
 
+/// The full text of a reply node: its `lead_reply` event, else its output preview, else its title.
+pub fn reply_text(n: &Node, evs: &[Event]) -> Option<String> {
+    let from_event = evs.iter().rev().find(|e| e.kind == "lead_reply").and_then(|e| e.payload["text"].as_str().map(String::from));
+    let preview = || n.output.as_ref().and_then(|o| o.preview.clone());
+    let title = || Some(n.title.clone());
+    from_event.or_else(preview).or_else(title).filter(|t| !t.trim().is_empty())
+}
+
 /// One role's answer in a planning meeting.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -582,6 +594,14 @@ mod tests {
     fn page(ids: &[i64], next: Option<i64>, cost: f64) -> Inspector {
         let events = ids.iter().map(|&i| ev(i, "progress", json!({}))).collect();
         Inspector { node_id: "n".into(), events, cost_usd: cost, done_checks: vec![DoneCheck::default()], next_after_id: next }
+    }
+
+    #[test]
+    fn reply_text_prefers_the_event() {
+        let n = Node { id: "r".into(), kind: "reply".into(), title: "Lead replied: hi".into(), ..Default::default() };
+        let evs = [ev(1, "lead_reply", serde_json::json!({"text": "hi there\n\nfull text"}))];
+        assert_eq!(reply_text(&n, &evs).as_deref(), Some("hi there\n\nfull text"));
+        assert_eq!(reply_text(&n, &[]).as_deref(), Some("Lead replied: hi"));
     }
 
     #[test]
