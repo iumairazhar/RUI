@@ -1090,8 +1090,13 @@ pub mod logic {
     }
 
     /// Lead changes a subtask's loop limit.
+    /// Refuses a raise when the step failed the same way twice and the Lead already raised it once since.
     pub fn set_limit(db: &Db, ctx: &Ctx, a: SetLimitArgs) -> anyhow::Result<Value> {
         let task = lead_child(db, ctx, a.task_id)?;
+        let parent = task.parent_id.unwrap_or_default();
+        if a.max_loops > task.max_loops && crate::stuck::spiral(db, parent, task.id)? {
+            anyhow::bail!(crate::stuck::SAME_FAILURE);
+        }
         crate::control::apply_limit(db, task.id, a.max_loops)?;
         record(db, ctx, Role::Lead, "set_limit", &a)?;
         Ok(json!({"ok": true, "task_id": task.id, "max_loops": a.max_loops}))
@@ -2182,6 +2187,22 @@ mod tests {
         assert!(logic::set_limit(&db, &lead, SetLimitArgs { task_id: lead.task_id.unwrap(), max_loops: 3 }).is_err());
         let a = SetDoneArgs { task_id: id, done_command: " ".into() };
         assert!(logic::set_done_command(&db, data.path(), &lead, a).is_err());
+    }
+
+    #[test]
+    fn set_limit_refuses_a_second_raise_on_the_same_failure() {
+        let (db, _data, lead, member) = staffed();
+        let id = member.task_id.unwrap();
+        let fail = |tail: &str| db.add_event(Some(id), "scheduler", "done_check", &json!({"passed": false, "output_tail": tail})).unwrap();
+        fail("Error: EPERM: operation not permitted, mkdir '/a/store/1'");
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 9 }).unwrap();
+        fail("Error: EPERM: operation not permitted, mkdir '/a/store/2'");
+        let err = logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 11 }).unwrap_err();
+        assert_eq!(err.to_string(), crate::stuck::SAME_FAILURE);
+        assert_eq!(db.get_task(id).unwrap().unwrap().max_loops, 9);
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 4 }).unwrap();
+        fail("Error: test login failed");
+        logic::set_limit(&db, &lead, SetLimitArgs { task_id: id, max_loops: 11 }).unwrap();
     }
 
     #[test]

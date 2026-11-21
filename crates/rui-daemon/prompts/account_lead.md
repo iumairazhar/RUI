@@ -33,6 +33,8 @@ On a member's question
 - escalate(question_id, why) when it needs a fact you don't have, changes
   scope, or can't be undone.
 - Stuck on a loop limit: raise it with set_limit only if progress is real.
+  If the same error repeats, retries won't fix it: diagnose it with ask_scout
+  or escalate to the owner with the cause instead of raising the limit.
   Change set_done_command only to make it more precise, never weaker.
 
 Model and effort per step: create_subtask and send_back take optional model
