@@ -18,7 +18,6 @@ const SPINE_Y: f32 = 196.;
 const WORLD_H: f32 = 390.;
 /// How far above or below the spine the first and second attached node sit.
 const NEAR: f32 = 108.;
-const FAR: f32 = 162.;
 /// Where the first spine node sits, from the track's left edge.
 const FIRST_X: f32 = 70.;
 const DOT: f32 = 34.;
@@ -145,22 +144,22 @@ fn anchor_of(nodes: &[Node], i: usize, spine: &[Placed]) -> Option<usize> {
 /// Horizontal room one attached card takes, gap included, so cards in a row never overlap.
 const CARD_W: f32 = DOT / 2. + CARD_RIGHT + 14.;
 
-/// The x where a card goes in its row: as close to `want` as the cards already there allow.
-fn free_x(rows: &mut Vec<(Zone, bool, f32)>, zone: Zone, far: bool, want: f32) -> f32 {
-    let row = rows.iter_mut().find(|(z, f, _)| *z == zone && *f == far);
-    let x = row.as_ref().map_or(want, |(_, _, next)| want.max(*next));
+/// The x where a card goes on its side's row: as close to `want` as the cards already there allow.
+fn free_x(rows: &mut Vec<(Zone, f32)>, zone: Zone, want: f32) -> f32 {
+    let row = rows.iter_mut().find(|(z, _)| *z == zone);
+    let x = row.as_ref().map_or(want, |(_, next)| want.max(*next));
     match row {
-        Some(r) => r.2 = x + CARD_W,
-        None => rows.push((zone, far, x + CARD_W)),
+        Some(r) => r.1 = x + CARD_W,
+        None => rows.push((zone, x + CARD_W)),
     }
     x
 }
 
-/// Attached nodes: above (came in) or below (went out) their spine step. Cards for one step take turns
-/// between the near and far row, and each row pushes a card right until it clears the one before.
+/// Attached nodes: above (came in) or below (went out) their spine step, on one row per side.
+/// Two stacked rows were closer than a two-line card is tall, so they overlapped; instead each card
+/// pushes right until it clears the one before, and the map scrolls sideways.
 fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
-    let mut rank: Vec<(Option<usize>, Zone, u32)> = Vec::new();
-    let mut rows: Vec<(Zone, bool, f32)> = Vec::new();
+    let mut rows: Vec<(Zone, f32)> = Vec::new();
     let mut out = Vec::new();
     for (i, n) in nodes.iter().enumerate() {
         let zone = zone_of(n);
@@ -168,24 +167,12 @@ fn place_attached(nodes: &[Node], spine: &[Placed]) -> Vec<Placed> {
             continue;
         }
         let anchor = anchor_of(nodes, i, spine);
-        let r = match rank.iter_mut().find(|(a, z, _)| *a == anchor && *z == zone) {
-            Some(e) => {
-                e.2 += 1;
-                e.2
-            }
-            None => {
-                rank.push((anchor, zone, 1));
-                1
-            }
-        };
         let ax = anchor.and_then(|a| spine.iter().find(|p| p.node == a)).map_or(FIRST_X, |p| p.x);
-        let far = r % 2 == 0;
-        let off = if far { FAR } else { NEAR };
         let (want, y) = match zone {
-            Zone::In => (ax - 40., SPINE_Y - off),
-            _ => (ax + 40., SPINE_Y + off),
+            Zone::In => (ax - 40., SPINE_Y - NEAR),
+            _ => (ax + 40., SPINE_Y + NEAR),
         };
-        let x = free_x(&mut rows, zone, far, want);
+        let x = free_x(&mut rows, zone, want);
         out.push(Placed { node: i, zone, planned: false, x, y, anchor });
     }
     out
@@ -847,7 +834,7 @@ mod tests {
         assert!(close(i.x, ax - 40.) && close(i.y, SPINE_Y - NEAR));
         let (o1, o2) = (at(&l, &nodes, "o1"), at(&l, &nodes, "o2"));
         assert!(close(o1.x, ax + 40.) && close(o1.y, SPINE_Y + NEAR));
-        assert!(close(o2.x, ax + 40.) && close(o2.y, SPINE_Y + FAR));
+        assert!(close(o2.x, ax + 40. + CARD_W) && close(o2.y, SPINE_Y + NEAR));
     }
 
     #[test]
