@@ -31,6 +31,7 @@ pub mod projects;
 pub mod protected;
 pub mod results;
 pub mod roster;
+pub mod run_settings;
 pub mod run_tokens;
 pub mod runner;
 pub mod sandbox;

@@ -109,6 +109,8 @@ fn chat_run(db: &Db, cfg: &Config, msg: ChatMessage) -> Result<AgentRun> {
         seat: None,
         sandbox: None,
         deny_secrets: Some(cfg.data_dir.clone()),
+        model: None,
+        effort: None,
         partial: true,
     })
 }

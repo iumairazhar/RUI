@@ -112,6 +112,7 @@ fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
     let task = db.get_task(task_id)?.context("task not found")?;
     let client = db.get_client(task.client_id)?.context("client not found")?;
     let system = prompts::fill(COACH_PROMPT, &coach_vars(db, &cfg.data_dir, &task, &client.name)?);
+    let run = crate::run_settings::for_coach();
     Ok(AgentRun {
         role: Role::Rui,
         task_id: Some(task_id),
@@ -129,6 +130,8 @@ fn coach_run(db: &Db, cfg: &Config, task_id: i64) -> Result<AgentRun> {
         seat: None,
         sandbox: None,
         deny_secrets: None,
+        model: run.model,
+        effort: run.effort,
     })
 }
 
@@ -342,7 +345,9 @@ mod tests {
     fn coach_runs_have_no_file_or_web_tools() {
         let (db, data, t) = setup();
         let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
-        crate::runner::tests::assert_no_file_or_web_tools(&coach_run(&db, &cfg, t.id).unwrap());
+        let run = coach_run(&db, &cfg, t.id).unwrap();
+        crate::runner::tests::assert_no_file_or_web_tools(&run);
+        assert_eq!((run.model.as_deref(), run.effort.as_deref()), (Some("sonnet"), None));
     }
 
     fn coach_plans(db: &Db) -> Vec<Action> {

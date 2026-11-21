@@ -420,6 +420,8 @@ mod tests {
             seat: None,
             sandbox: Some(Sandbox { data_dir: real(&data), repo: real(&repo), hosts: hosts(&[]) }),
             deny_secrets: None,
+            model: None,
+            effort: None,
         };
         let mut seen = String::new();
         let mut tool_uses = 0;
@@ -491,6 +493,8 @@ mod tests {
             seat: None,
             sandbox: Some(Sandbox { data_dir: real(&data), repo: real(&repo), hosts: hosts(&[]) }),
             deny_secrets: None,
+            model: None,
+            effort: None,
         };
         let mut seen = String::new();
         let mut tool_uses = 0;

@@ -52,6 +52,10 @@ pub struct AgentRun {
     /// For unsandboxed runs that read untrusted text (Rui chat, Scout): the data folder whose
     /// private files the Read and Edit tools must not touch. Ignored when `sandbox` is set.
     pub deny_secrets: Option<PathBuf>,
+    /// `--model` alias (haiku, sonnet, opus); None uses the CLI's default. See `run_settings`.
+    pub model: Option<String>,
+    /// `--effort` level; None uses the CLI's default. Claude only.
+    pub effort: Option<String>,
 }
 
 /// Final result of a turn.
@@ -120,11 +124,20 @@ pub fn build_args(run: &AgentRun, mcp_config_path: &Path, settings: Option<&Path
     if run.partial {
         a.push("--include-partial-messages".into());
     }
+    push_opt(&mut a, "--model", &run.model);
+    push_opt(&mut a, "--effort", &run.effort);
     if let Some(p) = settings {
         a.push("--settings".into());
         a.push(p.to_string_lossy().into_owned());
     }
     a
+}
+
+fn push_opt(a: &mut Vec<String>, flag: &str, v: &Option<String>) {
+    if let Some(v) = v {
+        a.push(flag.into());
+        a.push(v.clone());
+    }
 }
 
 /// Parses one stdout line; None for blank or non-JSON lines.
@@ -300,7 +313,22 @@ pub(crate) mod tests {
             seat: None,
             sandbox: None,
             deny_secrets: None,
+            model: None,
+            effort: None,
         }
+    }
+
+    #[test]
+    fn model_and_effort_flags_only_when_set() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = run(d.path());
+        let a = build_args(&r, Path::new("/x.json"), None);
+        assert!(!a.contains(&"--model".to_string()) && !a.contains(&"--effort".to_string()));
+        r.model = Some("opus".into());
+        r.effort = Some("high".into());
+        let a = build_args(&r, Path::new("/x.json"), None);
+        let pos = |k: &str| a.iter().position(|x| x == k).unwrap();
+        assert_eq!((a[pos("--model") + 1].as_str(), a[pos("--effort") + 1].as_str()), ("opus", "high"));
     }
 
     #[test]

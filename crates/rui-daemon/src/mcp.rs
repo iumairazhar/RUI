@@ -271,6 +271,12 @@ pub struct CreateSubtaskArgs {
     /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
     #[serde(default)]
     pub allow_paths: Option<Vec<String>>,
+    /// Model for this subtask's runs: haiku, sonnet or opus. Omit for the role's default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Effort for this subtask's runs: low, medium, high, xhigh or max. Omit for the role's default.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Arguments for the member's `report_progress`.
@@ -397,6 +403,28 @@ pub struct SendBackArgs {
     /// Protected paths this one subtask may change, e.g. ["package.json"]. A trailing / grants a folder; * globs. Only when the job truly needs it; every grant is logged.
     #[serde(default)]
     pub allow_paths: Option<Vec<String>>,
+    /// Model for this subtask's runs: haiku, sonnet or opus. Omit for the role's default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Effort for this subtask's runs: low, medium, high, xhigh or max. Omit for the role's default.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// Arguments for the Account Lead's `set_run_settings`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SetRunSettingsArgs {
+    /// Subtask id (a subtask of your task).
+    pub task_id: i64,
+    /// haiku, sonnet or opus. Omit to keep the current one.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// low, medium, high, xhigh or max. Omit to keep the current one.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Why the change, in one line.
+    pub why: String,
 }
 
 /// Arguments for the Account Lead's `forward_pr`.
@@ -843,8 +871,10 @@ pub mod logic {
     /// Lead creates a member subtask under its own task.
     pub fn create_subtask(db: &Db, data_dir: &Path, ctx: &Ctx, a: CreateSubtaskArgs) -> anyhow::Result<Value> {
         let parent = current_task(db, ctx)?;
+        let picked = crate::run_settings::check(a.model.as_deref(), a.effort.as_deref())?;
         let deps = a.depends_on.clone().unwrap_or_default();
         let task = insert_subtask(db, data_dir, &parent, &a.agent, &a.title, &a.job, &a.done_command, &deps, &a.allow_paths.clone().unwrap_or_default())?;
+        crate::run_settings::record(db, task.id, &picked, "lead", None)?;
         record(db, ctx, Role::Lead, "create_subtask", &a)?;
         let fresh = db.get_task(task.id)?.unwrap_or(task);
         Ok(serde_json::to_value(fresh)?)
@@ -939,6 +969,7 @@ pub mod logic {
     /// Account Lead sends reviewed work back: the remarks become a new subtask for the Pod.
     pub fn send_back(db: &Db, data_dir: &Path, ctx: &Ctx, a: SendBackArgs) -> anyhow::Result<Value> {
         let parent = own_task_for_review(db, ctx, a.task_id, &a.remarks)?;
+        let picked = crate::run_settings::check(a.model.as_deref(), a.effort.as_deref())?;
         let mut subs = db.subtasks(parent.id)?;
         subs.sort_by_key(|s| s.id);
         if subs.iter().any(|s| matches!(s.status, TaskStatus::Open | TaskStatus::InProgress | TaskStatus::WaitingAnswer)) {
@@ -954,6 +985,7 @@ pub mod logic {
             a.remarks, parent.title
         );
         let sub = insert_subtask(db, data_dir, &parent, &agent, &format!("Changes: {first}"), &job, &a.done_command, &[], &a.allow_paths.clone().unwrap_or_default())?;
+        crate::run_settings::record(db, sub.id, &picked, "lead", None)?;
         db.set_task_status(parent.id, TaskStatus::Split)?;
         db.add_event(Some(parent.id), "lead", "sent_back", &json!({"subtask_id": sub.id, "remarks": a.remarks}))?;
         log_client_decision(db, data_dir, &parent, &format!("Task {} sent back: {first}", parent.id))?;
@@ -1053,6 +1085,25 @@ pub mod logic {
         crate::control::apply_limit(db, task.id, a.max_loops)?;
         record(db, ctx, Role::Lead, "set_limit", &a)?;
         Ok(json!({"ok": true, "task_id": task.id, "max_loops": a.max_loops}))
+    }
+
+    /// Lead changes the model or effort of a subtask's next runs and logs why.
+    pub fn set_run_settings(db: &Db, data_dir: &Path, ctx: &Ctx, a: SetRunSettingsArgs) -> anyhow::Result<Value> {
+        let task = lead_child(db, ctx, a.task_id)?;
+        let picked = crate::run_settings::check(a.model.as_deref(), a.effort.as_deref())?;
+        if picked.is_empty() {
+            anyhow::bail!("give a model, an effort, or both");
+        }
+        if a.why.trim().is_empty() {
+            anyhow::bail!("why must not be empty");
+        }
+        let settings = picked.or(crate::run_settings::latest(db, task.id)?);
+        crate::run_settings::record(db, task.id, &settings, "lead", Some(a.why.trim()))?;
+        let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "default".into());
+        let line = format!("Subtask {} runs on {} at {} effort: {}", task.id, shown(&settings.model), shown(&settings.effort), a.why.trim());
+        log_client_decision(db, data_dir, &task, &line)?;
+        record(db, ctx, Role::Lead, "set_run_settings", &a)?;
+        Ok(json!({"ok": true, "task_id": task.id, "model": settings.model, "effort": settings.effort}))
     }
 
     /// Lead narrows or changes a subtask's done command.
@@ -1431,6 +1482,15 @@ impl LeadServer {
         finish(logic::set_limit(&self.db, &ctx_from(&parts), a))
     }
 
+    #[tool(description = "Change the model (haiku, sonnet, opus) or effort (low to max) for a subtask's next runs, with a one-line why.")]
+    async fn set_run_settings(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetRunSettingsArgs>,
+    ) -> CallToolResult {
+        finish(logic::set_run_settings(&self.db, &self.data_dir, &ctx_from(&parts), a))
+    }
+
     #[tool(description = "Change a subtask's done command, for example to narrow the criteria.")]
     async fn set_done_command(
         &self,
@@ -1633,6 +1693,8 @@ mod tests {
             done_command: "test -f done.txt".into(),
             depends_on: None,
             allow_paths: None,
+            model: None,
+            effort: None,
         }
     }
 
@@ -2261,7 +2323,7 @@ mod tests {
     }
 
     fn send_args(task_id: i64, remarks: &str) -> SendBackArgs {
-        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into(), allow_paths: None }
+        SendBackArgs { task_id, remarks: remarks.into(), agent: None, done_command: "test -f changes.txt".into(), allow_paths: None, model: None, effort: None }
     }
 
     #[test]
@@ -2286,6 +2348,61 @@ mod tests {
         let client = db.get_client(sub.client_id).unwrap().unwrap();
         let log = crate::client_state::read_log(data.path(), &client.name, 10).unwrap();
         assert!(log.contains(&format!("Task {lead_id} sent back: Fix the tests")));
+    }
+
+    fn settings_of(db: &Db, id: i64) -> crate::run_settings::RunSettings {
+        crate::run_settings::latest(db, id).unwrap()
+    }
+
+    #[test]
+    fn create_subtask_stores_run_settings_and_rejects_bad_ones() {
+        let (db, data, lead, member) = staffed();
+        assert!(settings_of(&db, member.task_id.unwrap()).is_empty(), "nothing stored when none given");
+        let args = CreateSubtaskArgs { model: Some("opus".into()), effort: Some("high".into()), ..sub_args("backend", "hard") };
+        let sub = logic::create_subtask(&db, data.path(), &lead, args).unwrap();
+        let id = sub["id"].as_i64().unwrap();
+        let s = settings_of(&db, id);
+        assert_eq!((s.model.as_deref(), s.effort.as_deref()), (Some("opus"), Some("high")));
+        let ev = db.list_events(Some(id), 50).unwrap().into_iter().find(|e| e.kind == "run_settings").unwrap();
+        assert_eq!(ev.payload["by"], "lead");
+        let before = db.subtasks(lead.task_id.unwrap()).unwrap().len();
+        let bad = CreateSubtaskArgs { model: Some("gpt".into()), ..sub_args("backend", "x") };
+        assert!(logic::create_subtask(&db, data.path(), &lead, bad).is_err());
+        assert_eq!(db.subtasks(lead.task_id.unwrap()).unwrap().len(), before, "a bad pick creates no subtask");
+    }
+
+    #[test]
+    fn send_back_stores_run_settings() {
+        let (db, data, lead, member) = staffed();
+        let lead_id = lead.task_id.unwrap();
+        set_status(&db, member.task_id.unwrap(), TaskStatus::Done);
+        set_status(&db, lead_id, TaskStatus::Clarifying);
+        let bad = SendBackArgs { effort: Some("huge".into()), ..send_args(lead_id, "x") };
+        assert!(logic::send_back(&db, data.path(), &lead, bad).is_err());
+        let args = SendBackArgs { model: Some("sonnet".into()), effort: Some("medium".into()), ..send_args(lead_id, "Fix it") };
+        let r = logic::send_back(&db, data.path(), &lead, args).unwrap();
+        let s = settings_of(&db, r["subtask_id"].as_i64().unwrap());
+        assert_eq!((s.model.as_deref(), s.effort.as_deref()), (Some("sonnet"), Some("medium")));
+    }
+
+    #[test]
+    fn set_run_settings_changes_own_subtasks_only_and_logs_why() {
+        let (db, data, lead, member) = staffed();
+        let id = member.task_id.unwrap();
+        let args = |task_id, model: Option<&str>, effort: Option<&str>, why: &str| SetRunSettingsArgs {
+            task_id, model: model.map(Into::into), effort: effort.map(Into::into), why: why.into(),
+        };
+        logic::set_run_settings(&db, data.path(), &lead, args(id, Some("sonnet"), None, "first")).unwrap();
+        let r = logic::set_run_settings(&db, data.path(), &lead, args(id, None, Some("high"), "two failed loops")).unwrap();
+        assert_eq!((r["model"].as_str(), r["effort"].as_str()), (Some("sonnet"), Some("high")), "keeps the earlier model");
+        let s = settings_of(&db, id);
+        assert_eq!((s.model.as_deref(), s.effort.as_deref()), (Some("sonnet"), Some("high")));
+        assert!(grant_log(&db, data.path(), id).contains(&format!("Subtask {id} runs on sonnet at high effort: two failed loops")));
+        assert!(logic::set_run_settings(&db, data.path(), &lead, args(lead.task_id.unwrap(), Some("opus"), None, "x")).is_err());
+        assert!(logic::set_run_settings(&db, data.path(), &member, args(id, Some("opus"), None, "x")).is_err());
+        assert!(logic::set_run_settings(&db, data.path(), &lead, args(id, Some("gpt"), None, "x")).is_err());
+        assert!(logic::set_run_settings(&db, data.path(), &lead, args(id, None, None, "x")).is_err());
+        assert!(logic::set_run_settings(&db, data.path(), &lead, args(id, Some("opus"), None, " ")).is_err());
     }
 
     fn grant_log(db: &Db, data: &Path, id: i64) -> String {
@@ -2475,7 +2592,7 @@ mod tests {
     #[tokio::test]
     async fn endpoints_list_their_tools() {
         let app = mcp_router(Arc::new(Db::open_test()), std::env::temp_dir(), Apps::default(), Runs::default());
-        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_story"];
+        let lead = ["ask_scout", "ask_team", "create_subtask", "escalate", "forward_pr", "log_decision", "mark_split", "rule", "send_back", "set_done_command", "set_limit", "set_run_settings", "set_story"];
         assert_eq!(tool_names(&app, "/mcp/lead", Server::Lead).await, lead);
         let builder = ["ask_lead", "report_progress", "report_status"];
         assert_eq!(tool_names(&app, "/mcp/builder", Server::Builder).await, builder);
@@ -2559,6 +2676,8 @@ mod tests {
             seat: None,
             sandbox: None,
             deny_secrets: None,
+            model: None,
+            effort: None,
             partial: false,
         };
         let out = run_agent(&run, |l| {

@@ -242,6 +242,7 @@ fn planning_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64, role: &str
     let skills = r.as_ref().map(|r| r.skills.clone()).unwrap_or_default();
     scheduler::install_logged(db, cfg, &wt, &task, &agent_name(request_id, role), &client.name, &skills)?;
     let filled = prompts::fill(PLAN_PROMPT, &plan_vars(&cfg.data_dir, &client.name, &task, &req, role)?);
+    let run = crate::run_settings::for_support(&cfg.data_dir, role);
     Ok(AgentRun {
         role: Role::Builder,
         task_id: Some(task_id),
@@ -263,6 +264,8 @@ fn planning_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64, role: &str
         seat: None,
         sandbox: Some(crate::sandbox::for_client(&cfg.data_dir, &client.name, &repo)),
         deny_secrets: None,
+        model: run.model,
+        effort: run.effort,
     })
 }
 

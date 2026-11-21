@@ -88,6 +88,12 @@ pub struct Node {
     /// Why the node is in its status, when the owner holds the step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Model picked for a subtask's runs (latest `run_settings`); None means the role or CLI default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Effort picked for a subtask's runs; None means the role or CLI default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +147,8 @@ struct Ctx<'a> {
     cost: HashMap<i64, f64>,
     /// What each planning meeting's turns cost, by `team_asked` event id.
     meeting_cost: HashMap<i64, f64>,
+    /// `run_settings` events of the subtasks, oldest first. Kept apart from `events`, so status logic never sees them.
+    run_settings: Vec<Event>,
     now: i64,
     stall: i64,
 }
@@ -170,7 +178,8 @@ fn max_id(evs: &[&Event], kind: &str) -> i64 {
 fn node(id: String, lane: &'static str, kind: &'static str, status: &'static str, title: String, at: &str) -> Node {
     Node {
         id, lane, kind, status, title, agent: None, subtask_id: None, attempts: None, started_at: at.into(), ended_at: None,
-        after: vec![], decision: None, output: None, cost_usd: None, event_ids: vec![], reason: None,
+        after: vec![], decision: None, output: None, cost_usd: None, event_ids: vec![], reason: None, model: None,
+        effort: None,
     }
 }
 
@@ -353,6 +362,10 @@ fn subtask_node(ctx: &Ctx, t: &Task) -> Node {
     n.event_ids = own.iter().map(|e| e.id).collect();
     n.output = done_checks(&own).last().map(test_output);
     n.reason = hold_reason(ctx, t, status).map(String::from);
+    if let Some(e) = ctx.run_settings.iter().rev().find(|e| e.task_id == Some(t.id)) {
+        let s = |k: &str| e.payload[k].as_str().map(String::from);
+        (n.model, n.effort) = (s("model"), s("effort"));
+    }
     n
 }
 
@@ -684,7 +697,8 @@ pub fn build(db: &Db, top: &Task, now: i64, stall: i64) -> Result<Thread> {
     let events = db.events_for_tasks(&ids, &KINDS, 0, i64::MAX)?;
     let meeting_cost = meeting_costs(db, top.id, &events)?;
     let (questions, last, cost) = (open_questions(db, &ids)?, db.last_activity(&ids)?, db.cost_by_task(&ids)?);
-    let ctx = Ctx { top, subs: &subs, events, questions, last, cost, meeting_cost, now, stall };
+    let run_settings = db.events_for_tasks(&ids, &[crate::run_settings::EVENT], 0, i64::MAX)?;
+    let ctx = Ctx { top, subs: &subs, events, questions, last, cost, meeting_cost, run_settings, now, stall };
     let nodes = nodes(&ctx);
     let mut statuses: Vec<&str> = nodes.iter().map(|n| n.status).collect();
     let all_planned = !subs.is_empty() && subs.iter().all(|s| task_status(&ctx, s) == "planned");
@@ -895,6 +909,21 @@ mod tests {
         let out = n.output.unwrap();
         assert_eq!(out.label, "2 of 2 answered");
         assert!(out.preview.unwrap().contains("Tester (S): do it Proof: cargo test"));
+    }
+
+    #[test]
+    fn subtask_nodes_show_the_latest_run_settings() {
+        let (db, top, sub) = setup(TaskStatus::Open);
+        let node = |th: &Thread| th.nodes.iter().find(|n| n.id == format!("task:{sub}")).cloned().unwrap();
+        let n = node(&get(&db, top, real_now()));
+        assert_eq!((n.model, n.effort), (None, None));
+        let s = crate::run_settings::check(Some("haiku"), Some("low")).unwrap();
+        crate::run_settings::record(&db, sub, &s, "lead", None).unwrap();
+        let s = crate::run_settings::check(Some("opus"), Some("high")).unwrap();
+        crate::run_settings::record(&db, sub, &s, "lead", Some("tricky")).unwrap();
+        let n = node(&get(&db, top, real_now()));
+        assert_eq!((n.model.as_deref(), n.effort.as_deref()), (Some("opus"), Some("high")));
+        assert_eq!(sub_status(&get(&db, top, real_now()), sub), "planned");
     }
 
     #[test]

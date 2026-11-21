@@ -163,6 +163,7 @@ fn scout_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64) -> Result<Age
     let client = db.get_client(task.client_id)?.context("client not found")?;
     let system = prompts::fill(SCOUT_PROMPT, &scout_vars(db, &task, &req)?);
     let by = req.payload["by"].as_str().unwrap_or_default();
+    let run = crate::run_settings::for_support(&cfg.data_dir, "scout");
     Ok(AgentRun {
         role: Role::Rui,
         task_id: Some(task_id),
@@ -180,6 +181,8 @@ fn scout_run(db: &Db, cfg: &Config, task_id: i64, request_id: i64) -> Result<Age
         seat: None,
         sandbox: None,
         deny_secrets: Some(cfg.data_dir.clone()),
+        model: run.model,
+        effort: run.effort,
     })
 }
 
@@ -337,6 +340,7 @@ mod tests {
         let id = request(&db, t.id, "Which crate?", "lead").unwrap();
         let cfg = Config { port: 0, tick: std::time::Duration::from_secs(1), data_dir: data.path().to_path_buf() };
         let mut run = scout_run(&db, &cfg, t.id, id).unwrap();
+        assert_eq!((run.model.as_deref(), run.effort.as_deref()), (Some("sonnet"), Some("medium")));
         run.cwd = data.path().to_path_buf();
         let v = crate::runner::tests::captured_settings(&run).await.expect("--settings passed");
         let want = crate::sandbox::secret_deny_rules(&std::fs::canonicalize(data.path()).unwrap());
