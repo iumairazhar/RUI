@@ -22,6 +22,8 @@ pub enum Server {
     Builder,
     Scout,
     Coach,
+    /// A planning-meeting turn: only `plan_reply`.
+    Plan,
 }
 
 /// What a run token allows: one server, acting for one task and source.

@@ -23,7 +23,7 @@ use views::section::{Sec, active_tab, empty_page};
 use views::{
     activity::ThreadsView, agents::AgentsView, apps::AppsView, chat::ChatView, client_knowledge::ClientDrawer, clients,
     inbox::InboxPanel,
-    library::Tooltip, playbook, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
+    library::Tooltip, playbook, preferences::PreferencesView, results::ResultsView, seat, seat::SeatView, skills::SkillsView,
     spend::{Mode as SpendMode, SpendView},
 };
 
@@ -147,6 +147,7 @@ struct Root {
     agents: Entity<AgentsView>,
     apps: Entity<AppsView>,
     skills: Entity<SkillsView>,
+    preferences: Entity<PreferencesView>,
     seats: Entity<SeatView>,
     spend: Entity<SpendView>,
     analytics: Entity<SpendView>,
@@ -200,6 +201,7 @@ impl Root {
             agents: cx.new(|cx| AgentsView::new(store.clone(), cx)),
             apps: cx.new(|cx| AppsView::new(store.clone(), cx)),
             skills: cx.new(|cx| SkillsView::new(store.clone(), cx)),
+            preferences: cx.new(|cx| PreferencesView::new(store.clone(), cx)),
             seats: cx.new(|cx| SeatView::new(store.clone(), cx)),
             spend: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Spend, cx)),
             analytics: cx.new(|cx| SpendView::new(store.clone(), SpendMode::Analytics, cx)),
@@ -225,7 +227,8 @@ impl Root {
             },
             Nav::Knowledge => match tab(Sec::Knowledge) {
                 0 => self.skills.clone().into_any_element(),
-                _ => playbook::page(cx),
+                1 => playbook::page(cx),
+                _ => self.preferences.clone().into_any_element(),
             },
             Nav::Cost => match tab(Sec::Cost) {
                 0 => self.spend.clone().into_any_element(),
@@ -409,6 +412,7 @@ impl Root {
         self.pill_seq += 1;
         if nav == Nav::Knowledge {
             self.store.update(cx, |s, cx| s.refresh_skills(cx));
+            self.preferences.update(cx, |v, cx| v.load(cx));
         }
         if nav == Nav::Cost {
             self.spend.update(cx, |v, cx| v.load(cx));

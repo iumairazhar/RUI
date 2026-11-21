@@ -3,24 +3,27 @@
 //! with the templates, so a new placeholder can't reach an agent as literal text.
 
 /// Placeholders filled in `builder.md`.
-pub const BUILDER_VARS: [&str; 6] = ["role", "title", "job", "done_command", "progress_file", "playbook"];
+pub const BUILDER_VARS: [&str; 7] = ["role", "title", "job", "done_command", "progress_file", "playbook", "owner_preferences"];
 /// Placeholders filled in `decide.md`.
-pub const DECIDE_VARS: [&str; 9] = [
+pub const DECIDE_VARS: [&str; 10] = [
     "question", "member_role", "subtask_title", "lead_why", "brief", "owner_knowledge", "client_playbook", "global_playbook",
-    "prior_rulings",
+    "prior_rulings", "owner_preferences",
 ];
 /// Placeholders filled in `rui.md`.
-pub const RUI_VARS: [&str; 1] = ["role_catalog"];
+pub const RUI_VARS: [&str; 2] = ["role_catalog", "owner_preferences"];
 
 /// Placeholders filled in `account_lead.md`.
-pub const ACCOUNT_LEAD_VARS: [&str; 6] =
-    ["client", "event", "client_log", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
+pub const ACCOUNT_LEAD_VARS: [&str; 7] =
+    ["client", "event", "client_log", "owner_preferences", "owner_knowledge", "client_playbook", "pod_roles_and_skills"];
 
 /// Placeholders filled in `scout.md`.
 pub const SCOUT_VARS: [&str; 7] = ["question", "asked_by", "tools", "brief", "last_check", "events_tail", "context"];
 
 /// Placeholders filled in `coach.md`.
 pub const COACH_VARS: [&str; 6] = ["title", "brief", "lessons", "client_playbook", "global_playbook", "library"];
+
+/// Placeholders filled in `plan.md`.
+pub const PLAN_VARS: [&str; 4] = ["role", "brief", "question", "pod_roles"];
 
 /// What a placeholder gets when there is nothing to say yet.
 pub const NONE_YET: &str = "(none yet)";
@@ -77,6 +80,7 @@ mod tests {
             (include_str!("../prompts/account_lead.md"), all(&ACCOUNT_LEAD_VARS)),
             (include_str!("../prompts/scout.md"), all(&SCOUT_VARS)),
             (include_str!("../prompts/coach.md"), all(&COACH_VARS)),
+            (include_str!("../prompts/plan.md"), all(&PLAN_VARS)),
         ];
         for (template, vars) in cases {
             assert_eq!(unfilled(&fill(template, &vars)), Vec::<String>::new());

@@ -25,7 +25,7 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/builder.md");
 const DECIDE_PROMPT: &str = include_str!("../prompts/decide.md");
 const LEAD_MCP: &str = "mcp__rui__create_subtask,mcp__rui__mark_split,mcp__rui__rule,mcp__rui__escalate,\
 mcp__rui__set_limit,mcp__rui__set_done_command,mcp__rui__log_decision,mcp__rui__send_back,mcp__rui__forward_pr,\
-mcp__rui__ask_scout,mcp__rui__set_story";
+mcp__rui__ask_scout,mcp__rui__ask_team,mcp__rui__set_story";
 const MEMBER_MCP: &str = "mcp__rui__report_progress,mcp__rui__report_status,mcp__rui__ask_lead";
 const RUI_DECIDE_TOOLS: [&str; 2] = ["mcp__rui__rule", "mcp__rui__escalate_to_owner"];
 const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
@@ -54,6 +54,8 @@ pub enum Action {
     Scout { task_id: i64, request_event_id: i64 },
     /// Run the Coach once over a finished top-level task.
     Coach { task_id: i64 },
+    /// Run one role's planning turn for an unanswered `team_asked` event; `index` is its place in the roles.
+    Plan { task_id: i64, request_event_id: i64, role: String, index: usize },
 }
 
 // ---- pure decision layer ----
@@ -80,6 +82,7 @@ pub fn plan_tick_at(db: &Db, running: &HashSet<i64>, now: i64) -> Result<Vec<Act
     actions.extend(plan_deliveries(&pending, now));
     actions.extend(crate::scout::plan(db, running)?);
     actions.extend(crate::coach::plan(db, running)?);
+    actions.extend(crate::team::plan(db, running)?);
     Ok(actions)
 }
 
@@ -107,6 +110,7 @@ fn plan_task(db: &Db, t: &Task, by_id: &HashMap<i64, &Task>, held: &HashSet<i64>
     match (t.parent_id, t.status) {
         (None, TaskStatus::New) => Ok(Some(Action::StartLead { task_id: t.id, answers: vec![] })),
         (None, TaskStatus::WaitingAnswer) => plan_answered(db, t, held),
+        (None, TaskStatus::Clarifying) => plan_team_wake(db, t),
         (Some(p), TaskStatus::Open) => plan_builder(db, t, by_id.get(&p).copied(), by_id),
         (_, TaskStatus::Split) => plan_rollup(db, t),
         _ => Ok(None),
@@ -124,6 +128,12 @@ fn plan_answered(db: &Db, t: &Task, held: &HashSet<i64>) -> Result<Option<Action
         .filter_map(|q| q.answer.map(|a| (q.text, a)))
         .collect();
     Ok(Some(Action::StartLead { task_id: t.id, answers }))
+}
+
+/// Wakes a Lead that ended its turn waiting on a planning meeting, once every reply is in.
+fn plan_team_wake(db: &Db, t: &Task) -> Result<Option<Action>> {
+    let ready = crate::team::ready_to_wake(db, t.id)?;
+    Ok(ready.then(|| Action::StartLead { task_id: t.id, answers: vec![] }))
 }
 
 /// Starts a ready subtask unless the owner holds it (a checkpoint or a takeover).
@@ -203,7 +213,7 @@ pub fn latest_forwarded(db: &Db, task_id: i64) -> Result<Option<Value>> {
 /// After a lead turn: a lead that neither asked nor split gets the task marked stuck.
 pub fn after_lead_turn(db: &Db, task_id: i64) -> Result<TaskStatus> {
     let status = db.get_task(task_id)?.context("task not found")?.status;
-    if status != TaskStatus::Clarifying {
+    if status != TaskStatus::Clarifying || crate::team::lead_waits(db, task_id)? {
         return Ok(status);
     }
     db.set_task_status(task_id, TaskStatus::Stuck)?;
@@ -603,6 +613,12 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
                 crate::coach::run(&db2, &cfg2, &live2, task_id).await
             }, db, Some(task_id));
         }
+        Action::Plan { task_id, request_event_id, role, index } => {
+            let (db2, cfg2, live2) = (db.clone(), cfg.clone(), live.clone());
+            spawn_keyed(running, crate::team::run_key(request_event_id, index), async move {
+                crate::team::run(&db2, &cfg2, &live2, task_id, request_event_id, &role).await
+            }, db, Some(task_id));
+        }
     }
 }
 
@@ -993,7 +1009,7 @@ fn take_instructions(db: &Db, task_id: i64) -> Result<String> {
 }
 
 /// The role's AGENT.md body followed by the role prompt.
-fn role_prompt(role: Option<&roster::Role>, prompt: &str) -> String {
+pub(crate) fn role_prompt(role: Option<&roster::Role>, prompt: &str) -> String {
     match role {
         Some(r) => format!("{}\n\n{prompt}", r.body),
         None => prompt.into(),
@@ -1012,7 +1028,7 @@ fn account_lead_tools(role: Option<&roster::Role>) -> Vec<String> {
 }
 
 /// Last `max` chars of `text`, cut at a char boundary, with a leading "…" when cut.
-fn tail_chars(text: &str, max: usize) -> String {
+pub(crate) fn tail_chars(text: &str, max: usize) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_string();
@@ -1044,7 +1060,8 @@ fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Ve
         ("client", client.name.clone()),
         ("event", event.to_string()),
         ("client_log", format!("Briefs:\n{briefs}\n\nDecisions log (latest last):\n{log}")),
-        ("owner_knowledge", client_state::read_knowledge(data_dir, &client.name)?),
+        ("owner_preferences", crate::memory::prefs_for_prompt(data_dir)?),
+        ("owner_knowledge", crate::memory::knowledge_for_prompt(data_dir, &client.name)?),
         ("client_playbook", client_state::read_playbook(data_dir, &client.name)?),
         ("pod_roles_and_skills", pod_roles_and_skills(data_dir, client)?),
     ])
@@ -1052,7 +1069,7 @@ fn account_lead_vars(data_dir: &Path, client: &Client, event: &str) -> Result<Ve
 
 /// Installs the role's skills plus the client's attached ones in `wt`, logs one `skill_used` event
 /// per installed skill, and returns the installed names.
-fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, client: &str, role_skills: &[String]) -> Result<Vec<String>> {
+pub(crate) fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, client: &str, role_skills: &[String]) -> Result<Vec<String>> {
     let mut names = role_skills.to_vec();
     names.extend(skills::client_skills(&cfg.data_dir, client));
     let names = skills::installable(&cfg.data_dir, &names);
@@ -1070,7 +1087,7 @@ fn install_logged(db: &Db, cfg: &Config, wt: &Path, task: &Task, agent: &str, cl
 }
 
 /// The top-level task's worktree and branch, cut from the client's base branch.
-fn task_worktree(cfg: &Config, client: &Client, repo: &Path, task_id: i64) -> Result<(PathBuf, String)> {
+pub(crate) fn task_worktree(cfg: &Config, client: &Client, repo: &Path, task_id: i64) -> Result<(PathBuf, String)> {
     let base = client_state::base_for(&cfg.data_dir, &client.name, repo)?;
     ensure_task_worktree(repo, &cfg.data_dir.join("worktrees"), task_id, &base)
 }
@@ -1263,7 +1280,8 @@ async fn decide(db: &Db, cfg: &Config, live: &Live, qid: i64, level: &str) -> Re
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
     let mut vars = decide_vars(db, &q, &member, &parent, playbook)?;
     vars.push(("global_playbook", client_state::read_global_playbook(&cfg.data_dir)?));
-    vars.push(("owner_knowledge", client_state::read_knowledge(&cfg.data_dir, &client.name)?));
+    vars.push(("owner_knowledge", crate::memory::knowledge_for_prompt(&cfg.data_dir, &client.name)?));
+    vars.push(("owner_preferences", crate::memory::prefs_for_prompt(&cfg.data_dir)?));
     let system = prompts::fill(DECIDE_PROMPT, &vars);
     run_logged(db, cfg, live, "rui", parent.id, rui_decision_run(cfg, &parent, prompt, system)).await?;
     Ok(())
@@ -1354,8 +1372,15 @@ fn member_setup(db: &Db, cfg: &Config, task: &Task, client: &Client, done: &str,
     let loaded: Vec<Skill> = names.iter().filter_map(|n| skills::load(&cfg.data_dir, n)).collect();
     let tools = member_tools(role.as_ref(), &loaded, client, done);
     let playbook = client_state::read_playbook(&cfg.data_dir, &client.name)?;
-    let prompt = prompts::fill(BUILDER_PROMPT, &builder_vars(db, task, role.as_ref(), done, playbook)?);
+    let prompt = member_prompt(db, &cfg.data_dir, task, role.as_ref(), done, playbook)?;
     Ok((role_prompt(role.as_ref(), &prompt), tools))
+}
+
+/// builder.md filled for one member, with the owner's preferences.
+fn member_prompt(db: &Db, data_dir: &Path, task: &Task, role: Option<&roster::Role>, done: &str, playbook: String) -> Result<String> {
+    let mut vars = builder_vars(db, task, role, done, playbook)?;
+    vars.push(("owner_preferences", crate::memory::prefs_for_prompt(data_dir)?));
+    Ok(prompts::fill(BUILDER_PROMPT, &vars))
 }
 
 /// Values for builder.md: who the member is, its job, and its own progress notes so far.
@@ -1820,6 +1845,46 @@ mod tests {
         assert!(take_instructions(&db, t.id).unwrap().contains("Missing env var"));
     }
 
+    /// A Lead mid-turn on a new task with a Pod of designer and tester.
+    fn lead_with_pod() -> (Db, Task, tempfile::TempDir) {
+        let (db, c) = setup();
+        let d = tempfile::tempdir().unwrap();
+        let roles = ["designer", "tester"].map(|r| client_state::PodRole { role: r.into(), skills: vec![] }).to_vec();
+        client_state::write_pod(d.path(), "acme", &client_state::Pod { roles, ..Default::default() }).unwrap();
+        let t = mk(&db, c, None, TaskStatus::Clarifying);
+        (db, t, d)
+    }
+
+    #[test]
+    fn ask_team_plans_turns_then_wakes_the_lead_once() {
+        let (db, t, d) = lead_with_pod();
+        let ctx = crate::mcp::Ctx { task_id: Some(t.id), source_ref: None };
+        let args = crate::mcp::AskTeamArgs { roles: vec!["designer".into(), "tester".into()], question: None };
+        let id = crate::mcp::logic::ask_team(&db, d.path(), &ctx, args).unwrap()["request_event_id"].as_i64().unwrap();
+        let unknown = crate::mcp::AskTeamArgs { roles: vec!["pilot".into()], question: None };
+        assert!(crate::mcp::logic::ask_team(&db, d.path(), &ctx, unknown).is_err());
+        assert_eq!(after_lead_turn(&db, t.id).unwrap(), TaskStatus::Clarifying, "waiting on the meeting is not stuck");
+        let turns = plan(&db);
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|a| matches!(a, Action::Plan { request_event_id, .. } if *request_event_id == id)));
+        let r = || crate::team::Reply { approach: "a".into(), size: "S".into(), proof: "p".into(), ..Default::default() };
+        crate::team::reply(&db, id, Some(t.id), "designer", r()).unwrap();
+        assert!(plan(&db).iter().all(|a| !matches!(a, Action::StartLead { .. })));
+        crate::team::reply(&db, id, Some(t.id), "tester", r()).unwrap();
+        assert_eq!(plan(&db), vec![Action::StartLead { task_id: t.id, answers: vec![] }]);
+        assert!(take_instructions(&db, t.id).unwrap().contains("TEAM REPLIES"));
+        assert!(plan(&db).is_empty(), "replies are delivered once");
+    }
+
+    #[test]
+    fn members_cannot_call_a_planning_meeting() {
+        let (db, t, d) = lead_with_pod();
+        let sub = mk(&db, t.client_id, Some(t.id), TaskStatus::InProgress);
+        let ctx = crate::mcp::Ctx { task_id: Some(sub.id), source_ref: None };
+        let args = crate::mcp::AskTeamArgs { roles: vec!["tester".into()], question: None };
+        assert!(crate::mcp::logic::ask_team(&db, d.path(), &ctx, args).is_err());
+    }
+
     #[test]
     fn members_cannot_ask_the_scout() {
         let (db, c) = setup();
@@ -1841,7 +1906,8 @@ mod tests {
 
     #[test]
     fn support_turns_wait_for_a_free_seat() {
-        let actions = vec![Action::Scout { task_id: 1, request_event_id: 2 }, Action::Coach { task_id: 1 }];
+        let plan_turn = Action::Plan { task_id: 1, request_event_id: 3, role: "tester".into(), index: 0 };
+        let actions = vec![Action::Scout { task_id: 1, request_event_id: 2 }, Action::Coach { task_id: 1 }, plan_turn];
         assert!(hold_turns(actions, false).is_empty());
     }
 
@@ -1896,6 +1962,23 @@ mod tests {
         let filled = prompts::fill(ACCOUNT_LEAD_PROMPT, &vars);
         assert!(prompts::unfilled(&filled).is_empty());
         assert!(filled.find("no Docker").unwrap() < filled.find("Client Playbook").unwrap());
+    }
+
+    #[test]
+    fn lead_and_member_prompts_get_the_owner_preferences() {
+        let (db, c) = setup();
+        let client = db.get_client(c).unwrap().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        client_state::ensure(data.path(), "acme", "/repo", None).unwrap();
+        client_state::append_knowledge(data.path(), "acme", "Owner says: no Docker").unwrap();
+        crate::memory::append(data.path(), "Always write tests first").unwrap();
+        let lead = prompts::fill(ACCOUNT_LEAD_PROMPT, &account_lead_vars(data.path(), &client, "a new task").unwrap());
+        let prefs = lead.find("Always write tests first").expect("lead gets preferences");
+        assert!(prefs < lead.find("no Docker").unwrap(), "preferences sit above the client knowledge");
+        let task = mk(&db, c, None, TaskStatus::Open);
+        let member = member_prompt(&db, data.path(), &task, None, "true", String::new()).unwrap();
+        assert!(member.contains("Owner preferences (owner's own lines win): - ") && member.contains("Always write tests first"));
+        assert!(prompts::unfilled(&member).is_empty());
     }
 
     #[test]
