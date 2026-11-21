@@ -690,6 +690,11 @@ pub struct Node {
     pub status: String,
     #[serde(default)]
     pub title: String,
+    /// Model and effort the Lead picked for this step, e.g. "opus" and "high".
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
