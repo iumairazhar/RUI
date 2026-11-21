@@ -217,12 +217,12 @@ fn put<T: PartialEq>(slot: &mut T, new: T) -> bool {
 }
 
 /// Create the chat first when there is none, then post; returns the chat id.
-fn send_to(current: Option<i64>, text: &str, client: Option<&str>, needs_you: usize) -> anyhow::Result<i64> {
+fn send_to(current: Option<i64>, text: &str, client: Option<&str>, needs_you: usize, files: &[String]) -> anyhow::Result<i64> {
     let id = match current {
         Some(id) => id,
         None => api::create_chat(needs_you)?.id,
     };
-    api::post_chat(id, text, client)?;
+    api::post_chat(id, text, client, files)?;
     Ok(id)
 }
 
@@ -611,8 +611,13 @@ impl Store {
 
     /// Send new instructions to a task; toast the daemon's note when it sends one, then refresh.
     pub fn instruct_task(&mut self, id: i64, text: String, cx: &mut Context<Self>) {
+        self.instruct_with_files(id, text, Vec::new(), cx);
+    }
+
+    /// Like [`Store::instruct_task`], with upload ids the owner attached.
+    pub fn instruct_with_files(&mut self, id: i64, text: String, files: Vec<String>, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { api::instruct(id, &text) }).await;
+            let res = cx.background_executor().spawn(async move { api::instruct(id, &text, &files) }).await;
             this.update(cx, |s, cx| {
                 s.action_error = res.as_ref().err().map(|e| format!("Request failed: {e}"));
                 if let Ok(note) = res {
@@ -728,12 +733,12 @@ impl Store {
     }
 
     /// Post a message to the current chat (creating one if none), then refresh.
-    pub fn send_chat(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn send_chat(&mut self, text: String, files: Vec<String>, cx: &mut Context<Self>) {
         let current = self.current_chat;
         let client = self.picked_client().map(|c| c.name.clone());
         let needs = self.awake_inbox();
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref(), needs) }).await;
+            let res = cx.background_executor().spawn(async move { send_to(current, &text, client.as_deref(), needs, &files) }).await;
             this.update(cx, |s, cx| {
                 match res {
                     Ok(id) => {

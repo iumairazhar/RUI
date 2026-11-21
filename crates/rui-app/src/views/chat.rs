@@ -2,6 +2,7 @@
 
 use super::live::live_action;
 use super::asks::{AskInputs, ask_card};
+use super::attach::{self, Attached, Attachments};
 use super::chat_tools::{ToolCall, results_by_id, tool_calls, tool_output, tool_row_head};
 use super::library::confirm_modal;
 use super::{chip, markdown, primary_button};
@@ -33,6 +34,10 @@ pub struct ChatView {
     client_menu: bool,
     /// "Saved to ..." lines per Rui message of the current chat.
     saved: HashMap<i64, Vec<String>>,
+    /// Files picked for the next message.
+    picked: Attachments,
+    /// Files each sent message of the current chat carried.
+    files: HashMap<i64, Vec<Attached>>,
 }
 
 impl ChatView {
@@ -41,7 +46,7 @@ impl ChatView {
         store::observe(&store, cx);
         let input = cx.new(|cx| TextInput::new("Tell Rui what to set up…", cx));
         cx.subscribe(&input, |this, _, _: &Submit, cx| this.send(cx)).detach();
-        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false, saved: HashMap::new() }
+        Self { store, input, ask_inputs: AskInputs::default(), scroll: ScrollHandle::new(), last_len: 0, last_chat: None, confirm_delete: None, open_tools: HashSet::new(), client_menu: false, saved: HashMap::new(), picked: Attachments::default(), files: HashMap::new() }
     }
 
     fn ask_delete(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
@@ -73,7 +78,18 @@ impl ChatView {
             return;
         }
         self.input.update(cx, |i, cx| i.clear(cx));
-        self.store.update(cx, |s, cx| s.send_chat(text, cx));
+        let files = self.picked.take_ids();
+        self.store.update(cx, |s, cx| s.send_chat(text, files, cx));
+    }
+
+    fn picked(v: &mut Self) -> &mut Attachments {
+        &mut v.picked
+    }
+
+    /// A message bubble, with the chips of the files it carried.
+    fn bubble(&self, m: &ChatMessage, th: &Theme) -> AnyElement {
+        let Some(files) = self.files.get(&m.id).filter(|f| !f.is_empty()) else { return message(m, th) };
+        div().flex().flex_col().child(message(m, th)).child(attach::sent_row(files, th)).into_any_element()
     }
 
     /// Answer an ask with a picked option, or with what was typed when `text` is `None`.
@@ -152,12 +168,12 @@ impl ChatView {
         let acts = cards.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]);
         let calls = tools.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]);
         if acts.is_empty() && calls.is_empty() {
-            return message(m, th);
+            return self.bubble(m, th);
         }
         let rows = (!calls.is_empty()).then(|| div().mb(px(8.)).child(self.tool_rows(calls, th, cx)));
         let els: Vec<AnyElement> = acts.iter().enumerate().map(|(k, a)| self.act_card(m.id, k, a, th, cx)).collect();
         let cards = (!els.is_empty()).then(|| div().flex().flex_col().gap(px(8.)).mt(px(8.)).children(els));
-        div().flex().flex_col().children(rows).child(message(m, th)).children(cards).into_any_element()
+        div().flex().flex_col().children(rows).child(self.bubble(m, th)).children(cards).into_any_element()
     }
 
     /// Show or hide the output of one tool call.
@@ -226,11 +242,11 @@ impl ChatView {
     fn composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme(cx).clone();
         let send = primary_button("send", "Send", cx).on_click(cx.listener(|this, _, _, cx| this.send(cx)));
-        div()
-            .id("chat-composer-wrap")
-            .pr(px(20.))
-            .pt(px(12.))
-            .pb(px(28.))
+        let attach = attach::attach_button("chat-attach", &self.store, Self::picked, cx);
+        let chips = attach::picked_row("chat-file", self.picked.items(), Self::picked, &th, cx);
+        let wrap = div().id("chat-composer-wrap").pr(px(20.)).pt(px(12.)).pb(px(28.));
+        attach::on_drop(wrap, &self.store, Self::picked, cx)
+            .children(chips)
             .child(
                 div()
                     .id("chat-composer")
@@ -244,6 +260,7 @@ impl ChatView {
                     .shadow(th.card_shadow())
                     .child(self.client_picker(cx))
                     .child(div().flex_1().child(self.input.clone()))
+                    .child(attach)
                     .child(send),
             )
             .into_any_element()
@@ -706,6 +723,7 @@ impl Render for ChatView {
             let tools = s.current_chat.map(|id| all_tools(&s.chat, &s.events, id)).unwrap_or_default();
             let live_calls = s.current_chat.map(|id| live_tools(&s.chat, &s.events, id)).unwrap_or_default();
             self.saved = s.current_chat.map(|id| memory_notes(&s.chat, &s.events, id)).unwrap_or_default();
+            self.files = s.current_chat.map(|id| attach::of_messages(&s.events, id)).unwrap_or_default();
             let questions = questions_in_chat(&s.questions, &s.tasks, &s.chat, &s.snoozed);
             (s.chat.clone(), s.chats.clone(), s.current_chat, questions, live, state, cards, asks, tools, live_calls)
         };
