@@ -113,6 +113,22 @@ pub const BROWSER_TEST_COMMANDS: [&str; 8] = [
     "npm run test:e2e *",
 ];
 
+/// Git subcommands that move or rewrite branches. Only RUI merges into a task branch, so Lead
+/// and member runs may not run these; `git add`, `commit`, `status`, `diff` and `log` stay open.
+pub const GIT_BRANCH_SURGERY: [&str; 14] = [
+    "merge", "push", "rebase", "reset", "checkout", "switch", "branch", "update-ref", "cherry-pick", "pull", "fetch", "worktree", "tag", "stash",
+];
+
+/// Bash deny rules for [`GIT_BRANCH_SURGERY`], in both the prefix (`:*`) and the wildcard form.
+pub fn git_deny_rules() -> Vec<String> {
+    let mut out = Vec::new();
+    for sub in GIT_BRANCH_SURGERY {
+        out.push(format!("Bash(git {sub}:*)"));
+        out.push(format!("Bash(git {sub} *)"));
+    }
+    out
+}
+
 /// Where a run may write: its worktree, the repo's .git, and the package-manager caches.
 fn allow_write(wt: &str, repo: &Path) -> Vec<String> {
     let mut out = vec![wt.to_string(), repo.join(".git").display().to_string()];
@@ -131,6 +147,7 @@ pub fn run_settings(data_dir: &Path, worktree: &Path, repo: &Path, hosts: &[Stri
     let mut deny_read: Vec<String> = SECRETS.iter().map(|f| data_dir.join(f).display().to_string()).collect();
     deny_read.extend(["~/.ssh", "~/.aws", "~/.config/gh"].map(String::from));
     deny.extend(["Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gh/**)"].map(String::from));
+    deny.extend(git_deny_rules());
     json!({
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
@@ -287,7 +304,9 @@ mod tests {
             "Edit(//Users/o/.rui/drop/**)", "Edit(//Users/o/.rui/approvals/**)",
             "Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gh/**)",
         ];
-        assert_eq!(s(&p["deny"]), want);
+        let deny = s(&p["deny"]);
+        assert_eq!(deny[..want.len()], want);
+        assert_eq!(deny[want.len()..], git_deny_rules());
         let sb = &v["sandbox"];
         assert_eq!(sb.as_object().unwrap().len(), 6);
         assert_eq!(sb["enabled"], true);
@@ -307,6 +326,30 @@ mod tests {
         let net = sb["network"].as_object().unwrap();
         assert_eq!(net.len(), 1, "no allowLocalBinding: {net:?}");
         assert_eq!(s(&net["allowedDomains"]), HOSTS);
+    }
+
+    #[test]
+    fn git_branch_surgery_is_denied_in_both_rule_forms() {
+        let rules = git_deny_rules();
+        assert_eq!(rules.len(), GIT_BRANCH_SURGERY.len() * 2);
+        for sub in ["merge", "push", "rebase", "reset", "checkout", "switch", "branch", "update-ref", "cherry-pick", "pull", "fetch", "worktree", "tag", "stash"] {
+            assert!(rules.contains(&format!("Bash(git {sub}:*)")), "{sub}");
+            assert!(rules.contains(&format!("Bash(git {sub} *)")), "{sub}");
+        }
+        for allowed in ["add", "commit", "status", "diff", "log"] {
+            assert!(!rules.iter().any(|r| r.starts_with(&format!("Bash(git {allowed}"))), "{allowed} stays allowed");
+        }
+    }
+
+    #[test]
+    fn lead_and_member_runs_deny_git_branch_surgery() {
+        // Lead and member runs both get their settings from write_settings.
+        let dir = RunDir::create().unwrap();
+        let sb = Sandbox { data_dir: "/d".into(), repo: "/r".into(), hosts: vec![] };
+        let path = write_settings(&dir, &sb, Path::new("/w")).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let deny = s(&v["permissions"]["deny"]);
+        assert!(deny.contains(&"Bash(git merge:*)") && deny.contains(&"Bash(git update-ref *)"));
     }
 
     #[test]
