@@ -303,17 +303,20 @@ fn task_in_node(ctx: &Ctx) -> Node {
     node(format!("task:{}", ctx.top.id), "in", "task_in", "done", title, &ctx.top.created_at)
 }
 
-/// An owner's answer forwarded as an instruction: tagged with `from_question`, or (older events) by its text.
-fn is_answer_text(e: &Event) -> bool {
+/// An owner's answer forwarded as an instruction: tagged with `from_question`, or (older events)
+/// by its text: the "Answer to your question" form, or exactly the text of an owner answer.
+fn is_answer_text(e: &Event, answers: &[&str]) -> bool {
     if e.payload.get("from_question").is_some_and(|v| !v.is_null()) {
         return true;
     }
-    e.payload["text"].as_str().is_some_and(|t| t.starts_with("Answer to your question"))
+    let Some(t) = e.payload["text"].as_str() else { return false };
+    t.starts_with("Answer to your question") || answers.contains(&t.trim())
 }
 
 fn instruction_nodes(ctx: &Ctx) -> Vec<Node> {
     // An answer to a question is stored as an instruction too; the answer node already shows it.
-    let said = |e: &&Event| e.kind == "instruction" && e.agent == "owner" && !is_answer_text(e);
+    let answers: Vec<&str> = ctx.questions.iter().filter(|q| q.level == "owner").filter_map(|q| q.answer.as_deref()).map(str::trim).collect();
+    let said = |e: &&Event| e.kind == "instruction" && e.agent == "owner" && !is_answer_text(e, &answers);
     ctx.events
         .iter()
         .filter(said)
@@ -1252,6 +1255,20 @@ mod tests {
         assert!(["task_in", "instruction", "answer", "plan", "subtask", "app"].iter().all(|x| k.contains(x)));
         let app = th.nodes.iter().find(|n| n.kind == "app").unwrap();
         assert_eq!(app.output.as_ref().unwrap().label, "App running on :3000");
+    }
+
+    #[test]
+    fn an_old_forwarded_answer_is_not_a_second_node() {
+        let (db, top, _sub) = setup(TaskStatus::InProgress);
+        let q = db.create_ladder_question(top, Role::Lead, "owner", &[], "Stopped: what now?").unwrap();
+        db.answer_question(q.id, "why we use astro ?", None).unwrap();
+        // Before `from_question` existed, the answer was forwarded as a plain owner instruction.
+        db.add_event(Some(top), "owner", "instruction", &json!({"text": "why we use astro ?"})).unwrap();
+        db.add_event(Some(top), "owner", "instruction", &json!({"text": "a separate message"})).unwrap();
+        let th = get(&db, top, real_now());
+        let said: Vec<_> = th.nodes.iter().filter(|n| n.kind == "instruction").map(|n| n.title.clone()).collect();
+        assert_eq!(said, vec!["You said: a separate message".to_string()]);
+        assert_eq!(th.nodes.iter().filter(|n| n.kind == "answer").count(), 1);
     }
 
     #[test]
