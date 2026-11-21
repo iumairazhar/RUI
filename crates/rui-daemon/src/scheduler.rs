@@ -393,8 +393,8 @@ fn deliver_answer(db: &Db, q: &Question, by: &str) -> Result<()> {
     db.set_task_status(fresh.id, TaskStatus::Stuck)
 }
 
-/// The owner's reply to a "stopped" question on a top-level task: cancel or drop ("Drop this step")
-/// leaves it stuck, retry ("Retry with more tries") reopens the stuck subtasks, anything else
+/// The owner's reply to a "stopped" question on a top-level task: cancel, drop or abandon
+/// ("Abandon the task") drops the task like the Abandon button, retry ("Retry with more tries") reopens the stuck subtasks, anything else
 /// ("Give new instructions" or typed text) goes to the Lead as an instruction.
 fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result<()> {
     if task.status != TaskStatus::Stuck || !q.text.contains(STOPPED_MARK) {
@@ -402,8 +402,10 @@ fn answer_stuck_question(db: &Db, task: &Task, q: &Question, by: &str) -> Result
     }
     let answer = q.answer.as_deref().unwrap_or_default().trim();
     let word = answer.to_lowercase();
-    if word.starts_with("cancel") || word.starts_with("drop") {
+    if word.starts_with("cancel") || word.starts_with("drop") || word.starts_with("abandon") {
+        // Same as the Abandon button: stop the team, mark it dropped, close its open questions.
         db.add_event(Some(task.id), by, "cancelled", &json!({"question_id": q.id}))?;
+        crate::control::drop_task(db, &Runs::default(), task.id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         return Ok(());
     }
     if word.starts_with("retry") {
@@ -2849,8 +2851,9 @@ mod tests {
         assert!(lines[3].starts_with("What you can do: retry with more tries"));
         let raised = db.list_events(Some(parent.id), 50).unwrap().into_iter().rfind(|e| e.kind == "question_raised").unwrap();
         assert_eq!(raised.payload["options"], json!(crate::stuck::LOOP_OPTIONS));
-        answer_question(&db, oq.id, "Drop this step", None, "owner").unwrap();
+        answer_question(&db, oq.id, "Abandon the task", None, "owner").unwrap();
         assert!(has_event(&db, parent.id, "cancelled"));
+        assert!(has_event(&db, parent.id, "dropped"), "abandoning really drops the task");
     }
 
     #[test]

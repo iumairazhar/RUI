@@ -9,9 +9,9 @@ use rui_core::{Event, QuestionStatus, Task};
 pub const SAME_FAILURE: &str =
     "Same failure twice \u{2014} retries won't fix it. Call ask_scout or escalate to the owner with the cause.";
 /// Owner options for a step stuck on its loop limit; answer_stuck_question maps them.
-pub const LOOP_OPTIONS: [&str; 3] = ["Retry with more tries", "Give new instructions", "Drop this step"];
+pub const LOOP_OPTIONS: [&str; 3] = ["Retry with more tries", "Give new instructions", "Abandon the task"];
 /// Owner options for a task stopped by an error.
-pub const ERROR_OPTIONS: [&str; 3] = ["Retry", "Give new instructions", "Cancel"];
+pub const ERROR_OPTIONS: [&str; 3] = ["Retry", "Give new instructions", "Abandon the task"];
 const CAUSE_MAX: usize = 200;
 const ERROR_WORDS: [&str; 5] = ["error", "failed", "eperm", "not found", "fatal"];
 
@@ -120,7 +120,7 @@ pub fn loop_note(db: &Db, sub: &Task, used: i64, max: i64) -> Result<Note> {
         headline: format!("step \"{}\" is blocked", sub.title),
         details,
         can_do: "What you can do: retry with more tries (only helps if the cause is fixed), give new instructions \
-                 (for example how to fix the cause), or drop this step."
+                 (for example how to fix the cause), or abandon the task."
             .into(),
         options: LOOP_OPTIONS.map(String::from).to_vec(),
     })
