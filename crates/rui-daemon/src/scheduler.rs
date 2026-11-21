@@ -570,10 +570,10 @@ fn execute(db: &Arc<Db>, cfg: &Config, running: &Runs, locks: &ClientLocks, live
                 report_error(db, Some(task_id), &e);
             } else if status == TaskStatus::Done {
                 launch_apps(db, &cfg.data_dir, apps, task_id);
-            } else if status == TaskStatus::Stuck {
-                if let Ok(Some(note)) = stuck_note(db, task_id) {
-                    let _ = raise_stuck_note(db, task_id, &note);
-                }
+            } else if status == TaskStatus::Stuck
+                && let Ok(Some(note)) = stuck_note(db, task_id)
+            {
+                let _ = raise_stuck_note(db, task_id, &note);
             }
         }
         Action::StartLead { task_id, answers } => {
